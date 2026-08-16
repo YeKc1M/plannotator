@@ -139,6 +139,12 @@ export interface GitCommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * Set when `maxOutputBytes` was reached and the runtime stopped reading. The
+   * command was killed, so `exitCode` reports the signal, not the command's own
+   * verdict, and `stdout` is a prefix — never a usable result.
+   */
+  truncated?: boolean;
 }
 
 /** Per-command execution policy understood by every review Git runtime. */
@@ -149,6 +155,14 @@ export interface GitCommandOptions {
   stdin?: string;
   /** Whether the command may ask the user for credentials. Defaults to `"allow"`. */
   interaction?: "allow" | "forbid";
+  /**
+   * Hard ceiling on buffered stdout. The runtime stops reading and kills the
+   * command once the limit is passed, so a command that can emit an unbounded
+   * tree (a whole-repository diff) bounds real memory growth instead of being
+   * rejected after it has already been held in full. The result is flagged
+   * `truncated`. Omitted means no ceiling.
+   */
+  maxOutputBytes?: number;
   /**
    * Extra Git configuration for this one command, injected through the
    * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`
@@ -1285,14 +1299,14 @@ export async function getWorkingTreeDiffFromBase(
 }
 
 /**
- * Build the exact, applyable patch used only to materialize CallDiff snapshots.
+ * Build the exact, applyable patch used to materialize immutable analysis snapshots.
  *
  * The ordinary review patch remains bounded and human-readable. This separate
  * machine patch includes Git binary payloads and full object ids so a binary
  * file elsewhere in the review cannot make `git apply --binary` reject the
  * synthetic snapshot.
  */
-export async function getGitCallFlowMaterializationPatch(
+export async function getGitSnapshotMaterializationPatch(
   runtime: ReviewGitRuntime,
   diffType: DiffType,
   defaultBranch: string = "main",
@@ -1302,7 +1316,7 @@ export async function getGitCallFlowMaterializationPatch(
   let effectiveDiffType = diffType as string;
   const worktree = parseWorktreeDiffType(effectiveDiffType);
   if (effectiveDiffType.startsWith("worktree:")) {
-    if (!worktree) throw new Error("Could not parse the worktree call-flow snapshot.");
+    if (!worktree) throw new Error("Could not parse the worktree snapshot.");
     cwd = worktree.path;
     effectiveDiffType = worktree.subType;
   }

@@ -7,7 +7,6 @@ import {
   CALLDIFF_SOURCE_INTEGRITY,
   CALLDIFF_VERSION,
   CallFlowService,
-  createCallFlowSnapshotPlan,
   getCallFlowManagedRuntimeDir,
   resolveCallFlowRuntime,
   pruneCallFlowNativePackage,
@@ -15,6 +14,8 @@ import {
   type CallFlowRuntime,
 } from "./call-flow";
 import type { ParsedCallDiffWorkerResult } from "./call-flow-types";
+import type { ReviewGitRuntime } from "./review-core";
+import { createGitProvider, createJjProvider, createVcsApi } from "./vcs-core";
 
 let repo = "";
 
@@ -55,14 +56,41 @@ const parsedResult: ParsedCallDiffWorkerResult = {
   diagnostics: [],
 };
 
+const reviewRuntime: ReviewGitRuntime = {
+  async runGit(args, options) {
+    const result = Bun.spawnSync(["git", ...args], {
+      cwd: options?.cwd,
+      stdin: options?.stdin === undefined ? undefined : Buffer.from(options.stdin),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return {
+      stdout: result.stdout.toString(),
+      stderr: result.stderr.toString(),
+      exitCode: result.exitCode,
+    };
+  },
+  async readTextFile() { return null; },
+  async getFileInfo() { return null; },
+  async readLink() { return null; },
+};
+
+const gitVcs = createVcsApi([createGitProvider(reviewRuntime)]);
+
 function input(snapshotId = "snapshot"): CallFlowAnalysisInput {
   return {
     snapshotId,
-    cwd: repo,
-    diffType: "uncommitted",
-    base: "main",
     rawPatch: "",
-    vcsType: "git",
+    snapshot: {
+      materialize: ({ includedExtensions, signal }) => gitVcs.materializeVcsSnapshot("git", {
+        cwd: repo,
+        diffType: "uncommitted",
+        base: "main",
+        rawPatch: "",
+        includedExtensions,
+        signal,
+      }),
+    },
   };
 }
 
@@ -72,12 +100,14 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-describe("createCallFlowSnapshotPlan", () => {
+describe("VCS snapshot materialization", () => {
   test("materializes an uncommitted patch as an immutable commit without changing the source repo", async () => {
     writeFileSync(join(repo, "main.ts"), "export function helper() { return 2; }\nexport function main() { return helper(); }\n");
     const patch = run(["diff", "--binary", "--full-index"]);
     const sourceHead = run(["rev-parse", "HEAD"]);
-    const plan = await createCallFlowSnapshotPlan({ snapshotId: "s", cwd: repo, diffType: "uncommitted", base: "main", rawPatch: patch, vcsType: "git" });
+    expect(gitVcs.vcsSupportsSnapshot("git", "uncommitted")).toBe(true);
+    expect(gitVcs.vcsSupportsSnapshot("git", "all")).toBe(false);
+    const plan = await gitVcs.materializeVcsSnapshot("git", { cwd: repo, diffType: "uncommitted", base: "main", rawPatch: patch, includedExtensions: [".ts"] });
     try {
       expect(plan.from).toBe(sourceHead);
       expect(Bun.spawnSync(["git", "show", `${plan.to}:main.ts`], { cwd: plan.cwd }).stdout.toString()).toContain("helper()");
@@ -93,7 +123,7 @@ describe("createCallFlowSnapshotPlan", () => {
     run(["add", "main.ts"]);
     writeFileSync(join(repo, "main.ts"), "export function staged() { return 2; }\nexport function unstaged() { return 3; }\n");
     const patch = run(["diff", "--binary", "--full-index"]);
-    const plan = await createCallFlowSnapshotPlan({ snapshotId: "s", cwd: repo, diffType: "unstaged", base: "main", rawPatch: patch, vcsType: "git" });
+    const plan = await gitVcs.materializeVcsSnapshot("git", { cwd: repo, diffType: "unstaged", base: "main", rawPatch: patch, includedExtensions: [".ts"] });
     try {
       const before = Bun.spawnSync(["git", "show", `${plan.from}:main.ts`], { cwd: plan.cwd }).stdout.toString();
       const after = Bun.spawnSync(["git", "show", `${plan.to}:main.ts`], { cwd: plan.cwd }).stdout.toString();
@@ -103,6 +133,137 @@ describe("createCallFlowSnapshotPlan", () => {
     } finally {
       plan.cleanup();
     }
+  });
+
+  test("materializes the parseable Jujutsu source tree without touching the checkout", async () => {
+    const calls: string[][] = [];
+    // The base side is the whole parseable tree at the resolved first parent.
+    const basePatch = [
+      "diff --git a/alias.ts b/alias.ts",
+      "new file mode 120000",
+      "--- /dev/null",
+      "+++ b/alias.ts",
+      "@@ -0,0 +1 @@",
+      "+main.ts",
+      "\\ No newline at end of file",
+      "diff --git a/binary.ts b/binary.ts",
+      "new file mode 100644",
+      "Binary files /dev/null and b/binary.ts differ",
+      "diff --git a/main.ts b/main.ts",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/main.ts",
+      "@@ -0,0 +1 @@",
+      "+export const version = 1;",
+      "diff --git a/tool.ts b/tool.ts",
+      "new file mode 100755",
+      "--- /dev/null",
+      "+++ b/tool.ts",
+      "@@ -0,0 +1 @@",
+      "+export const tool = 1;",
+      "",
+    ].join("\n");
+    // The second side is only what changed between the two revisions.
+    const deltaPatch = [
+      "diff --git a/alias.ts b/alias.ts",
+      "--- a/alias.ts",
+      "+++ b/alias.ts",
+      "@@ -1 +1 @@",
+      "-main.ts",
+      "\\ No newline at end of file",
+      "+tool.ts",
+      "\\ No newline at end of file",
+      "diff --git a/main.ts b/main.ts",
+      "--- a/main.ts",
+      "+++ b/main.ts",
+      "@@ -1 +1 @@",
+      "-export const version = 1;",
+      "+export const version = 2;",
+      "diff --git a/tool.ts b/tool.ts",
+      "old mode 100755",
+      "new mode 100644",
+      "",
+    ].join("\n");
+    const mergeParents = ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"];
+    const jjRuntime = {
+      async runJj(args: string[]) {
+        calls.push(args);
+        // `@` is a MERGE here, so the old `@-` revset would have been ambiguous.
+        if (args.includes("log")) {
+          return { stdout: mergeParents.join("\n"), stderr: "", exitCode: 0 };
+        }
+        const from = args[args.indexOf("--from") + 1];
+        return {
+          stdout: from === "root()" ? basePatch : deltaPatch,
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    };
+    const jjVcs = createVcsApi([createJjProvider(jjRuntime, reviewRuntime)]);
+    expect(jjVcs.vcsSupportsSnapshot("jj", "jj-current")).toBe(true);
+    expect(jjVcs.vcsSupportsSnapshot("jj", "jj-all")).toBe(false);
+    const plan = await jjVcs.materializeVcsSnapshot("jj", {
+      cwd: repo,
+      diffType: "jj-current",
+      base: "main",
+      rawPatch: "diff --git a/main.ts b/main.ts\n",
+      includedExtensions: [".ts"],
+    });
+    try {
+      const oldTree = Bun.spawnSync(["git", "ls-tree", plan.from], { cwd: plan.cwd }).stdout.toString();
+      const newTree = Bun.spawnSync(["git", "ls-tree", plan.to], { cwd: plan.cwd }).stdout.toString();
+      expect(oldTree).toContain("120000 blob");
+      expect(oldTree).toContain("100755 blob");
+      expect(newTree).not.toContain("100755 blob");
+      expect(Bun.spawnSync(["git", "show", `${plan.from}:main.ts`], { cwd: plan.cwd }).stdout.toString()).toContain("version = 1");
+      expect(Bun.spawnSync(["git", "show", `${plan.to}:main.ts`], { cwd: plan.cwd }).stdout.toString()).toContain("version = 2");
+      expect(Bun.spawnSync(["git", "show", `${plan.from}:alias.ts`], { cwd: plan.cwd }).stdout.toString()).toBe("main.ts");
+      expect(Bun.spawnSync(["git", "show", `${plan.to}:alias.ts`], { cwd: plan.cwd }).stdout.toString()).toBe("tool.ts");
+      // The delta never mentions tool.ts contents, so the second side can only
+      // carry them by having been built ON TOP of the base tree.
+      expect(Bun.spawnSync(["git", "show", `${plan.to}:tool.ts`], { cwd: plan.cwd }).stdout.toString()).toContain("tool = 1");
+      expect(Bun.spawnSync(["git", "cat-file", "-e", `${plan.to}:binary.ts`], { cwd: plan.cwd }).exitCode).not.toBe(0);
+      expect(run(["status", "--short"])).toBe("");
+
+      const diffs = calls.filter((args) => args.includes("diff"));
+      // Exactly one whole-tree pass; the second side is the changed files only.
+      expect(diffs.map((args) => args[args.indexOf("--from") + 1]))
+        .toEqual(["root()", mergeParents[0]]);
+      expect(diffs.map((args) => args[args.indexOf("--to") + 1]))
+        .toEqual([mergeParents[0], "@"]);
+      // Ambiguous parent shorthands must never reach jj.
+      expect(calls.flat()).not.toContain("@-");
+      expect(calls.flat()).not.toContain("parents(@-)");
+      expect(calls.every((args) => args[0] === "--ignore-working-copy")).toBe(true);
+      // Repo-root-anchored, so the review's invocation directory cannot narrow it.
+      expect(diffs.every((args) => args.includes('root-glob-i:"**/*.ts"'))).toBe(true);
+      expect(diffs.every((args) => args.some((arg) => arg.startsWith("glob-i:")))).toBe(false);
+    } finally {
+      plan.cleanup();
+    }
+  });
+
+  test("refuses a Jujutsu snapshot whose diff hit the runtime output ceiling", async () => {
+    // A truncated tree would otherwise become a valid-looking snapshot and
+    // CallDiff would report call-graph edges that do not exist.
+    let requestedCap: number | undefined;
+    const jjRuntime = {
+      async runJj(args: string[], options?: { maxOutputBytes?: number }) {
+        if (args.includes("log")) return { stdout: "abc", stderr: "", exitCode: 0 };
+        requestedCap = options?.maxOutputBytes;
+        return { stdout: "diff --git a/main.ts b/main.ts\n", stderr: "", exitCode: 0, truncated: true };
+      },
+    };
+    const jjVcs = createVcsApi([createJjProvider(jjRuntime, reviewRuntime)]);
+    expect(jjVcs.materializeVcsSnapshot("jj", {
+      cwd: repo,
+      diffType: "jj-current",
+      base: "main",
+      rawPatch: "",
+      includedExtensions: [".ts"],
+    })).rejects.toThrow(/64 MB/);
+    expect(requestedCap).toBe(64 * 1024 * 1024);
   });
 });
 
@@ -205,11 +366,11 @@ describe("CallFlowService", () => {
       },
     });
 
-    await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted" });
-    await service.getAdvert(true, { vcsType: "git", diffType: "staged" });
+    await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
+    await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
     expect(probes).toBe(1);
     now += 5_001;
-    await service.getAdvert(true, { vcsType: "git", diffType: "unstaged" });
+    await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
     expect(probes).toBe(2);
   });
 
@@ -226,18 +387,18 @@ describe("CallFlowService", () => {
       },
     });
 
-    const before = await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted" });
+    const before = await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
     expect(before.state).toBe("unavailable");
     expect(probes).toBe(1);
 
     // Without invalidation the 60s TTL would keep reporting unavailable.
     available = true;
-    const cached = await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted" });
+    const cached = await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
     expect(cached.state).toBe("unavailable");
     expect(probes).toBe(1);
 
     service.invalidateRuntimeProbe();
-    const after = await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted" });
+    const after = await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
     expect(after.state).toBe("available");
     expect(probes).toBe(2);
   });
@@ -259,7 +420,7 @@ describe("CallFlowService", () => {
       "+print('changed')",
     ].join("\n");
 
-    const advert = await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted", rawPatch });
+    const advert = await service.getAdvert(true, { snapshotSupported: true, rawPatch });
     expect(advert.state).toBe("unavailable");
     expect(advert.installable).toBe(true);
     expect(advert.installPlan?.languageIds).toEqual(["javascript-typescript", "python"]);
@@ -282,7 +443,7 @@ describe("CallFlowService", () => {
       "+print('changed')",
     ].join("\n");
 
-    const advert = await service.getAdvert(false, { vcsType: "git", diffType: "uncommitted", rawPatch });
+    const advert = await service.getAdvert(false, { snapshotSupported: true, rawPatch });
     expect(advert).toMatchObject({
       enabled: false,
       state: "disabled",
@@ -308,8 +469,7 @@ describe("CallFlowService", () => {
     });
     try {
       const advert = await service.getAdvert(false, {
-        vcsType: "git",
-        diffType: "uncommitted",
+        snapshotSupported: true,
         rawPatch: "diff --git a/tool.py b/tool.py\n",
       });
       expect(advert).toMatchObject({ enabled: false, state: "disabled", installable: false });
@@ -358,18 +518,20 @@ describe("CallFlowService", () => {
       },
     });
 
-    const allFiles = await service.getAdvert(true, { vcsType: "git", diffType: "all" });
-    const jj = await service.getAdvert(true, { vcsType: "jj", diffType: "jj-working-copy" });
-    const disabledAllFiles = await service.getAdvert(false, { vcsType: "git", diffType: "all" });
-    const disabledJj = await service.getAdvert(false, { vcsType: "jj", diffType: "jj-working-copy" });
+    const allFiles = await service.getAdvert(true, { snapshotSupported: false, rawPatch: "" });
+    const jj = await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
+    const jjAll = await service.getAdvert(true, { snapshotSupported: false, rawPatch: "" });
+    const disabledAllFiles = await service.getAdvert(false, { snapshotSupported: false, rawPatch: "" });
+    const disabledJj = await service.getAdvert(false, { snapshotSupported: true, rawPatch: "" });
 
     expect(allFiles.state).toBe("unsupported");
-    expect(jj.state).toBe("unsupported");
+    expect(jj.state).toBe("available");
+    expect(jjAll).toMatchObject({ state: "unsupported", reason: "view-unsupported" });
     expect(disabledAllFiles).toMatchObject({ state: "disabled", reason: "view-unsupported" });
     expect(disabledAllFiles.consentPlan).toBeUndefined();
-    expect(disabledJj).toMatchObject({ state: "disabled", reason: "vcs-unsupported" });
-    expect(disabledJj.consentPlan).toBeUndefined();
-    expect(probes).toBe(0);
+    expect(disabledJj).toMatchObject({ state: "disabled" });
+    expect(disabledJj.consentPlan).toBeDefined();
+    expect(probes).toBe(1);
   });
 
   test("advertises only the missing language packs required by the current patch", async () => {
@@ -383,7 +545,7 @@ describe("CallFlowService", () => {
       "+print('changed')",
     ].join("\n");
 
-    const advert = await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted", rawPatch });
+    const advert = await service.getAdvert(true, { snapshotSupported: true, rawPatch });
     expect(advert.state).toBe("available");
     expect(advert.installPlan?.languageIds).toEqual(["python"]);
     expect(advert.installPlan?.changedFiles).toBe(1);
@@ -420,7 +582,7 @@ describe("CallFlowService", () => {
     const service = new CallFlowService({
       resolveRuntime: async () => ({ ok: false, reason: "override-relative", message: "Override must be absolute." }),
     });
-    const advert = await service.getAdvert(true, { vcsType: "git", diffType: "uncommitted", rawPatch: "" });
+    const advert = await service.getAdvert(true, { snapshotSupported: true, rawPatch: "" });
     expect(advert.state).toBe("unavailable");
     expect(advert.installable).toBe(false);
     expect(advert.installPlan).toBeUndefined();

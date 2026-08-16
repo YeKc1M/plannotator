@@ -65,7 +65,7 @@ Measured on macOS arm64 with Node 24.15.0 after the pinned install on 2026-08-11
 
 ## Exact snapshot materialization
 
-CallDiff requires two immutable commits. Plannotator never points it at a mutable worktree for patch-backed views. Instead it makes a temporary shared clone, seeds a temporary index at the correct base, applies the exact visible patch, and creates unreachable synthetic commits with `git commit-tree`. Cleanup removes the temporary clone. No ref, index, or worktree in the user's repository is changed.
+CallDiff requires two immutable commits. Snapshot materialization is a VCS-provider capability: each provider owns the mapping from its review modes to an immutable Git commit pair, while Call flow receives only an opaque snapshot source. Plannotator never points CallDiff at a mutable worktree for patch-backed views. The Git provider makes a temporary shared clone, seeds a temporary index at the correct base, applies the exact visible patch, and creates unreachable synthetic commits with `git commit-tree`. Cleanup removes the temporary clone. No ref, index, or worktree in the user's repository is changed.
 
 Before spawning the worker, Plannotator groups both sides of every changed path by supported extension. It then lists both immutable snapshots and passes CallDiff an exact path filter containing all files in the installed language families relevant to the patch. This preserves complete same-language repository call graphs rather than reducing analysis to changed files, while preventing an unrelated unsupported language elsewhere in the repository from reaching CallDiff's lazy grammar loader.
 
@@ -80,8 +80,14 @@ Before spawning the worker, Plannotator groups both sides of every changed path 
 | Last commit | first parent of HEAD | HEAD |
 | Commit rail | first parent of selected commit | selected commit |
 | PR layer/full stack | exact locally available base/head pair | exact locally available head |
+| JJ current change | first parent of `@` | `@` |
+| JJ last change | first parent of the first parent of `@` | first parent of `@` |
+| JJ line of work | line-of-work base for the selected revision | `@` |
+| JJ evolution | selected historical evolution entry | `@` |
 
-The All Files snapshot has no meaningful commit baseline and is explicitly unsupported. GitButler, Jujutsu, Perforce, nested workspace aggregation, and hosted PR analysis without a local checkout are also unsupported in this version.
+Jujutsu parent hops are walked against the repository rather than written as revsets. `@-` is `parents(@)`, so on a merge revision both `@-` and `parents(@-)` resolve to several revisions and `jj diff` rejects the command outright, even though the visible `jj diff -r @` review still renders. Each hop resolves the first parent's commit id, which is the same side `getJjFileContentsForDiff` already expands merges on, so Call flow and file expansion agree.
+
+Jujutsu snapshots request `jj diff --git` restricted to the source extensions in the analyzed language families, with repo-root-anchored `root-glob-i:` filesets so a review started from a subdirectory does not silently drop the source files above it. The base side is materialized whole (`root()` to the base revision); the second side is that tree plus the changed-file delta between the two revisions, so materialization cost tracks the review rather than the repository, with a whole-tree second pass as the fallback when the delta cannot be replayed. Reads are capped at 64 MB by the runtime as it streams, not measured after the fact. Each filtered tree becomes an unreachable synthetic Git commit without changing the reviewed checkout; the existing snapshot fingerprint check rejects the result if the JJ revisions move during materialization. Binary entries are omitted because CallDiff consumes parseable source text and Jujutsu's Git-format diff does not carry binary payloads; text files, symlinks, executable modes, and deletions retain their Git patch semantics. The All Files snapshot has no meaningful commit baseline and is explicitly unsupported. GitButler, Perforce, nested workspace aggregation, and hosted PR analysis without a local checkout are also unsupported in this version.
 
 ## Server and API contract
 

@@ -311,6 +311,16 @@ export interface PiSDKConfig extends AIProviderConfig {
   piExecutablePath?: string;
 }
 
+export interface KimiCliConfig extends AIProviderConfig {
+  type: "kimi-cli";
+  /**
+   * Explicit path to the kimi CLI binary.
+   * Required when running inside a compiled binary where PATH resolution
+   * doesn't work the same way (e.g., bun build --compile).
+   */
+  kimiExecutablePath?: string;
+}
+
 export interface OpenCodeConfig extends AIProviderConfig {
   type: "opencode-sdk";
   /** Hostname for the OpenCode server. Default: "127.0.0.1". */

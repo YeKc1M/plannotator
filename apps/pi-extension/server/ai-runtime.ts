@@ -97,6 +97,21 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 		}
 
 		try {
+			await import("../generated/ai/providers/kimi-cli.ts");
+			const kimiPath = whichCmd("kimi");
+			if (kimiPath) {
+				const provider = await ai.createProvider({
+					type: "kimi-cli",
+					cwd,
+					kimiExecutablePath: kimiPath,
+				} as any);
+				registry.register(provider);
+			}
+		} catch {
+			// Kimi CLI not available.
+		}
+
+		try {
 			await import("../generated/ai/providers/opencode-sdk.ts");
 			const opencodePath = whichCmd("opencode");
 			if (opencodePath) {

@@ -148,3 +148,86 @@ describe("createAIRuntime Codex discovery", () => {
     });
   }, 15_000);
 });
+
+describe("createAIRuntime Kimi discovery", () => {
+  test("capabilities lists kimi-cli without executing the kimi binary", async () => {
+    if (process.platform === "win32") return;
+
+    const dir = mkdtempSync(join(tmpdir(), "plannotator-detect-kimi-"));
+    tempDirs.push(dir);
+    const marker = join(dir, "kimi-ran");
+    const kimi = join(dir, "kimi");
+    writeFileSync(kimi, `#!/bin/sh\necho ran > '${marker}'\nexit 1\n`);
+    chmodSync(kimi, 0o755);
+
+    const runner = join(dir, "runner.ts");
+    const runtimeUrl = pathToFileURL(join(import.meta.dir, "ai-runtime.ts")).href;
+    writeFileSync(runner, `
+      import { existsSync } from "node:fs";
+      import { createAIRuntime } from ${JSON.stringify(runtimeUrl)};
+      const runtime = await createAIRuntime({ cwd: ${JSON.stringify(dir)} });
+      const capabilities = await runtime.endpoints["/api/ai/capabilities"](
+        new Request("http://localhost/api/ai/capabilities"),
+      );
+      const data = await capabilities.json();
+      console.log(JSON.stringify({
+        hasKimi: data.providers.some((provider) => provider.id === "kimi-cli"),
+        afterCapabilities: existsSync(${JSON.stringify(marker)}),
+      }));
+      runtime.dispose();
+    `);
+
+    const proc = Bun.spawn([process.execPath, runner], {
+      cwd: import.meta.dir,
+      env: { ...process.env, PATH: `${dir}:/usr/bin:/bin` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(exitCode, stderr).toBe(0);
+    expect(JSON.parse(stdout.trim())).toEqual({
+      hasKimi: true,
+      afterCapabilities: false,
+    });
+  }, 15_000);
+
+  test("kimi-cli is absent when kimi is not on PATH", async () => {
+    if (process.platform === "win32") return;
+
+    const dir = mkdtempSync(join(tmpdir(), "plannotator-no-kimi-"));
+    tempDirs.push(dir);
+
+    const runner = join(dir, "runner.ts");
+    const runtimeUrl = pathToFileURL(join(import.meta.dir, "ai-runtime.ts")).href;
+    writeFileSync(runner, `
+      import { createAIRuntime } from ${JSON.stringify(runtimeUrl)};
+      const runtime = await createAIRuntime({ cwd: ${JSON.stringify(dir)} });
+      const capabilities = await runtime.endpoints["/api/ai/capabilities"](
+        new Request("http://localhost/api/ai/capabilities"),
+      );
+      const data = await capabilities.json();
+      console.log(JSON.stringify({
+        hasKimi: data.providers.some((provider) => provider.id === "kimi-cli"),
+      }));
+      runtime.dispose();
+    `);
+
+    const proc = Bun.spawn([process.execPath, runner], {
+      cwd: import.meta.dir,
+      env: { ...process.env, PATH: `${dir}:/usr/bin:/bin` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(exitCode, stderr).toBe(0);
+    expect(JSON.parse(stdout.trim())).toEqual({ hasKimi: false });
+  }, 15_000);
+});

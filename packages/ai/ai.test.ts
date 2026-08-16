@@ -1828,3 +1828,268 @@ describe("mapOpenCodeEvent", () => {
     expect(mapOpenCodeEvent("file.edited", { file: "foo.ts" }, SESSION_ID)).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// mapKimiStreamJsonLine
+// ---------------------------------------------------------------------------
+
+import { KimiCliProvider, mapKimiStreamJsonLine } from "./providers/kimi-cli.ts";
+
+describe("mapKimiStreamJsonLine", () => {
+  test("assistant content maps to text_delta", () => {
+    const result = mapKimiStreamJsonLine(
+      JSON.stringify({ role: "assistant", content: "Hello from Kimi" }),
+    );
+    expect(result).toEqual([{ type: "text_delta", delta: "Hello from Kimi" }]);
+  });
+
+  test("assistant tool_calls map to tool_use with parsed arguments", () => {
+    const result = mapKimiStreamJsonLine(
+      JSON.stringify({
+        role: "assistant",
+        tool_calls: [
+          {
+            type: "function",
+            id: "call_1",
+            function: { name: "read_file", arguments: '{"path":"/foo.ts"}' },
+          },
+        ],
+      }),
+    );
+    expect(result).toEqual([{
+      type: "tool_use",
+      toolName: "read_file",
+      toolInput: { path: "/foo.ts" },
+      toolUseId: "call_1",
+    }]);
+  });
+
+  test("assistant message with both content and tool_calls maps to both", () => {
+    const result = mapKimiStreamJsonLine(
+      JSON.stringify({
+        role: "assistant",
+        content: "Let me check.",
+        tool_calls: [
+          { type: "function", id: "call_2", function: { name: "bash", arguments: '{"cmd":"ls"}' } },
+        ],
+      }),
+    );
+    expect(result).toEqual([
+      { type: "text_delta", delta: "Let me check." },
+      { type: "tool_use", toolName: "bash", toolInput: { cmd: "ls" }, toolUseId: "call_2" },
+    ]);
+  });
+
+  test("malformed tool arguments JSON passes through as raw string", () => {
+    const result = mapKimiStreamJsonLine(
+      JSON.stringify({
+        role: "assistant",
+        tool_calls: [
+          { type: "function", id: "call_3", function: { name: "bash", arguments: "{not json" } },
+        ],
+      }),
+    );
+    expect(result).toEqual([{
+      type: "tool_use",
+      toolName: "bash",
+      toolInput: { arguments: "{not json" },
+      toolUseId: "call_3",
+    }]);
+  });
+
+  test("tool line maps to tool_result", () => {
+    const result = mapKimiStreamJsonLine(
+      JSON.stringify({ role: "tool", tool_call_id: "call_1", content: "file contents" }),
+    );
+    expect(result).toEqual([{
+      type: "tool_result",
+      toolUseId: "call_1",
+      result: "file contents",
+    }]);
+  });
+
+  test("tool line with non-string content stringifies it", () => {
+    const result = mapKimiStreamJsonLine(
+      JSON.stringify({ role: "tool", tool_call_id: "call_4", content: { files: ["a.ts"] } }),
+    );
+    expect(result).toEqual([{
+      type: "tool_result",
+      toolUseId: "call_4",
+      result: JSON.stringify({ files: ["a.ts"] }),
+    }]);
+  });
+
+  test("meta lines are ignored (including session.resume_hint)", () => {
+    expect(mapKimiStreamJsonLine(
+      JSON.stringify({ role: "meta", type: "system.version", version: "0.36.1" }),
+    )).toEqual([]);
+    expect(mapKimiStreamJsonLine(
+      JSON.stringify({ role: "meta", type: "turn.step.retrying" }),
+    )).toEqual([]);
+    expect(mapKimiStreamJsonLine(
+      JSON.stringify({ role: "meta", type: "session.resume_hint", session_id: "session_x" }),
+    )).toEqual([]);
+  });
+
+  test("non-JSON lines and junk are skipped", () => {
+    expect(mapKimiStreamJsonLine("not json at all")).toEqual([]);
+    expect(mapKimiStreamJsonLine("")).toEqual([]);
+    expect(mapKimiStreamJsonLine(JSON.stringify({ role: "user", content: "hi" }))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KimiCliProvider — driven by a fake `kimi` shell script
+// ---------------------------------------------------------------------------
+
+import { afterEach } from "bun:test";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+async function collectMessages(stream: AsyncIterable<AIMessage>): Promise<AIMessage[]> {
+  const out: AIMessage[] = [];
+  for await (const message of stream) out.push(message);
+  return out;
+}
+
+describe("KimiCliProvider", () => {
+  const kimiTempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of kimiTempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function makeFakeKimi(script: string): { dir: string; bin: string; capture: string } {
+    const dir = mkdtempSync(join(tmpdir(), "plannotator-fake-kimi-"));
+    kimiTempDirs.push(dir);
+    const bin = join(dir, "kimi");
+    const capture = join(dir, "args.txt");
+    writeFileSync(bin, script.replaceAll("__CAPTURE__", capture));
+    chmodSync(bin, 0o755);
+    return { dir, bin, capture };
+  }
+
+  const SUCCESS_SCRIPT = `#!/bin/sh
+printf '%s\\n' "$@" > '__CAPTURE__'
+echo '{"role":"meta","type":"system.version","version":"0.0.0"}'
+echo '{"role":"assistant","content":"fake answer"}'
+echo '{"role":"meta","type":"session.resume_hint","session_id":"session_fake_1","command":"kimi -r session_fake_1"}'
+`;
+
+  test("first query prepends preamble, resolves session id, streams messages", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, capture } = makeFakeKimi(SUCCESS_SCRIPT);
+    const provider = new KimiCliProvider({
+      type: "kimi-cli",
+      cwd: dir,
+      kimiExecutablePath: bin,
+    });
+    const session = await provider.createSession({
+      context: { mode: "plan-review", plan: { plan: "# PREAMBLE_MARKER plan" } },
+    });
+
+    const messages = await collectMessages(session.query("first question"));
+
+    expect(messages).toContainEqual({ type: "text_delta", delta: "fake answer" });
+    expect(messages.at(-1)).toEqual({
+      type: "result",
+      sessionId: "session_fake_1",
+      success: true,
+    });
+    // resume_hint resolved the real session id
+    expect(session.id).toBe("session_fake_1");
+
+    const args = readFileSync(capture, "utf8");
+    expect(args).toContain("# PREAMBLE_MARKER plan");
+    expect(args).toContain("User question: first question");
+    expect(args).toContain("--output-format\nstream-json");
+    expect(args).not.toContain("--session");
+    provider.dispose();
+  });
+
+  test("second query continues via --session with a bare prompt", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, capture } = makeFakeKimi(SUCCESS_SCRIPT);
+    const provider = new KimiCliProvider({
+      type: "kimi-cli",
+      cwd: dir,
+      kimiExecutablePath: bin,
+    });
+    const session = await provider.createSession({
+      context: { mode: "plan-review", plan: { plan: "# PREAMBLE_MARKER plan" } },
+    });
+
+    await collectMessages(session.query("first question"));
+    const messages = await collectMessages(session.query("follow-up"));
+
+    expect(messages.at(-1)).toEqual({
+      type: "result",
+      sessionId: "session_fake_1",
+      success: true,
+    });
+
+    // The fake script overwrites the capture file on each run, so this shows
+    // only the second invocation's arguments.
+    const args = readFileSync(capture, "utf8");
+    expect(args).toContain("--session\nsession_fake_1");
+    expect(args).toContain("follow-up");
+    expect(args).not.toContain("User question:");
+    expect(args).not.toContain("PREAMBLE_MARKER");
+    provider.dispose();
+  });
+
+  test("resumeSession binds the given id and skips the preamble", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, capture } = makeFakeKimi(SUCCESS_SCRIPT);
+    const provider = new KimiCliProvider({
+      type: "kimi-cli",
+      cwd: dir,
+      kimiExecutablePath: bin,
+    });
+    const session = await provider.resumeSession("session_previous_9");
+    expect(session.id).toBe("session_previous_9");
+
+    await collectMessages(session.query("hi again"));
+
+    const args = readFileSync(capture, "utf8");
+    expect(args).toContain("--session\nsession_previous_9");
+    expect(args).not.toContain("User question:");
+    provider.dispose();
+  });
+
+  test("non-zero exit yields an error with the stderr tail", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin } = makeFakeKimi(`#!/bin/sh
+echo 'not logged in: run kimi auth login' >&2
+exit 1
+`);
+    const provider = new KimiCliProvider({
+      type: "kimi-cli",
+      cwd: dir,
+      kimiExecutablePath: bin,
+    });
+    const session = await provider.createSession({
+      context: { mode: "plan-review", plan: { plan: "# Plan" } },
+    });
+
+    const messages = await collectMessages(session.query("hello"));
+
+    const error = messages.find((m) => m.type === "error");
+    expect(error).toMatchObject({
+      type: "error",
+      code: "kimi_exit_error",
+    });
+    expect(error && "error" in error && error.error).toContain("not logged in");
+    expect(messages.some((m) => m.type === "result")).toBe(false);
+    provider.dispose();
+  });
+});

@@ -1,0 +1,13 @@
+{
+  "name": "plannotator",
+  "description": "Interactive plan review for Kimi Code CLI — intercepts ExitPlanMode and opens a visual annotation UI, returning structured feedback.",
+  "version": "0.1.0",
+  "hooks": [
+    {
+      "event": "PermissionRequest",
+      "matcher": "ExitPlanMode",
+      "command": "plannotator kimi-plan",
+      "timeout": 86400
+    }
+  ]
+}

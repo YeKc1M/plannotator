@@ -1,7 +1,7 @@
 /**
  * Plannotator CLI for Claude Code, Droid, Codex, Gemini CLI, and Copilot CLI
  *
- * Supports thirteen modes:
+ * Supports fourteen modes:
  *
  * 1. Plan Review (default, no args):
  *    - Spawned by Claude/Gemini/Codex hook entrypoints
@@ -61,6 +61,11 @@
  *    - Removes recognized installer-owned components across supported hosts
  *    - Preserves local data by default; `--purge` removes known local data
  *
+ * 14. Kimi Plan (`plannotator kimi-plan`):
+ *    - Spawned by PermissionRequest hook (Kimi Code CLI) on ExitPlanMode
+ *    - Reads hook event from stdin, plan markdown from display.plan
+ *    - Outputs hookSpecificOutput permissionDecision JSON to stdout
+ *
  * Global flags:
  *   --help             - Show top-level usage information
  *   --version, -v      - Print version and exit
@@ -107,6 +112,7 @@ import { writeRemoteShareLink } from "@plannotator/server/share-url";
 import { enableTailscaleServe } from "@plannotator/server/tailscale-serve";
 import { writeUrlQr } from "@plannotator/server/qr";
 import { resolveAnnotateTarget } from "./annotate-resolution";
+import { buildKimiDecisionJson, parseKimiHookEvent } from "./kimi-plan";
 import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
@@ -2038,6 +2044,62 @@ if (args[0] === "sessions") {
   server.stop();
 
   emitAnnotateOutcome(result);
+  process.exit(0);
+
+} else if (args[0] === "kimi-plan") {
+  // ============================================
+  // KIMI CODE CLI PLAN INTERCEPTION MODE
+  // ============================================
+  //
+  // Spawned by the PermissionRequest hook (apps/kimi-plugin) on ExitPlanMode.
+  // Blocks while the user reviews the plan in the browser, then prints the
+  // kimi-native permission decision JSON on stdout and exits 0.
+
+  const eventJson = await Bun.stdin.text();
+  const parsed = parseKimiHookEvent(eventJson);
+
+  if (parsed.kind === "passthrough") {
+    // Not an ExitPlanMode request — no output = allow the tool call
+    process.exit(0);
+  }
+  if (parsed.kind === "error") {
+    console.error(parsed.message);
+    process.exit(1);
+  }
+
+  const planProject = (await detectProjectName()) ?? "_unknown";
+
+  const server = await startPlannotatorServer({
+    plan: parsed.plan,
+    origin: "kimi",
+    sharingEnabled,
+    shareBaseUrl,
+    pasteApiUrl,
+    htmlContent: planHtmlContent,
+    onReady: async (url, isRemote, port) => {
+      handleServerReady(url, isRemote, port);
+
+      if (isRemote && sharingEnabled) {
+        await writeRemoteShareLink(parsed.plan, shareBaseUrl, "review the plan", "plan only").catch(() => {});
+      }
+    },
+  });
+
+  registerSession({
+    pid: process.pid,
+    port: server.port,
+    url: server.url,
+    mode: "plan",
+    project: planProject,
+    startedAt: new Date().toISOString(),
+    label: `plan-${planProject}`,
+  });
+
+  const result = await server.waitForDecision();
+  await Bun.sleep(1500);
+  server.stop();
+
+  console.log(buildKimiDecisionJson(result, parsed.planPath));
   process.exit(0);
 
 } else if (args[0] === "improve-context") {

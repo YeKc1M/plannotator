@@ -30,6 +30,14 @@ export const OpenCodeIcon: React.FC<{ className?: string }> = ({ className = 'w-
   </svg>
 );
 
+/** Kimi icon — simple "K" letter mark (no brand asset vendored in the repo) */
+export const KimiIcon: React.FC<{ className?: string }> = ({ className = 'w-4 h-4' }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" className={className}>
+    <rect x="1" y="1" width="30" height="30" rx="7" fill="#6366f1" />
+    <path d="M10 7v18h3.4v-7.1l6.1 7.1H24l-7.4-8.5L23.5 7h-4.3l-5.8 7.2V7H10z" fill="#ffffff" />
+  </svg>
+);
+
 /** Generic fallback icon for unknown providers */
 const GenericProviderIcon: React.FC<{ className?: string }> = ({ className = 'w-4 h-4' }) => (
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>
@@ -42,6 +50,7 @@ export const PROVIDER_META: Record<string, { label: string; icon: React.FC<{ cla
   'claude-agent-sdk': { label: 'Claude', icon: ClaudeIcon },
   'codex-sdk': { label: 'Codex', icon: CodexIcon },
   'pi-sdk': { label: 'Pi', icon: PiIcon },
+  'kimi-cli': { label: 'Kimi', icon: KimiIcon },
   'opencode-sdk': { label: 'OpenCode', icon: OpenCodeIcon },
 };
 

@@ -5,6 +5,7 @@ import {
   ProviderRegistry,
   SessionManager,
   type AIEndpoints,
+  type KimiCliConfig,
   type PiSDKConfig,
 } from "@plannotator/ai";
 import { resolveWindowsCommandShim } from "@plannotator/ai/providers/command-path";
@@ -81,6 +82,22 @@ export async function createAIRuntime(options: CreateAIRuntimeOptions = {}): Pro
     }
   } catch {
     // Pi not available.
+  }
+
+  try {
+    await import("@plannotator/ai/providers/kimi-cli");
+    const rawKimiPath = Bun.which("kimi");
+    if (rawKimiPath) {
+      const kimiPath = resolveWindowsCommandShim(rawKimiPath);
+      const provider = await createProvider({
+        type: "kimi-cli",
+        cwd,
+        kimiExecutablePath: kimiPath,
+      } as KimiCliConfig);
+      registry.register(provider);
+    }
+  } catch {
+    // Kimi CLI not available.
   }
 
   try {

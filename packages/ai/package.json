@@ -14,6 +14,7 @@
     "./providers/codex-app-server": "./providers/codex-app-server.ts",
     "./providers/command-path": "./providers/command-path.ts",
     "./providers/pi-sdk": "./providers/pi-sdk.ts",
+    "./providers/kimi-cli": "./providers/kimi-cli.ts",
     "./providers/opencode-sdk": "./providers/opencode-sdk.ts",
     "./providers/pi-sdk-node": "./providers/pi-sdk-node.ts"
   },

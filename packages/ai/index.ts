@@ -74,6 +74,7 @@ export type {
   ClaudeAgentSDKConfig,
   CodexSDKConfig,
   PiSDKConfig,
+  KimiCliConfig,
   OpenCodeConfig,
 } from "./types.ts";
 

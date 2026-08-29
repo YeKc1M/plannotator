@@ -1,7 +1,8 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { instance } from '@viz-js/viz';
+import type { Viz } from '@viz-js/viz';
 import type { Block } from '../types';
+import { createRuntimeRetryEpoch } from '../utils/runtimeRetry';
 
 interface ViewBox {
   x: number;
@@ -14,12 +15,54 @@ const ZOOM_STEP = 0.25;
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 8;
 
-let vizInstancePromise: ReturnType<typeof instance> | null = null;
+/**
+ * The Graphviz engine (about 1.2 MB of Emscripten JS) is imported inside the
+ * render effect, not statically, so a host that bundles by route only fetches
+ * it when a dot fence is on the page. WASM instantiation was already deferred
+ * to first render; in Plannotator's single-file builds the import is inlined
+ * and resolves in a microtask ahead of a render that was already asynchronous.
+ */
+const loadVizInstance = (): Promise<Viz> => import('@viz-js/viz').then((m) => m.instance());
 
-function getVizInstance() {
-  vizInstancePromise ??= instance();
+let vizLoader = loadVizInstance;
+let vizInstancePromise: Promise<Viz> | null = null;
+
+/**
+ * Delay before the one automatic re-attempt after a failed engine import.
+ * Only chunking hosts can fail here (a single-file build never fetches).
+ */
+let runtimeRetryDelayMs = 750;
+
+/**
+ * Memoized engine. A rejected load is dropped from the memo so the next call
+ * (the automatic re-attempt, a later mount, or the Retry button) issues a
+ * fresh import() instead of replaying the cached rejection.
+ */
+function getVizInstance(): Promise<Viz> {
+  if (!vizInstancePromise) {
+    const attempt = vizLoader().catch((err: unknown) => {
+      if (vizInstancePromise === attempt) vizInstancePromise = null;
+      throw err;
+    });
+    vizInstancePromise = attempt;
+  }
   return vizInstancePromise;
 }
+
+/** Test hook: stand in for the engine import and shorten the retry delay. */
+export function __setVizLoaderForTests(
+  loader: (() => Promise<Viz>) | undefined,
+  options?: { retryDelayMs?: number },
+): void {
+  vizLoader = loader ?? loadVizInstance;
+  vizInstancePromise = null;
+  runtimeRetryDelayMs = options?.retryDelayMs ?? 750;
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** One Retry re-attempts every block whose engine import failed (see utils/runtimeRetry). */
+const vizRetryEpoch = createRuntimeRetryEpoch();
 
 function parseViewBox(svgEl: SVGSVGElement): ViewBox | null {
   const raw = svgEl.getAttribute('viewBox');
@@ -107,8 +150,23 @@ export const GraphvizBlock: React.FC<{ block: Block }> = ({ block }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // True when the failure was the engine import itself (a chunking host's
+  // fetch), which is the only failure a Retry can change; a dot syntax error
+  // keeps the panel exactly as it always was.
+  const [runtimeUnavailable, setRuntimeUnavailable] = useState(false);
+  const [retryToken, setRetryToken] = useState(0);
   const [showSource, setShowSource] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  // A sibling's Retry re-attempts this block too, but only while its own
+  // failure was the shared engine import; a healthy block or a dot syntax
+  // error is left alone.
+  const runtimeUnavailableRef = useRef(runtimeUnavailable);
+  runtimeUnavailableRef.current = runtimeUnavailable;
+  useEffect(() => vizRetryEpoch.subscribe(() => {
+    if (!runtimeUnavailableRef.current) return;
+    setError(null);
+    setRetryToken((token) => token + 1);
+  }), []);
 
   const zoomLevelRef = useRef(1);
   const isDraggingRef = useRef(false);
@@ -158,8 +216,28 @@ export const GraphvizBlock: React.FC<{ block: Block }> = ({ block }) => {
     let cancelled = false;
 
     const renderDiagram = async () => {
+      let viz: Viz;
       try {
-        const viz = await getVizInstance();
+        try {
+          viz = await getVizInstance();
+        } catch {
+          // Transient chunk failure on a chunking host: one automatic
+          // re-attempt with a fresh import() after a short delay. In a
+          // single-file build the first await never rejects, so this branch
+          // is unreachable there and the success path is unchanged.
+          await wait(runtimeRetryDelayMs);
+          if (cancelled) return;
+          viz = await getVizInstance();
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to render diagram');
+          setRuntimeUnavailable(true);
+          setSvg('');
+        }
+        return;
+      }
+      try {
         const renderedSvg = await viz.renderString(block.content, { format: 'svg' });
         const cleaned = renderedSvg
           .replace(/ width="[^"]*"/, ' width="100%"')
@@ -177,10 +255,12 @@ export const GraphvizBlock: React.FC<{ block: Block }> = ({ block }) => {
           naturalBoundsRef.current = parseViewBoxFromMarkup(cleaned);
           setSvg(cleaned);
           setError(null);
+          setRuntimeUnavailable(false);
         }
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Failed to render diagram');
+          setRuntimeUnavailable(false);
           setSvg('');
         }
       }
@@ -191,7 +271,7 @@ export const GraphvizBlock: React.FC<{ block: Block }> = ({ block }) => {
     return () => {
       cancelled = true;
     };
-  }, [block.content]);
+  }, [block.content, retryToken]);
 
   useEffect(() => {
     zoomLevelRef.current = 1;
@@ -362,6 +442,16 @@ export const GraphvizBlock: React.FC<{ block: Block }> = ({ block }) => {
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
           </svg>
           <span className="text-xs text-destructive font-medium">Graphviz Error</span>
+          {runtimeUnavailable && (
+            <button
+              type="button"
+              onClick={() => vizRetryEpoch.bump()}
+              className="ml-auto rounded-md border border-destructive/30 px-2 py-0.5 text-xs text-destructive hover:bg-destructive/10"
+              title="Retry loading the diagram renderer"
+            >
+              Retry
+            </button>
+          )}
         </div>
         <pre className="p-3 text-xs text-destructive/80 overflow-x-auto">{error}</pre>
         <pre className="p-3 text-xs text-muted-foreground bg-muted/30 border-t border-border/30 overflow-x-auto">

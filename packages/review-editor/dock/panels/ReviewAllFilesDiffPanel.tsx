@@ -47,6 +47,9 @@ export const ReviewAllFilesDiffPanel: React.FC<IDockviewPanelProps> = () => {
       onAddFileCommentForFile={state.onAddFileCommentForFile}
       viewedFiles={state.viewedFiles}
       onToggleViewed={state.onToggleViewed}
+      generatedFiles={state.generatedFiles}
+      expandedGeneratedFiles={state.expandedGeneratedFiles}
+      onGeneratedFileCollapsedChange={state.onGeneratedFileCollapsedChange}
       showViewedControls={state.showViewedControls}
       stagedFiles={state.stagedFiles}
       onStage={state.onStage}

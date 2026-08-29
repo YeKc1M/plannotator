@@ -10,16 +10,33 @@ import type { CallbackConfig } from '@plannotator/ui/utils/callback';
 import type { UIPreferences } from '@plannotator/ui/utils/uiPreferences';
 import { SparklesIcon } from '@plannotator/ui/components/SparklesIcon';
 import type { CompactPlanAction } from '@plannotator/ui/components/PlanHeaderMenu';
+import { HtmlSurfaceControls } from '@plannotator/ui/components/HtmlSurfaceControls';
+
+/** Plannotator's refresh strings for the published control: the document
+ * is a file on disk, so the refresh says so. */
+export const PLANNOTATOR_HTML_REFRESH_LABELS = {
+  refreshTitle: 'Refresh HTML from disk',
+  refreshingTitle: 'Refreshing HTML from disk',
+} as const;
 
 interface AppHeaderProps {
   /** Mobile document-scroll surfaces let Safari own the top edge and scroll
    * this header with the page. Desktop keeps the incumbent sticky header. */
   sticky?: boolean;
-  /** HTML annotate surface: show a Hide/Show annotation-tools toggle in the header,
-   *  so hiding leaves the rendered HTML completely free of overlay controls. */
+  /** HTML annotate surface (raw HTML or live app): shows the pen toggle. */
   htmlSurface?: boolean;
+  /** Interact/Annotate toggle for HTML and live-app surfaces: armed means
+   *  clicks annotate; unarmed hands the page back its native interaction
+   *  (text drag-selection commenting stays live either way). */
+  htmlAnnotateArmed?: boolean;
+  onToggleHtmlAnnotate?: () => void;
+  /** Floating tools (sidebar tongue tabs + comment/attachments cluster) are
+   *  fully removed from the DOM while hidden; this button is the way back. */
   htmlToolsHidden?: boolean;
   onToggleHtmlTools?: () => void;
+  canRefreshHtml?: boolean;
+  isRefreshingHtml?: boolean;
+  onRefreshHtml?: () => void;
   /** Compact touch layouts replace the brand mark with a task-focused entry
    * into the full-stage document navigator. Desktop never receives it. */
   compactTouchLayout?: boolean;
@@ -66,6 +83,14 @@ interface AppHeaderProps {
   taterMode: boolean;
   mobileSettingsOpen: boolean;
   gitUser: string | undefined;
+  /** This session offers the Agent TUI, so Settings shows its Position row. */
+  agentTerminalAvailable: boolean;
+  /** The browser exposes WebMCP, so Settings shows the "Agent tools" opt-out.
+   *  Nothing in the header renders for this alone. */
+  webmcpAvailable?: boolean;
+  /** A browser agent has completed at least one tool call in this session.
+   *  Only then does the unobtrusive "Agent" indicator appear. */
+  agentConnected?: boolean;
 
   // Handlers — App owns all decision logic, header just calls these
   onCallbackFeedback: () => void;
@@ -109,8 +134,13 @@ interface AppHeaderProps {
 export const AppHeader = React.memo<AppHeaderProps>(({
   sticky = true,
   htmlSurface,
+  htmlAnnotateArmed,
+  onToggleHtmlAnnotate,
   htmlToolsHidden,
   onToggleHtmlTools,
+  canRefreshHtml,
+  isRefreshingHtml,
+  onRefreshHtml,
   compactTouchLayout = false,
   compactNavigatorAvailable = false,
   compactNavigatorOpen = false,
@@ -148,6 +178,9 @@ export const AppHeader = React.memo<AppHeaderProps>(({
   taterMode,
   mobileSettingsOpen,
   gitUser,
+  agentTerminalAvailable,
+  webmcpAvailable = false,
+  agentConnected = false,
   onCallbackFeedback,
   onCallbackApprove,
   onAnnotateExit,
@@ -200,16 +233,6 @@ export const AppHeader = React.memo<AppHeaderProps>(({
           )
         ) : (
           <AppHeaderLogo />
-        )}
-        {!compactTouchLayout && htmlSurface && onToggleHtmlTools && (
-          <button
-            type="button"
-            onClick={onToggleHtmlTools}
-            className="ml-1 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors px-1.5 py-1 rounded cursor-pointer"
-            title={htmlToolsHidden ? 'Show annotation tools' : 'Hide annotation tools'}
-          >
-            {htmlToolsHidden ? 'Show tools' : 'Hide tools'}
-          </button>
         )}
       </div>
 
@@ -349,6 +372,41 @@ export const AppHeader = React.memo<AppHeaderProps>(({
           </>
         )}
 
+        {/* HTML and live-app surfaces only: the eye (show/hide tools, the
+            only way back from hidden), the refresh, and the Interact/Annotate
+            pen, in that order. The published control carries the markup;
+            the compact touch shell offers the same three actions in its
+            Options menu instead (compactDocumentActions in App: Show/Hide
+            tools, Interact/Annotate, Refresh from disk). */}
+        {htmlSurface && (onToggleHtmlTools || onToggleHtmlAnnotate) && (
+          <HtmlSurfaceControls
+            compact={compactTouchLayout}
+            armed={!!htmlAnnotateArmed}
+            onToggleArmed={onToggleHtmlAnnotate}
+            toolsHidden={!!htmlToolsHidden}
+            onToggleTools={onToggleHtmlTools}
+            canRefresh={!!canRefreshHtml && !!onRefreshHtml}
+            onRefresh={() => onRefreshHtml?.()}
+            isRefreshing={!!isRefreshingHtml}
+            labels={PLANNOTATOR_HTML_REFRESH_LABELS}
+          />
+        )}
+
+        {/* WebMCP activity indicator. Deliberately absent until a browser
+            agent has completed a tool call: the API merely existing must not
+            change the page (maintainer ruling). Non-interactive; the opt-out
+            lives in Settings. */}
+        {!compactTouchLayout && agentConnected && (
+          <span
+            data-webmcp-indicator="true"
+            className="hidden md:inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+            title="A browser agent has used Plannotator's tools in this session. Its comments are marked browser-agent. Turn the tools off in Settings."
+          >
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-primary" aria-hidden="true" />
+            Agent
+          </span>
+        )}
+
         {/* Annotations panel toggle */}
         {!compactTouchLayout && !goalSetupMode && (
           <button
@@ -400,6 +458,8 @@ export const AppHeader = React.memo<AppHeaderProps>(({
             externalOpen={mobileSettingsOpen}
             onExternalClose={onCloseSettings}
             gitUser={gitUser}
+            agentTerminalAvailable={agentTerminalAvailable}
+            webmcpAvailable={webmcpAvailable}
           />
         </div>
 

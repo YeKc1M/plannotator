@@ -132,6 +132,14 @@ export interface ReviewState {
   // Viewed / staged
   viewedFiles: Set<string>;
   onToggleViewed: (filePath: string) => void;
+  // Generated files (#1317): paths marked `linguist-generated` in
+  // `.gitattributes` (server sidecar). Collapsed by default on the all-files
+  // surface; headers show a "generated" tag. Presentation-only view state.
+  generatedFiles: Set<string>;
+  /** Generated files the user explicitly expanded — session-local, survives
+   *  panel remounts. */
+  expandedGeneratedFiles: Set<string>;
+  onGeneratedFileCollapsedChange: (filePath: string, collapsed: boolean) => void;
   /** Cookie-only chrome preference (#1277): hide the Viewed controls everywhere
    *  they render. Shortcuts and viewed state itself are unaffected. */
   showViewedControls: boolean;

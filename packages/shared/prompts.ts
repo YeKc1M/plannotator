@@ -24,7 +24,8 @@ export const PLAN_TOOL_NAMES: Record<PromptRuntime, string> = {
   pi: "plannotator_submit_plan",
   codex: "ExitPlanMode",
   "gemini-cli": "exit_plan_mode",
-  kimi: "ExitPlanMode",
+kimi: "ExitPlanMode",
+  "oh-my-pi": "ExitPlanMode",
 };
 
 export function getPlanToolName(runtime?: PromptRuntime | null): string {

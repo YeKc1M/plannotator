@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import type { AnnotateAgentTerminalSide } from '@plannotator/core/agent-terminal';
 import type { Origin } from '@plannotator/core/agents';
 import type { DiffLineBgIntensity } from '@plannotator/core/config-types';
 import { configStore, useConfigValue, setReviewPanelView, setReviewDefaultDiffType } from '../config';
+import { setWebMcpToolsEnabled, useWebMcpToolsEnabled } from '../webmcp/preference';
 import { loadDiffFont } from '../utils/diffFonts';
 import { TaterSpritePullup } from './TaterSpritePullup';
 import { getIdentity, regenerateIdentity, setCustomIdentity, isIdentityEditable } from '../utils/identity';
@@ -101,6 +103,15 @@ interface SettingsProps {
   isCompactTouchLayout?: boolean;
   /** Override Obsidian vault detection (default = GET /api/obsidian/vaults). */
   onDetectObsidianVaults?: () => Promise<string[]>;
+  /** This annotate session actually offers the Agent TUI, so its Position
+   *  setting is worth showing. Default false: the setting is the only way back
+   *  from a Hidden position, but offering it where no terminal can ever run
+   *  would just be a dead control. */
+  agentTerminalAvailable?: boolean;
+  /** The browser exposes WebMCP (`document.modelContext`), so the "Agent
+   *  tools" opt-out is worth showing. Default false: a browser without the
+   *  API gets no row at all (the provider registers nothing there). */
+  webmcpAvailable?: boolean;
 }
 
 // --- Review-mode Display tab (diff display options) ---
@@ -151,6 +162,12 @@ const DEFAULT_DIFF_TYPE_OPTIONS = [
   { value: 'staged' as const, label: 'Staged', description: "Only changes you've staged for commit" },
   { value: 'merge-base' as const, label: 'Committed changes (PR view)', description: "Everything you've committed on this branch" },
   { value: 'all' as const, label: 'All Files (HEAD)', description: "Every tracked file at HEAD, shown as additions" },
+];
+
+const AGENT_TERMINAL_SIDE_OPTIONS: { value: AnnotateAgentTerminalSide; label: string }[] = [
+  { value: 'left', label: 'Left' },
+  { value: 'right', label: 'Right' },
+  { value: 'hidden', label: 'Hidden' },
 ];
 
 function SegmentedControl<T extends string>({ options, value, onChange }: {
@@ -836,7 +853,8 @@ const CommentsTab: React.FC = () => {
   );
 };
 
-export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, sinceBaseUnavailable, isCompactTouchLayout = false, onDetectObsidianVaults }) => {
+export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, sinceBaseUnavailable, isCompactTouchLayout = false, onDetectObsidianVaults, agentTerminalAvailable = false, webmcpAvailable = false }) => {
+  const webmcpTools = useWebMcpToolsEnabled();
   const [showDialog, setShowDialog] = useState(false);
   const settingsWasOpenRef = useRef(false);
   const [themePreview, setThemePreview] = useState(false);
@@ -868,6 +886,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
   const vimModeEnabled = useConfigValue('vimModeEnabled');
   const vimHudEnabled = useConfigValue('vimHudEnabled');
   const vimHudKeyPanelEnabled = useConfigValue('vimHudKeyPanelEnabled');
+  const agentTerminalSide = useConfigValue('agentTerminalSide');
   const [identity, setIdentity] = useState('');
   const [obsidian, setObsidian] = useState<ObsidianSettings>({
     enabled: false,
@@ -1269,6 +1288,39 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                       </div>
                     </div>
 
+                    {/* Agent tools (WebMCP). Shown only when the browser
+                        exposes document.modelContext; off unregisters the
+                        tools for this browser. Cookie-only and idle at its
+                        default: no cookie exists until the user opts out. */}
+                    {webmcpAvailable && (
+                      <>
+                        <div className="border-t border-border" />
+                        <div className="flex items-center justify-between" data-webmcp-setting="true">
+                          <div>
+                            <div className="text-sm font-medium">Agent tools</div>
+                            <div className="text-xs text-muted-foreground">
+                              Let your browser's agent read this document and leave comments. Approving and sending feedback stay yours.
+                            </div>
+                          </div>
+                          <button
+                            role="switch"
+                            aria-checked={webmcpTools}
+                            aria-label="Agent tools"
+                            onClick={() => setWebMcpToolsEnabled(!webmcpTools)}
+                            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                              webmcpTools ? 'bg-primary' : 'bg-muted'
+                            }`}
+                          >
+                            <span
+                              className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
+                                webmcpTools ? 'translate-x-6' : 'translate-x-1'
+                              }`}
+                            />
+                          </button>
+                        </div>
+                      </>
+                    )}
+
                     {/* Permission Mode (Claude Code only) */}
                     {origin === 'claude-code' && mode === 'plan' && (
                       <>
@@ -1380,6 +1432,37 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                                 ? 'Stay on current agent after approval'
                                 : `Switch to ${agent.switchTo} agent after approval`}
                           </div>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Agent TUI position. The same control lives in the
+                        terminal's own Display popover, but that one is
+                        unreachable once the position is Hidden — this is the
+                        way back. Both write the same config value. Gated on the
+                        terminal actually being available in this session, so a
+                        remote or runtime-less annotate never offers a dead
+                        control. */}
+                    {mode === 'annotate' && agentTerminalAvailable && (
+                      <>
+                        <div className="border-t border-border" />
+                        <div className="space-y-2">
+                          <div>
+                            <div className="text-sm font-medium">Agent TUI Position</div>
+                            <div className="text-xs text-muted-foreground">
+                              Which side the agent terminal docks on, or Hidden to keep it out of the layout
+                            </div>
+                          </div>
+                          <SegmentedControl
+                            options={AGENT_TERMINAL_SIDE_OPTIONS}
+                            value={agentTerminalSide}
+                            onChange={(v) => configStore.set('agentTerminalSide', v)}
+                          />
+                          {agentTerminalSide === 'hidden' && (
+                            <div className="text-[10px] text-muted-foreground/70">
+                              You can still open it for this session from the sidebar rail.
+                            </div>
+                          )}
                         </div>
                       </>
                     )}

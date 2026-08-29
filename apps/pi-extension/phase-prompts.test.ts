@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import plannotator from "./index.ts";
+import plannotator, { PROJECT_TRUST_CAPABILITY_WARNING } from "./index.ts";
 
 type Handler = (event: unknown, context: ReturnType<typeof createContext>) => unknown;
 
@@ -154,16 +154,6 @@ async function startAgent(
 	return results[0] as PromptResult;
 }
 
-async function filterContext(
-	runtime: ReturnType<typeof createRuntime>,
-	context: ReturnType<typeof createContext>,
-	messages: ContextMessage[],
-): Promise<ContextMessage[] | undefined> {
-	const results = await runtime.run("context", context, { messages });
-	const result = results[0] as { messages?: ContextMessage[] } | undefined;
-	return result?.messages;
-}
-
 function executingContext(
 	cwd: string,
 	options: { framingDelivered?: boolean } = {},
@@ -188,19 +178,6 @@ function executingContext(
 function templateWarnings(context: ReturnType<typeof createContext>): Array<{ message: string; level: string | undefined }> {
 	return context.notifications.filter((n) => n.level === "warning" && n.message.includes("unknown template variables"));
 }
-
-const framingMessage = (phase: string, content = `framing-${phase}`): ContextMessage => ({
-	role: "custom",
-	customType: "plannotator-framing",
-	content,
-	details: { phase },
-});
-
-const todoMessage = (content = "todo"): ContextMessage => ({
-	role: "custom",
-	customType: "plannotator-context",
-	content,
-});
 
 describe("Plannotator phase framing messages", () => {
 	test("before_agent_start never returns a systemPrompt in any phase", async () => {
@@ -267,6 +244,9 @@ describe("Plannotator phase framing messages", () => {
 		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
 		expect((await startAgent(runtime, context))?.message?.customType).toBe("plannotator-framing");
 		await runtime.commands.get("plannotator-plan-mode")?.handler("", context); // exit to idle
+		// The first idle prompt after a toggle-off carries the one-shot
+		// plan-mode-off countermand (#1320); idle injects nothing after that.
+		expect((await startAgent(runtime, context))?.message?.details).toEqual({ phase: "idle" });
 		expect(await startAgent(runtime, context)).toBeUndefined();
 
 		await runtime.commands.get("plannotator-plan-mode")?.handler("", context); // re-enter
@@ -383,9 +363,35 @@ describe("Plannotator phase framing messages", () => {
 		const result = await startAgent(runtime, context);
 		expect(result?.message?.content).toContain("[PLANNOTATOR - PLANNING PHASE]");
 		expect(result?.message?.content).not.toContain("untrusted-project-instructions");
+		// An honest trust denial is not a capability gap: the host DID answer,
+		// so the capability warning must not fire (#1353).
+		expect(context.notifications).not.toContainEqual({
+			message: PROJECT_TRUST_CAPABILITY_WARNING,
+			level: "warning",
+		});
 	});
 
-	test("fails closed with an update warning when an older Pi host lacks project trust", async () => {
+	test("loads project Plannotator config when the host reports project trust", async () => {
+		// This is both the trusted real-Pi path and the oh-my-pi path once its
+		// isProjectTrusted() === true shim ships (can1357/oh-my-pi#7958): any
+		// host-provided true is honored, with no warning.
+		const cwd = makeWorkspace({
+			phases: { planning: { instructions: "trusted-project-instructions" } },
+		});
+		const runtime = createRuntime();
+		const context = createContext({ cwd, projectTrusted: true });
+		await runtime.run("session_start", context);
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+
+		const result = await startAgent(runtime, context);
+		expect(result?.message?.content).toContain("trusted-project-instructions");
+		expect(context.notifications).not.toContainEqual({
+			message: PROJECT_TRUST_CAPABILITY_WARNING,
+			level: "warning",
+		});
+	});
+
+	test("fails closed with the capability warning when the host lacks project trust support", async () => {
 		const cwd = makeWorkspace({
 			phases: { planning: { instructions: "untrusted-project-instructions" } },
 		});
@@ -406,10 +412,37 @@ describe("Plannotator phase framing messages", () => {
 		const result = await startAgent(runtime, context);
 		expect(result?.message?.content).toContain("trusted-global-instructions");
 		expect(result?.message?.content).not.toContain("untrusted-project-instructions");
+		// Deliberate copy pin (#1353): this warning reaches two audiences that
+		// cannot be told apart at runtime (pre-0.79.1 Pi and forks that never
+		// implemented the capability, e.g. oh-my-pi), and the previous text
+		// ("update Pi") misled the fork audience. It must state the capability
+		// gap without guessing the host; do not edit it casually.
 		expect(context.notifications).toContainEqual({
-			message: "Plannotator requires Pi 0.79.1 or newer. Update Pi; project-local config is disabled on this host.",
+			message:
+				"This host does not expose project trust (ctx.isProjectTrusted, Pi 0.79.1+). Project-local config (.pi/plannotator.json) is disabled; bundled and global config still load.",
 			level: "warning",
 		});
+	});
+
+	test("a throwing isProjectTrusted propagates and keeps project config unloaded", async () => {
+		// Real Pi's isProjectTrusted throws on a stale extension context
+		// (runner.assertActive). The guard deliberately does not swallow that:
+		// the session_start handler rejects and config loading never runs, so
+		// project-local config still cannot load (fail closed). Wrapping the
+		// call in a try/catch that defaults to trusted would fail here.
+		const cwd = makeWorkspace({
+			phases: { planning: { instructions: "untrusted-project-instructions" } },
+		});
+		const runtime = createRuntime();
+		const context = createContext({ cwd });
+		(context as { isProjectTrusted: () => boolean }).isProjectTrusted = () => {
+			throw new Error("stale context");
+		};
+
+		await expect(runtime.run("session_start", context)).rejects.toThrow("stale context");
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+		const result = await startAgent(runtime, context);
+		expect(result?.message?.content ?? "").not.toContain("untrusted-project-instructions");
 	});
 
 	test("persistState records the framing latch on both sides", async () => {
@@ -536,78 +569,307 @@ describe("Plannotator phase framing messages", () => {
 	});
 });
 
-describe("Plannotator context filtering", () => {
-	test("idle filters out all plannotator-injected messages", async () => {
+describe("Plannotator plan-mode-off countermand (#1320)", () => {
+	test("toggling plan mode off delivers the plan-mode-off notice exactly once", async () => {
 		const cwd = makeWorkspace();
 		const runtime = createRuntime();
 		const context = createContext({ cwd });
 		await runtime.run("session_start", context);
 
-		const kept = await filterContext(runtime, context, [
-			{ role: "user", content: "real question" },
-			framingMessage("planning"),
-			todoMessage(),
-			{ role: "user", content: "[PLANNOTATOR - PLANNING PHASE] legacy injected" },
-			{ role: "assistant", content: "answer" },
-		]);
-
-		expect(kept?.map((m) => m.content)).toEqual(["real question", "answer"]);
-	});
-
-	test("executing drops stale planning framing and keeps only the current framing", async () => {
-		const cwd = makeWorkspace();
-		writeFileSync(join(cwd, "PLAN.md"), "# Plan\n\n- [ ] Step one\n", "utf-8");
-		const runtime = createRuntime();
-		const context = executingContext(cwd);
-		await runtime.run("session_start", context);
-
-		const kept = await filterContext(runtime, context, [
-			framingMessage("planning"),
-			{ role: "user", content: "please plan" },
-			todoMessage("stale todo from an earlier cycle"),
-			framingMessage("executing", "current executing framing"),
-			todoMessage("current todo"),
-			{ role: "assistant", content: "working" },
-		]);
-
-		expect(kept?.map((m) => m.content)).toEqual([
-			"please plan",
-			"current executing framing",
-			"current todo",
-			"working",
-		]);
-	});
-
-	test("a planning re-entry keeps only the newest planning framing", async () => {
-		const cwd = makeWorkspace();
-		const runtime = createRuntime();
-		const context = createContext({ cwd });
-		await runtime.run("session_start", context);
 		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+		expect((await startAgent(runtime, context))?.message?.customType).toBe("plannotator-framing");
 
-		const kept = await filterContext(runtime, context, [
-			framingMessage("planning", "old cycle framing"),
-			{ role: "user", content: "first cycle" },
-			framingMessage("planning", "new cycle framing"),
-			{ role: "user", content: "second cycle" },
-		]);
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context); // toggle off
+		// The transition arms the latch and persists it, so a resume between
+		// the toggle and the next prompt still owes the notice.
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "idle",
+			idleNoticePending: true,
+		});
 
-		expect(kept?.map((m) => m.content)).toEqual(["first cycle", "new cycle framing", "second cycle"]);
+		const notice = await startAgent(runtime, context);
+		expect(notice?.message?.customType).toBe("plannotator-framing");
+		expect(notice?.message?.display).toBe(false);
+		expect(notice?.message?.details).toEqual({ phase: "idle" });
+		// Deliberate protocol marker (mirrors the pinned phase markers): the
+		// idle context filter anchors on framing with details.phase "idle",
+		// and the marker names the countermand for humans reading transcripts.
+		expect(notice?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "idle",
+			idleNoticePending: false,
+		});
+
+		// One-shot: later idle prompts inject nothing again (#1269 steady state).
+		expect(await startAgent(runtime, context)).toBeUndefined();
+		expect(await startAgent(runtime, context)).toBeUndefined();
 	});
 
-	test("an active phase without its own framing still drops other-phase framing", async () => {
-		const cwd = makeWorkspace({ phases: { executing: { instructions: null } } });
-		writeFileSync(join(cwd, "PLAN.md"), "# Plan\n\n- [ ] Step one\n", "utf-8");
+	test("plan completion (executing → idle) also delivers the notice", async () => {
+		const cwd = makeWorkspace();
+		writeFileSync(join(cwd, "PLAN.md"), "# Plan\n\n- [x] Step one\n- [x] Step two\n", "utf-8");
 		const runtime = createRuntime();
-		const context = executingContext(cwd);
+		const context = executingContext(cwd, { framingDelivered: true });
 		await runtime.run("session_start", context);
 
-		const kept = await filterContext(runtime, context, [
-			framingMessage("planning"),
-			{ role: "user", content: "prompt" },
-			todoMessage("current todo"),
-		]);
+		// All steps complete: agent_end returns the session to idle.
+		await runtime.run("agent_end", context, {});
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "idle",
+			idleNoticePending: true,
+		});
 
-		expect(kept?.map((m) => m.content)).toEqual(["prompt", "current todo"]);
+		const notice = await startAgent(runtime, context);
+		expect(notice?.message?.details).toEqual({ phase: "idle" });
+		expect(notice?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+		expect(await startAgent(runtime, context)).toBeUndefined();
+	});
+
+	test("resync fallback: a recorded executing phase whose plan file is gone demotes to idle WITH the notice armed", async () => {
+		// The session provably used plan mode (only a persisted executing entry
+		// reaches this fallback), so its framing residue is in history and the
+		// countermand is owed. Deleting the idleNoticePending arm in the
+		// missing-plan-file fallback must fail here.
+		const cwd = makeWorkspace();
+		// Deliberately NO PLAN.md on disk.
+		const runtime = createRuntime();
+		const context = executingContext(cwd, { framingDelivered: true });
+		await runtime.run("session_start", context);
+
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "idle",
+			idleNoticePending: true,
+		});
+		const notice = await startAgent(runtime, context);
+		expect(notice?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+		expect(await startAgent(runtime, context)).toBeUndefined();
+	});
+
+	test("resync fallback: a recorded executing phase with no submitted path demotes to idle WITH the notice armed", async () => {
+		// Same recorded-executing demotion as the missing-file case, hit when
+		// the state entry never captured lastSubmittedPath. Deleting the
+		// idleNoticePending arm in the no-path fallback must fail here.
+		const cwd = makeWorkspace();
+		const runtime = createRuntime();
+		const context = createContext({
+			cwd,
+			entries: [
+				{
+					type: "custom",
+					customType: "plannotator",
+					data: { phase: "executing", framingDelivered: true },
+				},
+			],
+		});
+		await runtime.run("session_start", context);
+
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "idle",
+			idleNoticePending: true,
+		});
+		const notice = await startAgent(runtime, context);
+		expect(notice?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+		expect(await startAgent(runtime, context)).toBeUndefined();
+	});
+
+	test("fresh sessions never deliver the notice: the #1269 inject-nothing promise holds", async () => {
+		const cwd = makeWorkspace();
+		const runtime = createRuntime();
+		const context = createContext({ cwd });
+		await runtime.run("session_start", context);
+
+		// A session that never entered plan mode injects nothing, ever — the
+		// reporter's patch on #1320 (deliver on every idle entry, fresh
+		// sessions included) must fail here and in "idle prompts inject
+		// nothing" above.
+		expect(await startAgent(runtime, context)).toBeUndefined();
+		expect(await startAgent(runtime, context)).toBeUndefined();
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "idle",
+			idleNoticePending: false,
+		});
+	});
+
+	test("a resumed idle session that already delivered the notice does not repeat it", async () => {
+		const cwd = makeWorkspace();
+		const runtime = createRuntime();
+		const context = createContext({
+			cwd,
+			entries: [
+				{
+					type: "custom",
+					customType: "plannotator",
+					data: { phase: "idle", framingDelivered: false, idleNoticePending: false },
+				},
+			],
+		});
+		await runtime.run("session_start", context);
+
+		expect(await startAgent(runtime, context)).toBeUndefined();
+	});
+
+	test("a path that recorded the toggle-off but not the delivery still owes the notice", async () => {
+		const cwd = makeWorkspace();
+		const runtime = createRuntime();
+		const context = createContext({ cwd });
+		await runtime.run("session_start", context);
+
+		// Branch onto a path whose last state entry armed the latch (toggle-off
+		// persisted, notice not yet delivered on that path).
+		const pendingPath = createContext({
+			cwd,
+			entries: [
+				{
+					type: "custom",
+					customType: "plannotator",
+					data: { phase: "idle", framingDelivered: false, idleNoticePending: true },
+				},
+			],
+		});
+		await runtime.run("session_tree", pendingPath, { newLeafId: "n1", oldLeafId: null });
+
+		const notice = await startAgent(runtime, pendingPath);
+		expect(notice?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+		expect(await startAgent(runtime, pendingPath)).toBeUndefined();
+	});
+
+	test("re-entering planning supersedes an undelivered notice", async () => {
+		const cwd = makeWorkspace();
+		const runtime = createRuntime();
+		const context = createContext({ cwd });
+		await runtime.run("session_start", context);
+
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+		expect((await startAgent(runtime, context))?.message?.customType).toBe("plannotator-framing");
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context); // off: notice pending
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context); // on again, no turn between
+
+		// The load-bearing contract of enterPlanning's latch clear: the
+		// re-entered planning state entry must NOT carry a pending notice.
+		// If it did, the latch would propagate into planning/executing state
+		// entries and re-arm through the resync fallbacks, delivering a stale
+		// "plan mode is off" into a session that is back IN plan mode.
+		expect(runtime.lastPersistedState()).toMatchObject({
+			phase: "planning",
+			idleNoticePending: false,
+		});
+
+		// The first prompt of the new cycle delivers planning framing, not a
+		// stale "plan mode is off" — that would contradict the toggle.
+		const reentry = await startAgent(runtime, context);
+		expect(reentry?.message?.content).toContain("[PLANNOTATOR - PLANNING PHASE]");
+		expect(reentry?.message?.details).toEqual({ phase: "planning" });
+
+		// The next toggle-off re-arms and delivers normally.
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+		expect((await startAgent(runtime, context))?.message?.content).toContain(
+			"[PLANNOTATOR - PLAN MODE OFF]",
+		);
+	});
+});
+
+describe("Plannotator append-only conversation (#1380)", () => {
+	// Pi applies "context" handler results only to the outgoing LLM request,
+	// but the provider prompt cache keys on the exact request prefix, so a
+	// handler that changes its verdict on an already-sent message re-bills the
+	// whole tail as uncached input. requestView models Pi's transformContext:
+	// handlers shape the request when present, otherwise it IS the history.
+	async function requestView(
+		runtime: ReturnType<typeof createRuntime>,
+		context: ReturnType<typeof createContext>,
+		history: ContextMessage[],
+	): Promise<ContextMessage[]> {
+		const results = await runtime.run("context", context, { messages: history });
+		for (const result of results) {
+			const shaped = (result as { messages?: ContextMessage[] } | undefined)?.messages;
+			if (shaped) return shaped;
+		}
+		return history;
+	}
+
+	function toInjected(result: PromptResult): ContextMessage {
+		if (!result?.message) throw new Error("expected an injected message");
+		return {
+			role: "custom",
+			customType: result.message.customType,
+			content: result.message.content,
+			details: result.message.details,
+		};
+	}
+
+	test("the outgoing request stays prefix-stable across planning, executing, and back to idle", async () => {
+		// The #1380 regression: the old context filter stripped delivered
+		// framing from mid-history at phase transitions, shifting every later
+		// message and invalidating the provider's cached prefix (88 of 119
+		// messages re-billed in the reporter's session). Any reintroduced
+		// handler that reshapes already-sent history fails the prefix
+		// comparisons below.
+		const cwd = makeWorkspace();
+		writeFileSync(join(cwd, "PLAN.md"), "# Plan\n\n- [ ] Step one\n", "utf-8");
+		const runtime = createRuntime();
+		const context = createContext({ cwd });
+		await runtime.run("session_start", context);
+
+		const history: ContextMessage[] = [];
+		const assertExtends = (next: ContextMessage[], prev: ContextMessage[]): void => {
+			expect(next.length).toBeGreaterThanOrEqual(prev.length);
+			for (let i = 0; i < prev.length; i++) {
+				expect(JSON.stringify(next[i])).toBe(JSON.stringify(prev[i]));
+			}
+		};
+
+		// Planning turn: framing is delivered and appended like the host would.
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+		history.push({ role: "user", content: "plan this" });
+		history.push(toInjected(await startAgent(runtime, context)));
+		history.push({ role: "assistant", content: "drafted the plan" });
+		const planningRequest = await requestView(runtime, context, history);
+		assertExtends(planningRequest, []);
+
+		// Executing turn (same runtime, phase flipped through the session-tree
+		// resync): the planning framing already sent upstream must survive.
+		const executingPath = executingContext(cwd);
+		await runtime.run("session_tree", executingPath, { newLeafId: "n1", oldLeafId: null });
+		history.push({ role: "user", content: "approved, go" });
+		history.push(toInjected(await startAgent(runtime, executingPath)));
+		history.push({ role: "assistant", content: "working [DONE:1]" });
+		const executingRequest = await requestView(runtime, executingPath, history);
+		assertExtends(executingRequest, planningRequest);
+
+		// Back to idle: everything sent during both phases must survive, and
+		// the plan-mode-off countermand arrives as a pure suffix append.
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", executingPath);
+		const notice = await startAgent(runtime, executingPath);
+		expect(notice?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+		history.push(toInjected(notice));
+		const idleRequest = await requestView(runtime, executingPath, history);
+		assertExtends(idleRequest, executingRequest);
+		expect(idleRequest[idleRequest.length - 1]?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+	});
+
+	test("phase framing carries the superseding language that replaced removal", async () => {
+		// With history append-only, stale instructions are neutralized by
+		// countermand text instead of deletion. Deliberate protocol copy pins:
+		// trimming these sentences silently reopens the stale-steering hole the
+		// removed filter used to cover, so they must not drift.
+		const cwd = makeWorkspace();
+		writeFileSync(join(cwd, "PLAN.md"), "# Plan\n\n- [ ] Step one\n", "utf-8");
+
+		const planningRuntime = createRuntime();
+		const planningCtx = createContext({ cwd });
+		await planningRuntime.run("session_start", planningCtx);
+		await planningRuntime.commands.get("plannotator-plan-mode")?.handler("", planningCtx);
+		const planning = await startAgent(planningRuntime, planningCtx);
+		expect(planning?.message?.content).toContain(
+			"supersedes every earlier Plannotator instruction",
+		);
+
+		const executingRuntime = createRuntime();
+		const executing = executingContext(cwd);
+		await executingRuntime.run("session_start", executing);
+		const framing = await startAgent(executingRuntime, executing);
+		expect(framing?.message?.content).toContain(
+			"supersedes every earlier Plannotator instruction",
+		);
 	});
 });

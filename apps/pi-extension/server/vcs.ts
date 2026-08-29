@@ -91,7 +91,12 @@ function runCommand(
 			stdoutChunks.push(chunk);
 		});
 		proc.stderr!.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-		if (options?.stdin !== undefined) proc.stdin!.end(options.stdin);
+		if (options?.stdin !== undefined) {
+			// A timeout-killed process can reject the stdin write while close is
+			// already being handled. Do not let that secondary EPIPE escape.
+			proc.stdin!.on("error", () => {});
+			proc.stdin!.end(options.stdin);
+		}
 
 		proc.on("close", (code) => {
 			if (timer) clearTimeout(timer);

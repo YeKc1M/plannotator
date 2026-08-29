@@ -1,3 +1,14 @@
+// Eager renderer registration (side-effect imports, evaluated before every
+// other module below). These keep Plannotator's first paint, identity minting
+// and failure surface byte-identical now that @plannotator/ui loads KaTeX, the
+// username dictionary and the Mermaid runtime lazily for hosts: math is typeset
+// on the first commit, names come from the full dictionary, and Mermaid stays
+// in this app's entry chunk (the review editor never renders Mermaid and does
+// not import that entry). Guarded by tests/entry-assets.test.ts; do not drop
+// or reorder any of these lines.
+import '@plannotator/ui/utils/math-eager';
+import '@plannotator/ui/utils/identity-tater';
+import '@plannotator/ui/utils/mermaid-eager';
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
 import { toast, Toaster } from 'sonner';
 import { type Origin, getAgentName } from '@plannotator/shared/agents';
@@ -117,8 +128,10 @@ import { modKey } from '@plannotator/ui/utils/platform';
 import {
   annotateSidebarShortcuts,
   useAnnotateSidebarShortcuts,
+  useAnnotationModeShortcuts,
   useDocumentViewShortcuts,
   useDoubleTapShortcuts,
+  useHtmlAnnotateShortcuts,
 } from '@plannotator/ui/shortcuts';
 const USE_DIFF_DEMO =
   import.meta.env.VITE_DIFF_DEMO === '1' ||
@@ -132,6 +145,10 @@ import {
   usePlanDiffViewAutoExit,
 } from './hooks/usePlanDiffViewAutoExit';
 import { AppHeader } from './components/AppHeader';
+import { useHtmlRefresh, type HtmlRefreshedDocument } from './hooks/useHtmlRefresh';
+import { AgentNudgeBanner } from './components/AgentNudgeBanner';
+import { useDocumentWebMcp } from './webmcp/useDocumentWebMcp';
+import { useWebMcpActivity } from '@plannotator/ui/webmcp';
 import type { CompactPlanAction } from '@plannotator/ui/components/PlanHeaderMenu';
 import { FolderAnnotationEmptyState } from './components/FolderAnnotationEmptyState';
 import { CompactAnnotationControls } from './components/CompactAnnotationControls';
@@ -153,6 +170,14 @@ import {
   AnnotateAgentTerminalPanel,
   type AnnotateAgentTerminalPanelHandle,
 } from './components/AnnotateAgentTerminalPanel';
+import {
+  saveAnnotateAgentTerminalSide,
+  type AnnotateAgentTerminalSide,
+} from '@plannotator/ui/utils/annotateAgentTerminal';
+import {
+  AGENT_TERMINAL_LG_BREAKPOINT,
+  getAgentTerminalLayout,
+} from './agentTerminalLayout';
 import {
   buildAgentTerminalDeliveryRecord,
   buildTerminalAskPrompt,
@@ -468,25 +493,34 @@ const App: React.FC = () => {
   const [rawHtml, setRawHtml] = useState('');
   const [htmlDiffHtml, setHtmlDiffHtml] = useState<string | null>(null);
   const [shareHtml, setShareHtml] = useState('');
+  // Live app annotation (mode "annotate-app"): the HtmlViewer navigates the
+  // loopback proxy origin instead of rendering srcdoc HTML. Pinpoint-only,
+  // vim/edit/diff/share hidden, annotations stamped with the page they were
+  // made on.
+  const [liveApp, setLiveApp] = useState<{ appUrl: string; origin: string; token: string } | null>(null);
+  const [livePageUrl, setLivePageUrl] = useState('');
+  // Interact/Annotate mode for HTML and live-app surfaces. Armed = the bridge
+  // captures clicks for pinpoint annotation; disarmed (Interact) = clicks are
+  // fully native while committed markers stay visible/clickable and text
+  // drag-selection commenting stays live. Session-only, never persisted.
+  // BOTH surface kinds start armed; Esc (or the header pen) drops to
+  // Interact.
+  const [htmlAnnotateArmed, setHtmlAnnotateArmed] = useState(true);
+  const handleHtmlAnnotateToggle = useCallback(() => setHtmlAnnotateArmed((v) => !v), []);
+  const handleHtmlAnnotateExit = useCallback(() => setHtmlAnnotateArmed(false), []);
   // Session-level force-markdown preference (`--markdown`). When set, folder/linked HTML
   // files are converted instead of rendered raw — threaded into /api/doc as &convert=1.
   const [convertHtml, setConvertHtml] = useState(false);
-  // Hide the floating HTML annotation controls (toolstrip + action cluster) so the
-  // user can read the rendered page unobstructed. Selections/annotations are unaffected.
-  // First-ever HTML session opens minimal (everything hidden); afterwards the user's
-  // last chrome state is restored from the persisted cookie (see utils/htmlChrome.ts).
-  const [htmlToolsHidden, setHtmlToolsHidden] = useState(false);
   // Gate for the chrome-persistence writer: only start saving once the persisted
   // state has been applied, so a pre-restore render can't clobber the cookie.
   const htmlChromeRestoredRef = useRef(false);
   // The restore's own commit still renders pre-restore values; the writer
   // consumes this flag to skip that exact run (see the save effect).
   const skipNextHtmlChromeSaveRef = useRef(false);
-  // Every overlay the document surface paints over a rendered HTML page — the
-  // toolstrip and the collapsed sidebar tab flags — drops out together, so the
-  // page really gets the whole viewport. The header's "Show tools" button stays
-  // put, and Mod+B still opens the sidebar, so neither can be locked away.
-  const htmlChromeHidden = isHtmlSurface && htmlToolsHidden;
+  // Header "Hide tools": removes ALL floating chrome over the page (sidebar
+  // tongue tabs + comment/attachments cluster) from the DOM. The header
+  // button itself is the way back, so hidden state can never strand.
+  const [htmlToolsHidden, setHtmlToolsHidden] = useState(false);
   const [imageBaseDir, setImageBaseDir] = useState<string | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -502,6 +536,10 @@ const App: React.FC = () => {
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
   const [agentTerminalCapability, setAgentTerminalCapability] = useState<AgentTerminalCapability | null>(null);
   const [isAgentTerminalOpen, setIsAgentTerminalOpen] = useState(false);
+  // Durable placement preference (server config > cookie > 'left'). Read through
+  // ConfigStore rather than component state so the Settings dialog's copy of the
+  // Position control and the terminal's own popover stay in step.
+  const agentTerminalSide = useConfigValue('agentTerminalSide');
   const [isAgentTerminalRunning, setIsAgentTerminalRunning] = useState(false);
   const [isAgentTerminalReady, setIsAgentTerminalReady] = useState(false);
   const [agentTerminalSessionId, setAgentTerminalSessionId] = useState<number | null>(null);
@@ -546,6 +584,7 @@ const App: React.FC = () => {
   });
   const [showLookAndFeelAnnouncement, setShowLookAndFeelAnnouncement] = useState(needsLookAndFeelAnnouncement);
   const isMobile = useIsMobile();
+  const isBelowAgentTerminalBreakpoint = useIsMobile(AGENT_TERMINAL_LG_BREAKPOINT);
   const isCompactTouchLayout = useCompactTouchLayout();
   const usesDocumentScroll = isCompactTouchLayout;
   const effectiveEditorMode: EditorMode = isCompactTouchLayout ? 'selection' : editorMode;
@@ -565,6 +604,36 @@ const App: React.FC = () => {
   const isCompactReviewOpen = isCompactTouchLayout && compactPlanSurface.type === 'review';
   const effectivePanelOpen = shouldPresentDesktopPlanPanel(isCompactTouchLayout, isPanelOpen);
 
+  // Resolved high, not at render time, because `isRightPanelVisible` is what
+  // decides whether the right-hand annotations/AI surface is actually on screen
+  // — and consumers of that fact (notably the Ask AI model-discovery effect)
+  // read it well before the JSX. Computing it late let those consumers fall
+  // back to `effectivePanelOpen`, which stays true under a right-docked
+  // terminal and so reported an invisible surface as open.
+  const showAgentTerminalControls =
+    annotateMode &&
+    annotateSource !== 'message' &&
+    agentTerminalCapability !== null &&
+    !goalSetupMode;
+  const {
+    shouldRender: shouldRenderAgentTerminal,
+    isVisible: isAgentTerminalVisible,
+    isLeftVisible: isLeftAgentTerminalVisible,
+    showOnLeft: showAgentTerminalOnLeft,
+    showOnRight: showAgentTerminalOnRight,
+    isRightPanelVisible,
+    dockClassName: agentTerminalDockClassName,
+    placement: agentTerminalPlacement,
+  } = getAgentTerminalLayout({
+    showControls: showAgentTerminalControls,
+    isOpen: isAgentTerminalOpen,
+    isRunning: isAgentTerminalRunning,
+    isWideMode: wideModeType !== null,
+    isBelowBreakpoint: isBelowAgentTerminalBreakpoint,
+    side: agentTerminalSide,
+    isRightPanelOpen: effectivePanelOpen,
+  });
+
   // Compact interactions never write into the remembered desktop rail/panel
   // state. Crossing back to a fine-pointer workspace simply removes the
   // transient foreground surface and reveals the incumbent desktop layout.
@@ -578,7 +647,6 @@ const App: React.FC = () => {
     // explicit desktop choice without letting compact changes write it back.
     setCompactInputMethod(inputMethod);
   }, [inputMethod, isCompactTouchLayout]);
-
   const viewerRef = useRef<ViewerHandle>(null);
   // Desktop uses the main document element as its native scroll viewport.
   // Compact coarse-pointer browsers use the page scroller so Mobile Safari
@@ -633,8 +701,10 @@ const App: React.FC = () => {
     defaultWidth: 360,
     minWidth: 280,
     maxWidth: 640,
-    side: 'left',
-    onSnapClose: () => setIsAgentTerminalOpen(false),
+    // The handle follows the edge the panel actually docks against, which for a
+    // 'hidden' preference opened for the session is the left fallback.
+    side: agentTerminalPlacement,
+    onSnapClose: () => hideAgentTerminal(),
     // Single click on the handle (no drag) collapses it.
     onClick: () => hideAgentTerminal(),
     apply: (w) => document.documentElement.style.setProperty('--agent-terminal-w', `${w}px`),
@@ -736,6 +806,38 @@ const App: React.FC = () => {
     }, 0);
   }, []);
 
+  const hideAgentTerminal = useCallback(() => {
+    setIsAgentTerminalOpen(false);
+  }, []);
+
+  /**
+   * RIGHT-SLOT INVARIANT (see also getAgentTerminalLayout in
+   * ./agentTerminalLayout, and the panel render site below).
+   *
+   * A right-docked Agent TUI and the annotations/AI panel compete for the same
+   * slot, and the coordination between them is deliberately ASYMMETRIC:
+   *
+   *  - Panel wins over terminal, destructively. Asking for annotations or Ask
+   *    AI is a request for that specific surface, so the terminal gives up the
+   *    slot: `isAgentTerminalOpen` goes false. Nothing is lost — a running
+   *    agent stays mounted off-layout, so reopening returns to the same
+   *    session rather than a fresh PTY.
+   *  - Terminal wins over panel, non-destructively. Opening the terminal only
+   *    suppresses the panel visually (`isRightPanelVisible`); `isPanelOpen`
+   *    and the selected tab are left alone, so dismissing the terminal
+   *    restores exactly the surface the user had.
+   *
+   * Making this symmetric (closing the panel outright when the terminal opens)
+   * was considered and rejected: the terminal is frequently a short detour
+   * from an annotation pass, and clearing the panel would make every detour
+   * cost the user their place. The asymmetry is the UX, not an oversight.
+   */
+  const replaceRightAgentTerminalWithPanel = useCallback((tab: 'annotations' | 'ai') => {
+    hideAgentTerminal();
+    setRightSidebarTab(tab);
+    setIsPanelOpen(true);
+  }, [hideAgentTerminal]);
+
   const handleAnnotationPanelToggle = useCallback(() => {
     if (isCompactTouchLayout) {
       openCompactPlanSurface('annotations');
@@ -746,9 +848,15 @@ const App: React.FC = () => {
       setRightSidebarTab('annotations');
       return;
     }
+    // Right-slot invariant: only a VISIBLE right-docked terminal is holding the
+    // slot. A collapsed-but-running one is off-layout and must not be evicted.
+    if (agentTerminalPlacement === 'right' && isAgentTerminalVisible) {
+      replaceRightAgentTerminalWithPanel('annotations');
+      return;
+    }
     setRightSidebarTab('annotations');
     setIsPanelOpen(prev => rightSidebarTab === 'annotations' ? !prev : true);
-  }, [exitWideMode, isCompactTouchLayout, openCompactPlanSurface, rightSidebarTab, wideModeType]);
+  }, [agentTerminalPlacement, exitWideMode, isAgentTerminalVisible, isCompactTouchLayout, openCompactPlanSurface, replaceRightAgentTerminalWithPanel, rightSidebarTab, wideModeType]);
 
   const dismissLookAndFeelAnnouncement = useCallback(() => {
     // Persist even when the user accepts the displayed default without first
@@ -768,12 +876,22 @@ const App: React.FC = () => {
       setRightSidebarTab('ai');
       return;
     }
+    // Right-slot invariant: see replaceRightAgentTerminalWithPanel above.
+    if (agentTerminalPlacement === 'right' && isAgentTerminalVisible) {
+      replaceRightAgentTerminalWithPanel('ai');
+      return;
+    }
     setRightSidebarTab('ai');
     setIsPanelOpen(prev => rightSidebarTab === 'ai' ? !prev : true);
-  }, [exitWideMode, isCompactTouchLayout, openCompactPlanSurface, rightSidebarTab, wideModeType]);
+  }, [agentTerminalPlacement, exitWideMode, isAgentTerminalVisible, isCompactTouchLayout, openCompactPlanSurface, replaceRightAgentTerminalWithPanel, rightSidebarTab, wideModeType]);
 
-  const hideAgentTerminal = useCallback(() => {
-    setIsAgentTerminalOpen(false);
+  /**
+   * Record the durable placement. Writing through ConfigStore is the whole
+   * update: `agentTerminalSide` is a useConfigValue subscriber, so the terminal
+   * popover and the Settings dialog observe the same value.
+   */
+  const handleAgentTerminalSideChange = useCallback((side: AnnotateAgentTerminalSide) => {
+    saveAnnotateAgentTerminalSide(side);
   }, []);
 
   const setAgentTerminalDelivery = useCallback((delivery: AgentTerminalDeliveryRecord | null) => {
@@ -804,6 +922,12 @@ const App: React.FC = () => {
     setAgentTerminalSessionId(agentTerminalSessionSeqRef.current);
   }, [setAgentTerminalDelivery]);
 
+  /**
+   * Explicit intent to see the terminal now: the rail toggle, Shift Shift, or
+   * a message routed to the agent. Deliberately does NOT rewrite a 'hidden'
+   * preference — asking for the panel once is not the same as asking for it
+   * every session, so the open is session-scoped and the preference survives.
+   */
   const openAgentTerminal = useCallback(() => {
     if (wideModeType !== null) {
       exitWideMode({ restore: false, panelOpen: false });
@@ -823,6 +947,16 @@ const App: React.FC = () => {
     if (annotateMode && annotateSource !== 'message' && agentTerminalCapability) return;
     closeAgentTerminal();
   }, [agentTerminalCapability, annotateMode, annotateSource, closeAgentTerminal]);
+
+  // Choosing "Hidden" closes the terminal, from either surface that offers the
+  // Position control (the terminal's own popover, which then disappears, and
+  // the Settings dialog, which is how you get it back). Keyed on the preference
+  // alone, so a later explicit open in the same session is not undone: the
+  // effect does not re-run until the preference changes again.
+  useEffect(() => {
+    if (agentTerminalSide !== 'hidden') return;
+    closeAgentTerminal();
+  }, [agentTerminalSide, closeAgentTerminal]);
 
   // Sync sidebar open state when the "Auto-open Sidebar" preference changes in
   // Settings. Deliberately does NOT react to the document or render mode —
@@ -962,6 +1096,7 @@ const App: React.FC = () => {
   const activeDiffPreviousPlan = linkedDocHook.isActive ? linkedDocHook.diffPreviousPlan : previousPlan;
   const activeDiffVersionInfo = linkedDocHook.isActive ? linkedDocHook.diffVersionInfo : versionInfo;
   const activeDocFilepath = linkedDocHook.isActive ? linkedDocHook.filepath : null;
+  const activeHtmlPath = linkedDocHook.filepath ?? sourceFilePath ?? null;
 
   // Per-document version fetchers: only needed while a document with its own
   // diff baseline is active (folder annotate) — usePlanDiff's bare-endpoint
@@ -1065,6 +1200,45 @@ const App: React.FC = () => {
     setMarkdown, setAnnotations, setSelectedAnnotationId, setSubmitted,
   });
   const documentReadOnly = archive.archiveMode;
+  // A Refresh lands the bytes and, for the root document, the version diff
+  // the server recomputed against them (previousPlan/versionInfo still name
+  // the saved baseline). The view returns to normal mode with the "Show
+  // changes" toggle available whenever a diff came back; a refresh of a
+  // linked doc keeps the root's version fields untouched, as before.
+  const applyRefreshedHtml = useCallback((refreshed: HtmlRefreshedDocument) => {
+    setRawHtml(refreshed.rawHtml);
+    setShareHtml('');
+    setIsPlanDiffActive(false);
+    if (linkedDocHook.isActive) {
+      setHtmlDiffHtml(null);
+      return;
+    }
+    setHtmlDiffHtml(refreshed.diffHtml ?? null);
+    setPreviousPlan(refreshed.previousPlan ?? null);
+    setVersionInfo(refreshed.versionInfo ?? null);
+  }, [linkedDocHook.isActive]);
+  // Annotations a Refresh could no longer anchor: the panel shows an
+  // "Unanchored" chip on them. Set from the refresh's restore report only,
+  // so the chip is exactly the toast's list; a document change clears it.
+  const [htmlUnanchoredIds, setHtmlUnanchoredIds] = useState<ReadonlySet<string>>(() => new Set());
+  const handleHtmlRefreshUnanchored = useCallback((ids: string[]) => {
+    setHtmlUnanchoredIds(new Set(ids));
+  }, []);
+  useEffect(() => {
+    setHtmlUnanchoredIds((prev) => (prev.size === 0 ? prev : new Set()));
+  }, [activeHtmlPath]);
+  const htmlRefresh = useHtmlRefresh({
+    enabled: isApiMode && annotateMode && isHtmlSurface && !liveApp && !documentReadOnly,
+    activePath: activeHtmlPath,
+    onSnapshot: applyRefreshedHtml,
+    onUnanchored: handleHtmlRefreshUnanchored,
+  });
+  const htmlShareContext = useMemo(
+    () => ({ activePath: activeHtmlPath, reloadGeneration: htmlRefresh.reloadGeneration }),
+    [activeHtmlPath, htmlRefresh.reloadGeneration],
+  );
+  const latestHtmlShareContextRef = useRef(htmlShareContext);
+  latestHtmlShareContextRef.current = htmlShareContext;
 
   const canUseWideMode = useMemo(() => canUseAnnotateWideMode({
     archiveMode: archive.archiveMode,
@@ -1701,7 +1875,7 @@ const App: React.FC = () => {
     if (!isApiMode) return rawHtml;
 
     const params = new URLSearchParams();
-    const activePath = linkedDocHook.filepath ?? sourceFilePath;
+    const { activePath } = htmlShareContext;
     if (activePath) params.set('path', activePath);
     const query = params.toString();
     const res = await fetch(`/api/share-html${query ? `?${query}` : ''}`);
@@ -1709,9 +1883,12 @@ const App: React.FC = () => {
     if (!res.ok || data.error || typeof data.shareHtml !== 'string') {
       throw new Error(data.error || 'Failed to prepare HTML for sharing');
     }
+    if (latestHtmlShareContextRef.current !== htmlShareContext) {
+      throw new Error('HTML changed while preparing the share link');
+    }
     setShareHtml(data.shareHtml);
     return data.shareHtml;
-  }, [isApiMode, linkedDocHook.filepath, rawHtml, renderAs, shareHtml, sourceFilePath]);
+  }, [htmlShareContext, isApiMode, rawHtml, renderAs, shareHtml]);
 
   // URL-based sharing
   const {
@@ -1747,6 +1924,7 @@ const App: React.FC = () => {
     setRawHtml,
     setShareHtml,
     setRenderAs,
+    htmlRefresh.reloadGeneration,
   );
 
   useEffect(() => {
@@ -1778,10 +1956,13 @@ const App: React.FC = () => {
 
   // Restore-on-entry: every time the session transitions ONTO an HTML surface
   // (a root raw-HTML session, or a linked .html doc opened from markdown),
-  // apply the chrome the user last left an HTML session with (first-ever run:
-  // everything hidden, sidebar closed — a minimal "just the page" paint).
-  // Re-restoring on each entry is also what keeps a markdown surface's sidebar
-  // state from leaking into the HTML cookie on the way back.
+  // apply the sidebar/panel/toolsHidden state the user last left an HTML
+  // session with (first-ever run: both closed, tools visible). A restored
+  // toolsHidden:true always has a way back on every layout: the desktop
+  // header eye toggle, and the compact Options menu "Show tools" action
+  // (compactDocumentActions). Re-restoring on each entry is also what keeps
+  // a markdown surface's sidebar state from leaking into the HTML cookie on
+  // the way back.
   const prevHtmlChromeSurfaceRef = useRef(false);
   useEffect(() => {
     if (isLoading || isLoadingShared) return;
@@ -1792,10 +1973,10 @@ const App: React.FC = () => {
     if (archive.archiveMode || goalSetupMode || annotateSource === 'folder') return;
     const chrome = getHtmlChromeState();
     skipNextHtmlChromeSaveRef.current = true;
-    setHtmlToolsHidden(chrome.toolsHidden);
     if (chrome.sidebarOpen) sidebar.open();
     else sidebar.close();
     setIsPanelOpen(chrome.panelOpen);
+    setHtmlToolsHidden(chrome.toolsHidden);
     htmlChromeRestoredRef.current = true;
   }, [
     annotateSource,
@@ -1809,8 +1990,8 @@ const App: React.FC = () => {
     wideModeType,
   ]);
 
-  // Persist the chrome the user leaves an HTML session in (tools visibility +
-  // sidebar open), so the next raw-HTML session opens exactly as they left this
+  // Persist the chrome the user leaves an HTML session in (sidebar + panel
+  // open state), so the next raw-HTML session opens exactly as they left this
   // one. Gated on the restore having run — a pre-restore render must not save
   // the transient defaults over the user's remembered state — and on being ON
   // the HTML surface, so a linked markdown doc's sidebar use never writes here.
@@ -1827,8 +2008,8 @@ const App: React.FC = () => {
       skipNextHtmlChromeSaveRef.current = false;
       return;
     }
-    saveHtmlChromeState({ toolsHidden: htmlToolsHidden, sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen });
-  }, [isHtmlSurface, htmlToolsHidden, sidebar.isOpen, isPanelOpen]);
+    saveHtmlChromeState({ sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen, toolsHidden: htmlToolsHidden });
+  }, [isHtmlSurface, sidebar.isOpen, isPanelOpen, htmlToolsHidden]);
 
   const ensureShareLink = useCallback(async (): Promise<string | null> => {
     const existing = shortShareUrl || shareUrl;
@@ -2628,6 +2809,11 @@ const App: React.FC = () => {
   };
 
   const handleInputMethodChange = (method: InputMethod) => {
+    // HTML and live-app surfaces pin the viewer to pinpoint (drag-selection
+    // commenting is simultaneously live there, so there is nothing to
+    // switch): the toolstrip is not rendered and the Alt shortcut must not
+    // flip state the surface ignores or write the html cookie.
+    if (liveApp || isHtmlSurface) return;
     if (isCompactTouchLayout) {
       setCompactInputMethod(method);
       return;
@@ -2654,6 +2840,53 @@ const App: React.FC = () => {
   // Alt/Option key: hold to temporarily switch, double-tap to toggle
   useInputMethodSwitch(effectiveInputMethod, handleInputMethodChange);
 
+  // Gates both the toolstrip's own render and its shortcuts, so a mode can never
+  // change with no visible pill to report it. HTML/live surfaces have no
+  // toolstrip at all: they are comment-only with pinpoint + drag both live,
+  // so there is no input method or annotation mode left to switch.
+  const toolstripVisible = useMemo(
+    () =>
+      !goalSetupMode && !isPlanDiffActive && !archive.archiveMode && !isEditingMarkdown && !isHtmlSurface
+      && (!isCompactTouchLayout || !(annotateSource === 'folder' && !markdown && !linkedDocHook.isActive)),
+    [
+      annotateSource,
+      archive.archiveMode,
+      goalSetupMode,
+      isHtmlSurface,
+      isCompactTouchLayout,
+      isEditingMarkdown,
+      isPlanDiffActive,
+      linkedDocHook.isActive,
+      markdown,
+    ],
+  );
+
+  const canHandleAnnotationModeShortcut = useCallback(
+    (event: KeyboardEvent) => toolstripVisible && canHandleDocumentChromeShortcut(event),
+    [canHandleDocumentChromeShortcut, toolstripVisible],
+  );
+
+  // Interact/Annotate toggle (Mod+Shift+A) — HTML and live-app surfaces only.
+  // The bridge mirrors the same chord inside the iframe and forwards it, so
+  // this parent-side registration covers focus living in the editor chrome.
+  useHtmlAnnotateShortcuts({
+    handlers: {
+      toggleAnnotateMode: {
+        when: (event) => isHtmlSurface && !documentReadOnly && canHandleDocumentChromeShortcut(event),
+        handle: handleHtmlAnnotateToggle,
+      },
+    },
+  });
+
+  useAnnotationModeShortcuts({
+    handlers: {
+      selectMarkupMode: { when: canHandleAnnotationModeShortcut, handle: () => handleEditorModeChange('selection') },
+      selectCommentMode: { when: canHandleAnnotationModeShortcut, handle: () => handleEditorModeChange('comment') },
+      selectRedlineMode: { when: canHandleAnnotationModeShortcut, handle: () => handleEditorModeChange('redline') },
+      selectQuickLabelMode: { when: canHandleAnnotationModeShortcut, handle: () => handleEditorModeChange('quickLabel') },
+    },
+  });
+
   // Check if we're in API mode (served from Bun hook server)
   // Skip if we loaded from a shared URL
   useEffect(() => {
@@ -2665,7 +2898,7 @@ const App: React.FC = () => {
         if (!res.ok) throw new Error('Not in API mode');
         return res.json();
       })
-      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive' | 'goal-setup'; goalSetup?: GoalSetupBundle; filePath?: string; sourceInfo?: string; sourceConverted?: boolean; sourceSave?: SourceSaveCapability; gate?: boolean; approvalNotesSupported?: boolean; clientLease?: AnnotateClientLeaseConfig; renderAs?: 'html' | 'markdown'; rawHtml?: string; shareHtml?: string; diffHtml?: string; convertHtml?: boolean; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string; host?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; markdownExtensions?: string[]; serverConfig?: { displayName?: string; gitUser?: string }; recentMessages?: PickerMessage[]; agentTerminal?: AgentTerminalCapability; feedbackTemplates?: AnnotateFeedbackTemplates }) => {
+      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'annotate-app' | 'archive' | 'goal-setup'; goalSetup?: GoalSetupBundle; filePath?: string; appUrl?: string; targetUrl?: string; liveToken?: string; sourceInfo?: string; sourceConverted?: boolean; sourceSave?: SourceSaveCapability; gate?: boolean; approvalNotesSupported?: boolean; clientLease?: AnnotateClientLeaseConfig; renderAs?: 'html' | 'markdown'; rawHtml?: string; shareHtml?: string; diffHtml?: string; convertHtml?: boolean; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string; host?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; markdownExtensions?: string[]; serverConfig?: { displayName?: string; gitUser?: string }; recentMessages?: PickerMessage[]; agentTerminal?: AgentTerminalCapability; feedbackTemplates?: AnnotateFeedbackTemplates }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
         // Extra extensions the user registered as markdown (#1307) — the
@@ -2689,6 +2922,18 @@ const App: React.FC = () => {
           archive.fetchPlans();
           setSharingEnabled(false);
           sidebar.open('archive');
+        } else if (data.mode === 'annotate-app' && data.appUrl && data.liveToken) {
+          // Live app annotation: full-viewport live surface on the loopback
+          // proxy origin. No rawHtml, no version fields, no sharing.
+          setRenderAs('html');
+          setMarkdown('');
+          // Live sessions open ARMED like every HTML surface (htmlAnnotateArmed
+          // defaults true): pinpoint is the default, Esc drops to Interact.
+          setLiveApp({
+            appUrl: data.appUrl,
+            origin: new URL(data.appUrl).origin,
+            token: data.liveToken,
+          });
         } else if (data.renderAs === 'html' && data.rawHtml) {
           setRenderAs('html');
           setRawHtml(data.rawHtml);
@@ -2710,7 +2955,7 @@ const App: React.FC = () => {
           }
         }
         setIsApiMode(true);
-        if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder') {
+        if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder' || data.mode === 'annotate-app') {
           setAnnotateMode(true);
           setGate(data.gate ?? false);
           setApprovalNotesSupported(data.approvalNotesSupported ?? false);
@@ -2719,7 +2964,7 @@ const App: React.FC = () => {
         if (data.mode === 'annotate-folder') {
           sidebar.open('files');
         }
-        if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder') {
+        if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder' || data.mode === 'annotate-app') {
           setAnnotateSource(data.mode === 'annotate-last' ? 'message' : data.mode === 'annotate-folder' ? 'folder' : 'file');
         }
         if (data.mode === 'annotate-last' && data.recentMessages && data.recentMessages.length > 0) {
@@ -3500,8 +3745,15 @@ const App: React.FC = () => {
 
   const handleAddAnnotation = (ann: Annotation) => {
     if (documentReadOnly) return;
-    setAnnotations(prev => [...prev, ann]);
-    setSelectedAnnotationId(ann.id);
+    // Live app sessions stamp every page-located annotation with the page it
+    // was made on (restore filters per page; export groups by page). Global
+    // comments have no page location and stay unstamped.
+    const stamped =
+      liveApp && livePageUrl && ann.type !== AnnotationType.GLOBAL_COMMENT
+        ? { ...ann, pageUrl: livePageUrl }
+        : ann;
+    setAnnotations(prev => [...prev, stamped]);
+    setSelectedAnnotationId(stamped.id);
     setSelectedCodeAnnotationId(null);
     // Annotation activity keeps the HTML-surface preferences alive: re-stamp
     // the input method and chrome records so they only expire for users who
@@ -3509,7 +3761,7 @@ const App: React.FC = () => {
     if (isHtmlSurface) {
       refreshInputMethodStamp(inputMethod);
       if (htmlChromeRestoredRef.current) {
-        saveHtmlChromeState({ toolsHidden: htmlToolsHidden, sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen });
+        saveHtmlChromeState({ sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen, toolsHidden: htmlToolsHidden });
       }
     }
   };
@@ -3612,6 +3864,56 @@ const App: React.FC = () => {
       a.id === id ? { ...a, ...updates } : a
     ));
   };
+
+  // WebMCP (browser-agent tools). The hook detects `document.modelContext`
+  // once and does nothing in a browser without it; the banner state below
+  // is only ever set by the agent's `nudge_user` tool.
+  const [agentNudge, setAgentNudge] = useState<{ key: number; message: string } | null>(null);
+  const showAgentNudge = useCallback((message: string) => {
+    setAgentNudge({ key: Date.now(), message });
+  }, []);
+  const webmcpActivity = useWebMcpActivity();
+  const webmcp = useDocumentWebMcp({
+    isApiMode,
+    isSharedSession,
+    goalSetupMode,
+    annotateMode,
+    annotateSource,
+    liveApp,
+    livePageUrl,
+    archiveMode: archive.archiveMode,
+    gate,
+    submitted,
+    renderAs,
+    rawHtml,
+    displayedMarkdown,
+    blocks,
+    allAnnotations,
+    isEditingMarkdown,
+    editorDiffersFromBaseline,
+    sourceStale: !!activeEditableDocument?.missingOnDisk || !!activeEditableDocument?.diskConflict,
+    sourceFilePath,
+    sourceInfo,
+    versionInfo,
+    linkedDoc: {
+      isActive: linkedDocHook.isActive,
+      filepath: linkedDocHook.filepath,
+      error: linkedDocHook.error,
+      getDocAnnotations: linkedDocHook.getDocAnnotations,
+      open: (path: string) => linkedDocHook.open(path),
+    },
+    fileBrowserDirs: fileBrowser.dirs,
+    fileBrowserActiveFile: fileBrowser.activeFile,
+    openFolderFile: handleFileBrowserSelect,
+    viewerRef,
+    scrollViewport,
+    addAnnotation: handleAddAnnotation,
+    editAnnotation: handleEditAnnotation,
+    deleteAnnotation: handleDeleteAnnotation,
+    selectAnnotation: handleSelectAnnotation,
+    showBanner: showAgentNudge,
+  });
+  const agentHasComments = allAnnotations.some((a) => a.source === 'browser-agent');
 
   const handleIdentityChange = useCallback((oldIdentity: string, newIdentity: string) => {
     if (documentReadOnly) return;
@@ -3797,9 +4099,13 @@ const App: React.FC = () => {
 
   // Opening the Ask AI surface with a provider selected is the other explicit
   // gesture that should surface the provider's real model list.
+  // isRightPanelVisible, not effectivePanelOpen: a right-docked Agent TUI
+  // suppresses the panel without closing it, and kicking off provider model
+  // discovery for a surface nobody can see is exactly the eager work this
+  // gesture-gated effect exists to avoid.
   const aiSurfaceOpen = isCompactTouchLayout
     ? compactPlanSurface.type === 'ai'
-    : effectivePanelOpen && rightSidebarTab === 'ai';
+    : isRightPanelVisible && rightSidebarTab === 'ai';
   useEffect(() => {
     if (!aiAvailable || !aiSurfaceOpen) return;
     activateAIProvider(aiConfig.providerId);
@@ -4508,19 +4814,50 @@ const App: React.FC = () => {
   const compactDocumentActions: CompactPlanAction[] = !isCompactTouchLayout
     ? []
     : [
-        ...(isHtmlSurface
-          ? [{
-              id: 'tools' as const,
-              label: htmlToolsHidden ? 'Show annotation tools' : 'Hide annotation tools',
-              onSelect: () => setHtmlToolsHidden((hidden) => !hidden),
-            }]
-          : []),
         ...(canEditMarkdown && !isEditingMarkdown && !isPlanDiffActive && !archive.archiveMode && !isHtmlSurface
           ? [{
               id: 'edit' as const,
               label: 'Edit document',
               subtitle: activeSourceSave ? `Edit ${activeSourceSave.basename}` : 'Edit the plan text directly',
               onSelect: handleEditExitClick,
+            }]
+          : []),
+        // HTML/live surfaces on the compact touch shell: the desktop pen and
+        // eye toggles are header-only and hidden here, and Mod+Shift+A is
+        // keyboard-only, so without these menu actions a touch user has NO
+        // way to disarm annotate mode (every tap annotates, the page beneath
+        // is unreachable) or to bring hidden tools back.
+        ...(isHtmlSurface && !documentReadOnly
+          ? [{
+              id: 'annotate' as const,
+              label: htmlAnnotateArmed ? 'Interact with page' : 'Annotate page',
+              subtitle: htmlAnnotateArmed
+                ? 'Taps annotate. Switch to use the page itself.'
+                : 'Taps use the page. Switch to add annotations.',
+              onSelect: handleHtmlAnnotateToggle,
+            }]
+          : []),
+        ...(isHtmlSurface
+          ? [{
+              id: 'tools' as const,
+              label: htmlToolsHidden ? 'Show tools' : 'Hide tools',
+              subtitle: htmlToolsHidden
+                ? 'Bring the annotation chrome back over the page'
+                : 'Remove all floating chrome from over the page',
+              onSelect: () => setHtmlToolsHidden((v) => !v),
+            }]
+          : []),
+        // The desktop header's Refresh is header-only too; local HTML files
+        // (never URL or live-app sessions) get the same action here.
+        ...(isHtmlSurface && htmlRefresh.canRefresh
+          ? [{
+              id: 'refresh' as const,
+              label: 'Refresh from disk',
+              subtitle: htmlRefresh.isRefreshing
+                ? 'Refreshing the HTML file'
+                : 'Reload the HTML file and keep the annotations that still match',
+              onSelect: () => { void htmlRefresh.refresh(); },
+              disabled: htmlRefresh.isRefreshing,
             }]
           : []),
       ];
@@ -4530,16 +4867,36 @@ const App: React.FC = () => {
     return widths[uiPrefs.planWidth] ?? 832;
   }, [uiPrefs.planWidth]);
   const annotateReaderMaxWidth = canUseWideMode && wideModeType === 'wide' ? null : planMaxWidth;
-  const showAgentTerminalControls =
-    annotateMode &&
-    annotateSource !== 'message' &&
-    agentTerminalCapability !== null &&
-    !goalSetupMode;
-  const shouldRenderAgentTerminal =
-    showAgentTerminalControls &&
-    agentTerminalCapability !== null &&
-    wideModeType === null &&
-    (isAgentTerminalOpen || isAgentTerminalRunning);
+  const agentTerminalPanel = shouldRenderAgentTerminal && agentTerminalCapability ? (
+    <div
+      key="agent-terminal"
+      className={agentTerminalDockClassName}
+      aria-hidden={!isAgentTerminalVisible}
+      inert={!isAgentTerminalVisible}
+    >
+      <AnnotateAgentTerminalPanel
+        ref={agentTerminalRef}
+        capability={agentTerminalCapability}
+        width={`var(--agent-terminal-w, ${agentTerminalResize.width}px)`}
+        side={agentTerminalSide}
+        placement={agentTerminalPlacement}
+        onSideChange={handleAgentTerminalSideChange}
+        onSessionActiveChange={setIsAgentTerminalRunning}
+        onSessionReadyChange={handleAgentTerminalReadyChange}
+        onClose={hideAgentTerminal}
+      />
+      {isAgentTerminalVisible && (
+        <ResizeHandle
+          {...agentTerminalResize.handleProps}
+          className="hidden lg:block z-[55]"
+          side={agentTerminalPlacement}
+          hideHoverTrack
+          tooltip={RESIZE_HANDLE_TOOLTIP}
+          onCollapse={hideAgentTerminal}
+        />
+      )}
+    </div>
+  ) : null;
   // Only greet in a normal authoring context — not on a read-only shared session
   // (a viewer would also be able to flip the owner's gridEnabled), nor over the
   // goal-setup / permission-mode flows. Deferred (not marked seen) until then.
@@ -4713,6 +5070,7 @@ const App: React.FC = () => {
       width={presentation === 'panel' ? `var(--rpanel-w, ${panelResize.width}px)` : undefined}
       editorAnnotations={editorAnnotations}
       onDeleteEditorAnnotation={deleteEditorAnnotation}
+      unanchoredIds={isHtmlSurface && htmlUnanchoredIds.size > 0 ? htmlUnanchoredIds : undefined}
       onClose={presentation === 'panel' ? () => setIsPanelOpen(false) : closeCompactPlanSurface}
       onQuickCopy={async () => {
         const output = getCurrentFeedbackPayload();
@@ -4783,8 +5141,13 @@ const App: React.FC = () => {
         <AppHeader
           sticky={!usesDocumentScroll}
           htmlSurface={isHtmlSurface}
+          htmlAnnotateArmed={htmlAnnotateArmed}
+          onToggleHtmlAnnotate={isHtmlSurface && !documentReadOnly ? handleHtmlAnnotateToggle : undefined}
           htmlToolsHidden={htmlToolsHidden}
-          onToggleHtmlTools={() => setHtmlToolsHidden((v) => !v)}
+          onToggleHtmlTools={isHtmlSurface ? () => setHtmlToolsHidden((v) => !v) : undefined}
+          canRefreshHtml={htmlRefresh.canRefresh}
+          isRefreshingHtml={htmlRefresh.isRefreshing}
+          onRefreshHtml={htmlRefresh.refresh}
           compactTouchLayout={isCompactTouchLayout}
           compactNavigatorAvailable={compactNavigatorAvailable}
           compactNavigatorOpen={isCompactNavigatorOpen}
@@ -4804,9 +5167,9 @@ const App: React.FC = () => {
           origin={origin}
           isSubmitting={isSubmitting}
           isExiting={isExiting}
-          isPanelOpen={effectivePanelOpen && rightSidebarTab === 'annotations'}
+          isPanelOpen={isRightPanelVisible && rightSidebarTab === 'annotations'}
           aiAvailable={canUseAskAI}
-          isAIChatOpen={effectivePanelOpen && rightSidebarTab === 'ai'}
+          isAIChatOpen={isRightPanelVisible && rightSidebarTab === 'ai'}
           aiHasMessages={visibleAIMessages.length > 0}
           hasAnyAnnotations={hasAnyAnnotations || hasDirectEdits || hasSavedFileChanges}
           annotationCount={feedbackAnnotationCount}
@@ -4822,6 +5185,9 @@ const App: React.FC = () => {
           taterMode={taterMode}
           mobileSettingsOpen={mobileSettingsOpen}
           gitUser={gitUser}
+          agentTerminalAvailable={showAgentTerminalControls}
+          webmcpAvailable={webmcp.available}
+          agentConnected={webmcpActivity.calls > 0}
           onCallbackFeedback={handleCallbackFeedback}
           onCallbackApprove={handleCallbackApprove}
           onAnnotateExit={handleHeaderAnnotateExit}
@@ -4975,38 +5341,9 @@ const App: React.FC = () => {
         <div data-print-region="content" className={`flex-1 flex ${usesDocumentScroll ? 'overflow-visible' : 'overflow-hidden'} relative z-0 ${isResizing ? 'select-none' : ''}`}>
           {/* Tater sprites — inside content wrapper so z-0 stacking context applies */}
           {taterMode && <TaterSpriteRunning />}
-          {shouldRenderAgentTerminal && agentTerminalCapability && (
-            <div
-              className={
-                isAgentTerminalOpen
-                  ? "contents group/agent-terminal"
-                  : "absolute left-0 top-0 h-full w-0 overflow-hidden pointer-events-none group/agent-terminal"
-              }
-              aria-hidden={!isAgentTerminalOpen}
-              inert={!isAgentTerminalOpen ? true : undefined}
-            >
-              <AnnotateAgentTerminalPanel
-                ref={agentTerminalRef}
-                capability={agentTerminalCapability}
-                width={`var(--agent-terminal-w, ${agentTerminalResize.width}px)`}
-                onSessionActiveChange={setIsAgentTerminalRunning}
-                onSessionReadyChange={handleAgentTerminalReadyChange}
-                onClose={hideAgentTerminal}
-              />
-              {isAgentTerminalOpen && (
-                <ResizeHandle
-                  {...agentTerminalResize.handleProps}
-                  className="hidden lg:block z-[55]"
-                  side="left"
-                  hideHoverTrack
-                  tooltip={RESIZE_HANDLE_TOOLTIP}
-                  onCollapse={hideAgentTerminal}
-                />
-              )}
-            </div>
-          )}
+          {showAgentTerminalOnLeft && agentTerminalPanel}
           {/* Left Sidebar: collapsed tab flags (when sidebar is closed) */}
-          {!isCompactTouchLayout && wideModeType === null && !sidebar.isOpen && !goalSetupMode && !isAgentTerminalOpen && !htmlChromeHidden && (
+          {!isCompactTouchLayout && wideModeType === null && !sidebar.isOpen && !goalSetupMode && !isLeftAgentTerminalVisible && !(isHtmlSurface && htmlToolsHidden) && (
             <SidebarTabs
               activeTab={sidebar.activeTab}
               onToggleTab={toggleSidebarTab}
@@ -5035,7 +5372,7 @@ const App: React.FC = () => {
           {/* Document Area */}
           <OverlayScrollArea
             element="main"
-            className={`flex-1 min-w-0 ${isHtmlSurface ? 'bg-background' : `${gridEnabled ? "bg-grid " : "bg-card "}${!goalSetupMode && !sidebar.isOpen && !isAgentTerminalOpen && wideModeType === null ? 'lg:pl-[30px]' : ''}`}`}
+            className={`flex-1 min-w-0 ${isHtmlSurface ? 'bg-background' : `${gridEnabled ? "bg-grid " : "bg-card "}${!goalSetupMode && !sidebar.isOpen && !isLeftAgentTerminalVisible && wideModeType === null ? 'lg:pl-[30px]' : ''}`}`}
             data-print-region="document"
             overflowX={usesDocumentScroll ? 'visible' : 'hidden'}
             overflowY={usesDocumentScroll ? 'visible' : 'auto'}
@@ -5080,19 +5417,17 @@ const App: React.FC = () => {
               )}
 
               {/* Annotation Toolstrip — the mode switcher (selection/redline input +
-                  comment/markup mode). Hidden during plan diff, and on HTML surfaces
-                  when the header's "Hide tools" toggle is on (leaving the rendered HTML
-                  free of overlay controls). On HTML it floats top-left over the doc. */}
-              {!goalSetupMode && !isPlanDiffActive && !archive.archiveMode && !isEditingMarkdown && !htmlChromeHidden &&
-                (!isCompactTouchLayout || !(annotateSource === 'folder' && !markdown && !linkedDocHook.isActive)) && (
+                  comment/markup mode). Markdown surfaces only: HTML/live surfaces
+                  are comment-only with pinpoint + drag both live, so no floating
+                  toolstrip ever overlays the rendered page. Hidden during plan
+                  diff and archive browsing. */}
+              {toolstripVisible && (
                 <div
                   data-print-hide
-                  className={isHtmlSurface
-                    ? `absolute top-3 ${sidebar.isOpen ? 'left-3' : 'left-10'} z-20 flex items-center rounded-lg border border-border/50 bg-background/85 px-1.5 py-1 shadow-md backdrop-blur-sm`
-                    : "w-full mb-3 md:mb-4 flex items-center justify-start"}
-                  style={isHtmlSurface || annotateReaderMaxWidth == null ? undefined : { maxWidth: annotateReaderMaxWidth }}
+                  className="w-full mb-3 md:mb-4 flex items-center justify-start"
+                  style={annotateReaderMaxWidth == null ? undefined : { maxWidth: annotateReaderMaxWidth }}
                 >
-                  {isCompactTouchLayout && !isHtmlSurface ? (
+                  {isCompactTouchLayout ? (
                     <CompactAnnotationControls
                       inputMethod={effectiveInputMethod}
                       onInputMethodChange={handleInputMethodChange}
@@ -5104,7 +5439,7 @@ const App: React.FC = () => {
                       mode={editorMode}
                       onModeChange={handleEditorModeChange}
                       taterMode={taterMode}
-                      showHelpLink={!isHtmlSurface}
+                      showHelpLink
                     />
                   )}
                 </div>
@@ -5279,17 +5614,28 @@ const App: React.FC = () => {
                 )}
                 {renderAs === 'html' ? (
                   <HtmlViewer
-                    key={(linkedDocHook.isActive ? `doc:${linkedDocHook.filepath}` : 'plan') + (isPlanDiffActive && htmlDiffHtml ? ':diff' : '')}
+                    key={`${liveApp ? 'live-app' : linkedDocHook.isActive ? `doc:${linkedDocHook.filepath}` : 'plan'}${isPlanDiffActive && htmlDiffHtml ? ':diff' : ''}:reload-${htmlRefresh.reloadGeneration}`}
                     ref={viewerRef}
                     rawHtml={isPlanDiffActive && htmlDiffHtml ? htmlDiffHtml : rawHtml}
+                    src={liveApp?.appUrl}
+                    liveSession={liveApp ? { origin: liveApp.origin, token: liveApp.token } : undefined}
+                    currentPageUrl={liveApp ? livePageUrl : undefined}
+                    onPageChange={liveApp ? setLivePageUrl : undefined}
                     annotations={viewerAnnotations}
                     onAddAnnotation={handleAddAnnotation}
                     onSelectAnnotation={handleSelectAnnotation}
                     selectedAnnotationId={selectedAnnotationId}
                     mode={effectiveEditorMode}
-                    inputMethod={effectiveInputMethod}
-                    vimModeEnabled={vimModeEnabled}
-                    vimHudEnabled={vimModeEnabled && vimHudEnabled}
+                    // HTML/live surfaces are always pinpoint: armed = click
+                    // pins an element AND drag selects text (both live at
+                    // once); Interact (Esc) keeps clicks native while drag
+                    // commenting stays available. No input-method switch.
+                    inputMethod="pinpoint"
+                    annotateModeActive={htmlAnnotateArmed}
+                    onAnnotateModeExit={documentReadOnly ? undefined : handleHtmlAnnotateExit}
+                    onAnnotateModeToggle={documentReadOnly ? undefined : handleHtmlAnnotateToggle}
+                    vimModeEnabled={liveApp ? false : vimModeEnabled && htmlAnnotateArmed}
+                    vimHudEnabled={!liveApp && vimModeEnabled && htmlAnnotateArmed && vimHudEnabled}
                     vimHudKeyPanelEnabled={vimHudKeyPanelEnabled}
                     onVimHudKeyPanelChange={handleVimHudKeyPanelChange}
                     globalAttachments={globalAttachments}
@@ -5297,11 +5643,16 @@ const App: React.FC = () => {
                     onRemoveGlobalAttachment={handleRemoveGlobalAttachment}
                     maxWidth={isHtmlSurface ? null : annotateReaderMaxWidth}
                     fullViewport={isHtmlSurface}
-                    hideControls={htmlToolsHidden}
-                    diffAvailable={!!htmlDiffHtml}
-                    diffActive={isPlanDiffActive && !!htmlDiffHtml}
+                    // Applied on every layout: desktop has the header eye
+                    // toggle, and the compact touch shell has the Options
+                    // menu "Show tools" action (compactDocumentActions), so
+                    // a restored toolsHidden:true always has a way back.
+                    hideControls={isHtmlSurface && htmlToolsHidden}
+                    diffAvailable={!liveApp && !!htmlDiffHtml}
+                    diffActive={!liveApp && isPlanDiffActive && !!htmlDiffHtml}
                     onToggleDiff={() => setIsPlanDiffActive((v) => !v)}
                     onAskAI={canUseDocumentAskAI ? handleAskAI : undefined}
+                    onUnanchoredChange={htmlRefresh.reportAnnotationRestore}
                     readOnly={documentReadOnly}
                   />
                 ) : isEditingMarkdown ? (
@@ -5397,20 +5748,22 @@ const App: React.FC = () => {
             </div>
           </OverlayScrollArea>
 
+          {showAgentTerminalOnRight && agentTerminalPanel}
+
           {/* Right panel region — `group/sidebar` so the collapse button reveals when
               hovering the whole panel, not just the thin handle. The handle and the
               panel(s) are separate sibling conditionals, so they need a shared hover
               ancestor (`contents` = no layout box). */}
           <div className="contents group/sidebar">
           {/* Resize Handle */}
-          {effectivePanelOpen && wideModeType === null && !goalSetupMode && (rightSidebarTab === 'annotations' || canUseAskAI) && <ResizeHandle {...panelResize.handleProps} className="hidden md:block z-[55]" side="right" hideHoverTrack tooltip={RESIZE_HANDLE_TOOLTIP} onCollapse={() => setIsPanelOpen(false)} />}
+          {isRightPanelVisible && wideModeType === null && !goalSetupMode && (rightSidebarTab === 'annotations' || canUseAskAI) && <ResizeHandle {...panelResize.handleProps} className="hidden md:block z-[55]" side="right" hideHoverTrack tooltip={RESIZE_HANDLE_TOOLTIP} onCollapse={() => setIsPanelOpen(false)} />}
 
           {/* Annotation Panel */}
           {renderAnnotationPanel(
             'panel',
-            effectivePanelOpen && rightSidebarTab === 'annotations' && wideModeType === null && !goalSetupMode,
+            isRightPanelVisible && rightSidebarTab === 'annotations' && wideModeType === null && !goalSetupMode,
           )}
-          {effectivePanelOpen && rightSidebarTab === 'ai' && wideModeType === null && !goalSetupMode && canUseAskAI && (
+          {isRightPanelVisible && rightSidebarTab === 'ai' && wideModeType === null && !goalSetupMode && canUseAskAI && (
             <aside
               data-annotation-panel="true"
               className={`border-l border-border/50 bg-card flex flex-col flex-shrink-0 ${
@@ -5656,6 +6009,17 @@ const App: React.FC = () => {
             } as React.CSSProperties,
           }}
         />
+
+        {/* Browser-agent nudge (WebMCP nudge_user): one transient banner,
+            rendered only while a message exists. */}
+        {agentNudge && (
+          <AgentNudgeBanner
+            key={agentNudge.key}
+            message={agentNudge.message}
+            onDismiss={() => setAgentNudge(null)}
+            onShowComments={agentHasComments && !isPanelOpen ? () => { setIsPanelOpen(true); setAgentNudge(null); } : undefined}
+          />
+        )}
 
         {/* Completion overlay - shown after approve/deny */}
         <CompletionOverlay

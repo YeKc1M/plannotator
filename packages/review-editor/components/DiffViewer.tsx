@@ -194,6 +194,10 @@ interface DiffViewerProps {
   /** Chrome preference (#1277): false hides the header Viewed button; the `V`
    *  shortcut and viewed state are unaffected. */
   showViewedControls?: boolean;
+  /** Marked `linguist-generated` in `.gitattributes` (#1317) — shows the
+   * header "generated" tag. The single-file surface never collapses for it:
+   * opening a file as its own tab is already an explicit request to see it. */
+  isGenerated?: boolean;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
   isStaged?: boolean;
@@ -253,6 +257,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   isViewed = false,
   onToggleViewed,
   showViewedControls = true,
+  isGenerated = false,
   collapsed = false,
   onToggleCollapsed,
   isStaged = false,
@@ -771,6 +776,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         status={status}
         oldPath={oldPath}
         isViewed={isViewed}
+        isGenerated={isGenerated}
         onToggleViewed={onToggleViewed}
         showViewedControl={showViewedControls}
         collapseToggle={onToggleCollapsed && (

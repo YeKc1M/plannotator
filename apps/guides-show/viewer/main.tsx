@@ -89,15 +89,37 @@ function ErrorCard({ title, detail }: { title: string; detail: string }) {
   );
 }
 
+/**
+ * "Made with Plannotator" → plannotator.ai. Portable pages send no referrer
+ * (`<meta name="referrer" content="no-referrer">`), so the `ref` query is the
+ * only attribution the destination gets. Plain text, muted, no icon: it must
+ * read as a credit, not a call to action, next to the guide's own controls.
+ */
+function BrandLink() {
+  return (
+    <a
+      href="https://plannotator.ai/?ref=guide"
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center rounded-md px-1.5 py-1.5 text-[11.5px] text-muted-foreground transition-colors hover:text-foreground pointer-coarse:px-2.5 pointer-coarse:py-2.5"
+      title="Guided Reviews are made with Plannotator"
+      data-testid="guide-brand-link"
+    >
+      Made with Plannotator
+    </a>
+  );
+}
+
 function App({ snapshot, workerFactory, hosted }: { snapshot: GuideSnapshot; workerFactory: (() => Worker) | null; hosted: boolean }) {
   // Only a hosted page offers the download: a downloaded file IS the export.
-  const headerActions = hosted ? (
+  // The attribution link is on every guides.show-rendered page (portable and
+  // hosted); the in-app review UI composes its own header and never sees this.
+  const headerActions = (
     <>
-      <HostedDownloadButton snapshot={snapshot} scriptUrl={import.meta.url} />
+      <BrandLink />
+      {hosted && <HostedDownloadButton snapshot={snapshot} scriptUrl={import.meta.url} />}
       <ModeToggle />
     </>
-  ) : (
-    <ModeToggle />
   );
   const view = (
     <GuideViewer

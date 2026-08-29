@@ -58,4 +58,45 @@ describe("PATCH /api/external-annotations", () => {
     expect(edited.annotation.text).toBe("edited text");
     expect(edited.annotation.source).toBe("rogue-agent");
   });
+
+  // PATCH merges arbitrary fields, so it was the one way to create an
+  // inReplyTo self-reference or cycle (which the export used to drop while
+  // still counting). The invalid state is refused at ingest.
+  test("refuses an inReplyTo that is self, missing, or would close a cycle; accepts a valid reply", async () => {
+    const handler = createExternalAnnotationHandler("plan");
+    const added = handler.addAnnotations({
+      annotations: [
+        { source: "tool", text: "first" },
+        { source: "tool", text: "second" },
+      ],
+    });
+    if ("error" in added) throw new Error(added.error);
+    const [first, second] = added.ids;
+
+    const patch = async (id: string, body: unknown) => {
+      const url = `http://localhost/api/external-annotations?id=${encodeURIComponent(id)}`;
+      const res = await handler.handle(
+        new Request(url, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+        new URL(url),
+      );
+      return { status: res!.status, body: (await res!.json()) as { error?: string; annotation?: { inReplyTo?: string } } };
+    };
+
+    expect((await patch(first, { inReplyTo: first })).status).toBe(400);
+    expect((await patch(first, { inReplyTo: "nope" })).status).toBe(400);
+    expect((await patch(first, { inReplyTo: 7 })).status).toBe(400);
+
+    const ok = await patch(second, { inReplyTo: first });
+    expect(ok.status).toBe(200);
+    expect(ok.body.annotation?.inReplyTo).toBe(first);
+
+    // second -> first is in place; first -> second would close the loop.
+    const cycle = await patch(first, { inReplyTo: second });
+    expect(cycle.status).toBe(400);
+    expect(cycle.body.error).toContain("cycle");
+
+    // Clearing stays allowed, and an unrelated patch does not touch the field.
+    expect((await patch(second, { inReplyTo: null })).status).toBe(200);
+    expect((await patch(second, { text: "still fine" })).status).toBe(200);
+  });
 });

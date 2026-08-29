@@ -47,6 +47,10 @@ interface FileHeaderProps {
   editDisabledReason?: string | null;
   /** Compact coarse-pointer treatment. Defaults to the enclosing review state. */
   compactTouchLayout?: boolean;
+  /** Marked `linguist-generated` in `.gitattributes` (#1317) — renders a
+   * "generated" tag next to the +/- counts. Collapse seeding is the owner's
+   * concern; this prop is display-only. */
+  isGenerated?: boolean;
 }
 
 function splitFilePath(filePath: string): { directory: string; name: string } {
@@ -130,6 +134,7 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
   editDisabledReason,
   compactTouchLayout,
   readOnly = false,
+  isGenerated = false,
 }) => {
   const [headerWidth, setHeaderWidth] = useState<number>(0);
   const state = useReviewStateOptional();
@@ -219,11 +224,20 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
             </>
           )}
         </span>
-        {(additions > 0 || deletions > 0 || (status && status !== 'modified')) && (
+        {(additions > 0 || deletions > 0 || (status && status !== 'modified') || isGenerated) && (
           <span className="flex-none ml-2 flex items-center gap-1.5 text-xs leading-none">
             {additions > 0 && <span className="font-mono text-success">+{additions}</span>}
             {deletions > 0 && <span className="font-mono text-destructive">-{deletions}</span>}
             {status && <FileStatusLetter status={status} oldPath={oldPath} />}
+            {isGenerated && (
+              <span
+                data-pn-generated-badge
+                className="flex-none rounded-sm border border-border/60 bg-muted/60 px-1.5 py-0.5 text-[10px] font-medium leading-none text-muted-foreground"
+                title="Marked linguist-generated in .gitattributes"
+              >
+                generated
+              </span>
+            )}
           </span>
         )}
       </div>

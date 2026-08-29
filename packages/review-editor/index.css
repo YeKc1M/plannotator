@@ -1400,6 +1400,10 @@ diffs-container {
   width: min(38rem, 94vw);
   max-height: min(30rem, 78vh);
   overflow: auto;
+  /* Momentum scroll that hits the Lens's edge must not chain to the page:
+     the page scroll moves the anchor, drags the popup out from under the
+     pointer, and hover-closes the Lens (worst under Safari rubber-banding). */
+  overscroll-behavior: contain;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);

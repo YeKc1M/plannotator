@@ -53,26 +53,29 @@
   header .gh:hover{color:var(--heading);border-color:var(--muted)}
   .add{color:var(--add)}.del{color:var(--del)}
 
-  /* A guide, the way the viewer lays one out: chapters, an overview each, the files under it. */
-  figure{margin:1.75rem 0 0;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden;font-size:.84rem}
-  figure .title{padding:.8rem 1rem .7rem;border-bottom:1px solid var(--border)}
-  figure .title b{display:block;color:var(--heading);font-weight:600;font-size:.95rem}
-  figure .title span{color:var(--muted)}
-  figure .ch{display:grid;grid-template-columns:3.2rem 1fr;gap:.15rem 0;padding:.7rem 1rem;border-bottom:1px solid var(--border)}
-  figure .ch:last-of-type{border-bottom:0}
-  figure .ch .n{grid-row:1/3;font-family:var(--mono);font-size:.72rem;color:var(--muted);padding-top:.15rem}
-  figure .ch h3{margin:0;font-size:.88rem;font-weight:500;color:var(--heading)}
-  figure .ch p{margin:0;color:var(--text)}
-  figure .ch .files{grid-column:2;display:flex;flex-wrap:wrap;gap:.35rem .8rem;margin-top:.35rem;font-family:var(--mono);font-size:.72rem;color:var(--muted)}
-  figure .ch .files b{color:var(--text);font-weight:500}
-  figure .ch .files .add,figure .ch .files .del{margin-left:.35ch}
-  /* An abstract diff under a chapter: rows of bars, no code. */
-  figure .diff{grid-column:2;margin:.55rem 0 .1rem;padding:.4rem 0;border:1px solid var(--border);border-radius:5px;background:var(--bg)}
-  figure .diff i{display:flex;align-items:center;gap:.6rem;height:1.05rem;padding:0 .6rem 0 .5rem}
-  figure .diff i::before{content:"";width:1.6ch;height:1px;background:var(--border-strong);flex:none}
-  figure .diff i::after{content:"";height:5px;border-radius:2px;background:var(--border-strong);width:var(--w)}
-  figure .diff i.a{background:var(--add-bg)}figure .diff i.a::after{background:var(--add);opacity:.8}
-  figure .diff i.d{background:var(--del-bg)}figure .diff i.d::after{background:var(--del);opacity:.8}
+  /* The example guide: a screenshot that opens full size. */
+  .shot{display:block;width:100%;margin:1.75rem 0 0;padding:0;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden;cursor:zoom-in;font:inherit;color:inherit;text-align:left}
+  .shot img{display:block;width:100%;height:auto}
+  .shot:focus-visible{outline:2px solid var(--add);outline-offset:2px}
+  .examples{margin:.75rem 0 0;font-size:.9rem;color:var(--muted);display:flex;flex-wrap:wrap;gap:.35rem .5rem;align-items:baseline}
+  .examples a{color:var(--text);text-decoration-color:var(--add)}
+  .examples a:hover{color:var(--heading)}
+  .shot:hover{border-color:var(--border-strong)}
+  .shot figcaption{padding:.55rem .9rem .6rem;border-top:1px solid var(--border);color:var(--muted);font-size:.8rem;display:flex;justify-content:space-between;gap:1rem}
+  .shot figcaption span:last-child{font-family:var(--mono);font-size:.72rem;white-space:nowrap}
+  @media (max-width:480px){.shot figcaption span:last-child{display:none}}
+  dialog.lightbox{max-width:none;max-height:none;width:100vw;height:100vh;height:100dvh;margin:0;padding:0;border:0;background:transparent;overflow:hidden}
+  dialog.lightbox::backdrop{background:rgba(0,0,0,.82)}
+  dialog.lightbox .area{display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1.5rem;margin:0;border:0;background:none;cursor:zoom-out}
+  dialog.lightbox img{max-width:100%;max-height:100%;width:auto;height:auto;border:1px solid var(--border);border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  dialog.lightbox .x{position:fixed;top:.75rem;right:.75rem;width:2.5rem;height:2.5rem;padding:0;border-radius:6px;color:#fff;background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.2);font-size:1.4rem;line-height:1;cursor:pointer}
+  dialog.lightbox .x:focus-visible{outline:2px solid var(--add);outline-offset:2px}
+  @media (prefers-reduced-motion:no-preference){
+    dialog.lightbox[open] img{animation:zoom .22s cubic-bezier(.2,.8,.2,1)}
+    dialog.lightbox[open]::backdrop{animation:fade .2s ease-out}
+    @keyframes zoom{from{transform:scale(.94);opacity:0}}
+    @keyframes fade{from{opacity:0}}
+  }
   .cmd{display:flex;align-items:center;gap:.75rem;margin:1rem 0;padding:.55rem .6rem .55rem .9rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);overflow-x:auto}
   .cmd code{flex:1;background:none;border:0;padding:0;color:var(--heading);white-space:nowrap}
   .cmd button{flex:none;font:inherit;font-family:var(--mono);font-size:.74rem;color:var(--text);background:none;border:1px solid var(--border-strong);border-radius:4px;padding:.15rem .55rem;cursor:pointer}
@@ -82,6 +85,7 @@
   .banner{display:block;width:100%;height:auto;margin:1.5rem 0 0;border:1px solid var(--border);border-radius:8px}
   footer{margin-top:4rem;padding-top:1.25rem;border-top:1px solid var(--border);color:var(--muted);font-size:.85rem;display:flex;flex-wrap:wrap;gap:.4rem 1.25rem}
   footer a{color:var(--text)}
+  footer .credit{margin-left:auto}
   @media (prefers-reduced-motion:no-preference){a{transition:text-decoration-color .15s}}
   button,a{touch-action:manipulation}
   @media (pointer:coarse){
@@ -104,14 +108,19 @@
   <img class="banner" src="/banner.webp" alt="guides.show, by Plannotator" width="1774" height="887" decoding="async" fetchpriority="high">
 
   <h1>A code walkthrough you can send as a file.</h1>
-  <p>A <a href="https://plannotator.ai/docs/commands/code-review#guided-review">Guided Review</a> takes a diff and explains it in order: chapters, a short overview for each, and the files that belong to it, with the changes shown alongside. Exported, it is one HTML file. This site serves what displays it, and hosts guides shared as links.</p>
+  <p>A <a href="https://plannotator.ai/docs/commands/code-review#guided-review">Guided Review</a> takes a diff and explains it in order of importance: chapters, a short overview for each, and the files that belong to it, with the changes shown alongside. Exported, it is one HTML file. This site serves what displays it, and hosts guides shared as links.</p>
 
-  <figure aria-label="The shape of a guide">
-    <div class="title"><b>Rate limit guide creation</b><span>One brake on anonymous uploads: creation only, per IP, fails open.</span></div>
-    <div class="ch"><span class="n">01</span><h3>The binding</h3><p>Where the limiter comes from and why it is optional.</p><div class="files"><span><b>wrangler.toml</b><span class="add">+15</span></span><span><b>worker/index.ts</b><span class="add">+59</span></span></div><div class="diff" aria-hidden="true"><i style="--w:38%"></i><i style="--w:54%"></i><i class="d" style="--w:47%"></i><i class="a" style="--w:61%"></i><i class="a" style="--w:29%"></i><i class="a" style="--w:44%"></i><i style="--w:33%"></i></div></div>
-    <div class="ch"><span class="n">02</span><h3>Only the create route</h3><p>Reads and deletes stay untouched; the 429 carries a Retry-After.</p><div class="files"><span><b>share/core/handler.ts</b><span class="add">+7</span></span></div></div>
-    <div class="ch"><span class="n">03</span><h3>What the tests pin</h3><p>Per-IP, never for reads, and open when there is no binding.</p><div class="files"><span><b>worker/index.test.ts</b><span class="add">+71</span><span class="del">−2</span></span></div></div>
-  </figure>
+  <button type="button" class="shot" id="open-shot" aria-haspopup="dialog" aria-controls="shot-dialog">
+    <figure style="margin:0">
+      <img src="/example_guide.webp" alt="A guide with two chapters. Left: the chapter title, a short overview, and the files it covers. Right: the diff for each file." width="1774" height="1101" decoding="async">
+      <figcaption><span>A two-chapter guide, opened in a browser.</span><span>click to enlarge</span></figcaption>
+    </figure>
+  </button>
+  <p class="examples">Open a real one:
+    <a href="https://guides.show/g/gs0M7zgI_zYeuqtLG4j5vQ#key=awkuPrNypYrCLT49XVnrRUyzg3Iqb-YB2h9-QEWQWMM">a bug fix, 5 chapters</a>
+    <span aria-hidden="true">·</span>
+    <a href="https://guides.show/g/Q-ECuRlzn6I2U41wmnyVmA#key=bA52euqWQypYoSC8n9LFXvP9gLsvTMwYtgjvfS0YAQE">a 125-file feature branch, 6 chapters</a>
+  </p>
 
   <h2>Making one</h2>
   <p>Ask your coding agent for a guide of a branch, PR, or commit with the <a href="https://github.com/plannotator/guides"><code>plannotator-guide</code></a> skill; it writes the chapters and hands you the file. <a href="https://plannotator.ai">Plannotator</a> users get the same from <em>Download portable guide</em> after a Guided Review.</p>
@@ -130,8 +139,15 @@
     <a href="https://plannotator.ai/docs/reference/portable-guides/">File format</a>
     <a href="https://github.com/backnotprop/plannotator">Plannotator</a>
     <a href="https://github.com/plannotator/guides">Agent skill</a>
+    <span class="credit">Diffs rendered with <a href="https://diffs.com/">diffs.com</a></span>
   </footer>
 </main>
+<dialog class="lightbox" id="shot-dialog" aria-label="Example guide, enlarged">
+  <button type="button" class="x" id="close-shot" aria-label="Close">&times;</button>
+  <button type="button" class="area" id="close-shot-area" aria-label="Close enlarged view">
+    <img data-src="/example_guide-2x.webp" alt="" width="2600" height="1613" decoding="async">
+  </button>
+</dialog>
 <script>
 for (const b of document.querySelectorAll('button[data-copy]')) {
   b.addEventListener('click', async () => {
@@ -141,6 +157,13 @@ for (const b of document.querySelectorAll('button[data-copy]')) {
     setTimeout(() => { b.textContent = 'Copy'; b.classList.remove('done'); }, 1500);
   });
 }
+const dlg = document.getElementById('shot-dialog');
+const big = dlg.querySelector('img');
+document.getElementById('open-shot').addEventListener('click', () => {
+  if (!big.getAttribute('src')) big.src = big.dataset.src;
+  dlg.showModal();
+});
+for (const id of ['close-shot', 'close-shot-area']) document.getElementById(id).addEventListener('click', () => dlg.close());
 </script>
 </body>
 </html>

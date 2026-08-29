@@ -10,6 +10,10 @@
  * input transformers handle validation and field assignment.
  */
 
+// Reply-threading validation for PATCH ingest, re-exported so both HTTP
+// adapters import it from the module they already use.
+export { validateReplyTarget } from "./annotation-threads";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------

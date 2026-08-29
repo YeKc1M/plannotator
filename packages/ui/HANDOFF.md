@@ -92,6 +92,8 @@ Pass any subset of these to `configurePlannotatorUI({ ... })`. Anything omitted 
 | `aiTransport` | `AITransport` | The "Ask AI" chat session/query/abort/permission | `POST /api/ai/{session,query,abort,permission}` |
 | `serverSync` | `ServerSyncFn` | Push a settings change back to the server | No-op-ish (Plannotator's local sync) |
 | `loadSettingsFromBackend` | `boolean` | After install, re-hydrate settings from your `storageBackend` | off |
+| `mathRendererLoader` | `() => Promise<MathRenderer>` | How KaTeX is loaded when no renderer is registered before the first math node renders (see "Lazy renderers and eager entries"). Once registered, the package default is never called, not even as a fallback after a rejected load, and `resetMathRenderer()` keeps the registration (0.34.0); a default load already in flight at registration still fills the slot (pre-existing, see `setMathRendererLoader`), so register before the first math render | `utils/math-default-loader`'s `import('katex')`, JS only; CSS stays yours |
+| `identityGenerator` | `() => string` | The synchronous generator behind the default "tater" display name when no `identityProvider` is installed | A built-in 16 x 16 word pool of the same `adjective-noun-tater` shape; Plannotator registers the full dictionary via `utils/identity-tater` |
 
 ### Interface details worth knowing
 
@@ -189,7 +191,7 @@ We deliberately did **not** restructure the exports map in this PR (move-don't-r
 | `components/BlockRenderer` + the block components it renders (`TableBlock`, `HtmlBlock`, `Callout`, `MermaidBlock`, `MathBlock`, …) | Pure rendering. |
 | `components/InlineMarkdown` | Code-file hover previews route through the `docPreviewFetcher` seam. Wiki-link rendering takes the sync `resolveLinkedDoc` prop (live labels + deleted-doc treatment; see "Wiki-link seams (0.27.0)"). |
 | `components/Viewer` | The full annotatable document. Required props: `markdown` and `taterMode` (pass `false`). **Pass `disableCodePathValidation` unless you implement `/api/doc/exists`** — code-path validation is a prop-level opt-out, not a `configure` seam. |
-| `components/MarkdownEditor` | Theme-bridging wrapper over `@plannotator/markdown-editor`. Takes CM6 extensions via the `extensions` prop (captured ONCE per `documentId` — see "Wiki-link seams (0.27.0)") and re-exports `wikiLinks` + its config types. |
+| `components/MarkdownEditor` | Theme-bridging wrapper over `@plannotator/markdown-editor`. Takes CM6 extensions via the `extensions` prop (captured ONCE per `documentId` — see "Wiki-link seams (0.27.0)") and re-exports `wikiLinks`, `embedPicker`, `embedSlashItem`, `planEmbedInsert`, and their public types. |
 | `components/MarkdownDiff` | Theme-bridging wrapper over `@plannotator/markdown-editor`'s frozen two-revision diff. Same shim pattern as `components/MarkdownEditor` (ThemeProvider bridge, `extensions` passthrough, grid card chrome); never editable. See "Frozen markdown diff (0.28.0)". |
 | `components/CommentPopover` | Anchor capture + comment entry. Ask-AI UI renders only if you pass `onAskAI`. |
 | `components/AnnotationPanel` | Renders from your annotation state; no fetches of its own. |
@@ -204,8 +206,16 @@ We deliberately did **not** restructure the exports map in this PR (move-don't-r
 | `hooks/useActiveSection` | Scroll-spy over rendered headings; no backend. *(Blessed in 0.24.0.)* |
 | `hooks/useScrollViewport` | Resolves the scrolling element for viewport-aware UI; no backend. *(Blessed in 0.24.0.)* |
 | `utils/annotationHelpers` | Pure annotation utilities (`getAnnotationCountBySection`, `buildTocHierarchy` + `TocItem`). *(Blessed in 0.24.0.)* |
-| `components/html-viewer` (`HtmlViewer`) | The raw-HTML annotation viewer: overlay-projected placed markers, pinpoint anchors, multi-target comments. Props + validated bridge protocol; no backend of its own. See "Raw-HTML annotation viewer + syntax-highlighting migration (0.29.0)". *(Blessed in 0.29.0.)* |
+| `components/html-viewer` (`HtmlViewer`, `projectHostThreads`, `buildPersistedHtmlAnchor`) | The raw-HTML annotation viewer: overlay-projected placed markers, pinpoint anchors, multi-target comments. Props + validated bridge protocol; no backend of its own. See "Raw-HTML annotation viewer + syntax-highlighting migration (0.29.0)" and "HTML annotation parity seams". *(Blessed in 0.29.0.)* |
+| `components/HtmlSurfaceControls` | The eye / refresh / pen header controls for an HTML surface, with per-string `labels` overrides. Presentation only. See "HTML annotation parity seams". |
+| `hooks/useHtmlRefresh` | Re-fetch a rendered HTML document through a host-supplied `fetchSnapshot`, remount the viewer on a reload generation, acknowledge the restore report once. See "HTML annotation parity seams". |
+| `shortcuts` (`useHtmlAnnotateShortcuts`, `defineShortcutScope`, the scope registry) | The declarative keyboard-shortcut engine and the per-surface scopes, including the HTML annotate scope (Mod+Shift+A). Pure: React plus `utils/platform`; no backend. |
+| `utils/inputMethod` (`getInputMethod`, `saveInputMethod`, `refreshInputMethodStamp`) | The per-surface pinpoint/drag input-method preference with its TTL. Persists through the `storageBackend` seam; no backend of its own. |
 | `utils/codeHighlight` / `utils/codeBlockMark` / `utils/syntaxTheme` | The Shiki-based fence highlighter, swap-surviving annotation marks, and palette→Shiki theme mapping. Replaces all `.hljs` styling. *(Blessed in 0.29.0.)* |
+| `utils/math` (`loadMathRenderer`, `getMathRenderer`, `getMathRendererSource`, `setMathRenderer`, `setMathRendererLoader`, `getMathRendererLoader`, `resetMathRenderer`) and `utils/math-eager` | The math renderer slot and its eager KaTeX registration. Import `utils/math-eager` for synchronous typesetting on the first commit; call `loadMathRenderer()` to pre-warm the lazy path. `resetMathRenderer()` empties the slot and keeps the registered loader; `setMathRendererLoader(null)` drops it. See "Lazy renderers and eager entries". |
+| `utils/mermaid-math-slot` | Alias target only: what a host redirects Mermaid's own `katex` import to, so `$$` labels in diagrams typeset through the math slot and the host build carries one KaTeX chunk. Never import it yourself. See "Lazy renderers and eager entries", item 2. |
+| `utils/identity-tater` | Side-effect entry that registers the full username dictionary into the identity generator slot. Import it only if you rely on the default tater names and want the full dictionary; a host with `identityProvider` should not. |
+| `utils/mermaid` (`loadMermaidRuntime`, `getMermaidRuntime`, `getMermaidRuntimeSource`, `setMermaidRuntime`, `MERMAID_CONFIG`) and `utils/mermaid-eager` | The Mermaid runtime slot and its eager registration. Import `utils/mermaid-eager` to keep Mermaid in your entry chunk as Plannotator does; omit it for the lazy path with retry. See "Lazy renderers and eager entries". |
 
 **AI is fully avoidable** — with one precision worth knowing. No AI *UI* is reachable from the supported components: `useAIChat` is imported only by `components/ai/DocumentAIChatPanel` and `useAIProviderConfig`, neither of which any supported component imports, and `CommentPopover`'s Ask-AI affordance exists only behind the optional `onAskAI` prop. `configure.ts` does statically import the `useAIChat` module (it needs `setAITransport`), but if you never use AI the hook is dead code and bundlers eliminate it — verified empirically: a standalone consumer's production bundle importing the full supported surface contains zero `/api/ai` strings. Don't import `components/ai/*` and don't pass `aiTransport`, and you ship no AI code.
 
@@ -237,6 +247,8 @@ The renderer's `MathBlock` (and inline math) uses KaTeX. **KaTeX's stylesheet an
 3. **Bundler import:** `import 'katex/dist/katex.min.css';` next to your `styles.css` import — your bundler ships the fonts as separate lazy-loaded files. With npm/bun this resolves out of the box (`katex` is a dependency of `@plannotator/ui` and gets hoisted); under pnpm's strict `node_modules`, add `katex` to your own dependencies to import it directly.
 
 If you skip all three and render math, equations appear as broken-looking raw HTML — that's the symptom to recognize. If you never render math, do nothing.
+
+The JS side is separate and lazy by default: KaTeX's runtime is no longer on the static import graph of `MathBlock` / `InlineMarkdown`. A host that renders `Viewer` without importing `@plannotator/ui/utils/math-eager` gets the TeX source in the same wrapper for one frame, then the typeset markup once `import('katex')` resolves. See "Lazy renderers and eager entries" for the opt-back and the loader seam.
 
 ---
 
@@ -395,6 +407,169 @@ Consumer-enablement round for wiki-links (Workspaces' `[[doc_01XYZ|label]]` link
 
 ---
 
+## Embed media picker (0.31.0)
+
+The package now owns the reusable two-stage `/embed` authoring flow. The host still owns its target catalog, serialized embed grammar, and upload UI/API. This is a per-editor extension seam, not a `configurePlannotatorUI()` backend seam.
+
+1. **Single supported import.** `components/MarkdownEditor` re-exports `embedSlashItem()`, `embedPicker(config)`, `EmbedKind`, `EmbedTarget`, `EmbedPickerConfig`, `planEmbedInsert()`, and `EmbedInsertPlan`. Do not import the nested picker module, `@plannotator/atomic-editor`, or `@plannotator/core` directly from a host.
+
+2. **Compose both stages.** Add the static item to `slashCommands()` and register the picker beside it:
+
+   ```tsx
+   import {
+     MarkdownEditor,
+     embedPicker,
+     embedSlashItem,
+     slashCommands,
+   } from "@plannotator/ui/components/MarkdownEditor";
+
+   const editorExtensions = [
+     slashCommands({ items: [embedSlashItem()] }),
+     embedPicker({
+       getTargets: () => currentTargets,
+       buildInsertLine: (target) => buildHostEmbedLine(target),
+       uploadTarget: async (kind) => uploadHostTarget(kind),
+       getNotice: (docBody) => currentEmbedNotice(docBody),
+     }),
+   ];
+
+   <MarkdownEditor extensions={editorExtensions} {...editorProps} />;
+   ```
+
+   The static item rewrites `/query` to `/embed ` and reopens completion. The picker then performs case-insensitive substring matching over target titles and paths. It deliberately returns `filter: false` so multi-word titles remain in the session.
+
+3. **Captured once, callbacks stay live.** The `extensions` array is still captured once per `documentId`. Keep the extension reference stable and close `getTargets`, `buildInsertLine`, `uploadTarget`, and `getNotice` over live refs or route state. Do not rebuild the array merely because target data changed.
+
+4. **Grammar belongs to the host; splicing belongs to the package.** `buildInsertLine(target)` returns the exact line the host wants stored. `planEmbedInsert()` then normalizes that line into its own blank-line-delimited paragraph and places the caret on the following line. Host-specific path resolution, label escaping, and embed-fragment grammar stay outside the package.
+
+5. **Upload is optional and single-flight.** When `uploadTarget` is absent, no upload row is rendered. When present, every picker state includes `Upload HTML...`. While its promise is pending, the typed `/embed` text stays visible and a reopened picker shows an inert `Uploading...` row. Resolving with a target inserts it through `buildInsertLine` and the same splice as an existing target; resolving `null` or rejecting leaves the typed command untouched. The package maps the anchor through CodeMirror transactions and silently drops the insert if the command was edited away. The host owns all failure UI.
+
+6. **One CodeMirror dependency graph.** The picker imports `@codemirror/autocomplete`, `@codemirror/state`, and `@codemirror/view` from `@plannotator/ui`'s declared dependencies. `@plannotator/atomic-editor` declares these as peers, so a consumer must resolve one shared copy. A second live copy of `@codemirror/state` breaks extensions just as it does for `wikiLinks`.
+
+Behavior is pinned by `components/MarkdownEditor.embedPicker.test.ts`, the supported re-export by `components/MarkdownEditor.embedPicker.reexport.test.ts`, and the pure splice planner by `../core/embed-insert.test.ts`.
+
+---
+
+## Lazy renderers and eager entries (0.32.0)
+
+Four modules that used to ride every document read for a host that bundles by route now load on demand: the Mermaid runtime, the Graphviz engine, KaTeX, and the username dictionary. Plannotator's own apps register KaTeX and the dictionary eagerly in both the plan editor and the review editor, and the plan editor also registers the Mermaid runtime eagerly (the review editor never renders a Mermaid block and deliberately does not), so every surface renders exactly as before; the single-file builds are unchanged in size and first paint and the portal entry chunk keeps Mermaid as on main (the built-HTML markers and the A/B proof live in `tests/entry-assets.test.ts` and the PR that shipped this).
+
+1. **Graphviz: no seam, nothing to do.** `GraphvizBlock` imports `@viz-js/viz` inside its render effect. It already showed the source fence until the SVG landed, so the only change for a chunking host is that the first dot fence on a page fetches the engine. A failed import is dropped from the memo and re-attempted once with a fresh `import()` after a short delay; a persistently failing chunk surfaces as the existing error panel with the source, plus a Retry button that issues another fresh attempt (a diagram syntax error shows the panel exactly as before, without Retry). Hosts that aliased the specifier to a lazy shim can delete the shim.
+
+   **Mermaid: a runtime slot, filled eagerly by Plannotator.** `utils/mermaid` holds the slot (`getMermaidRuntime`, `setMermaidRuntime`, `getMermaidRuntimeSource`) and the one code path `MermaidBlock` uses, `loadMermaidRuntime()`: it resolves at once from a filled slot and otherwise imports `mermaid` lazily, initialized once with `MERMAID_CONFIG` (`securityLevel: 'strict'` pinned by test), with the same drop-on-rejection, one automatic re-attempt and Retry button as Graphviz. `utils/mermaid-eager` imports the runtime statically, initializes it at module evaluation (where the old module-scope `initialize` ran) and fills the slot; `packages/editor/App.tsx` imports it by policy, so Plannotator's plan surfaces keep Mermaid in their entry chunk and it can never fail separately from the app (on the share portal `mermaid.core` stays in the entry, as on main). The review editor does not import it because it never renders a Mermaid block. A host that wants the same adds `import '@plannotator/ui/utils/mermaid-eager'`; a host that omits it gets the lazy path.
+
+   **Retry, honestly.** An in-page retry cannot recover a chunk whose first fetch failed: browsers record a failed module fetch in the module map for the page lifetime, so a fresh `import()` of the same URL rejects without a request, and package code cannot re-import under a new URL because Rollup minifies the chunk's export names. The retry therefore recovers failures after the fetch (engine instantiation, `initialize`) and hosts that version chunk URLs; a host that needs recovery from a failed first fetch uses versioned chunk URLs or a `vite:preloadError` reload at app level. The panel with the source is always shown, never a blank.
+
+2. **KaTeX: a renderer slot, filled eagerly by Plannotator.** `utils/math` holds a synchronous slot (`getMathRenderer`, `setMathRenderer`, `subscribeMathRenderer`), an idempotent `loadMathRenderer()` whose default loader is `import('katex')` (JS only; stylesheet policy is unchanged, see "Math rendering"; since 0.33.0 that default lives in its own module, `utils/math-default-loader`, see the paragraph on dropping its chunk below), and `setMathRendererLoader`. `MathBlock` and inline math read the slot during render: filled, they typeset synchronously in the same render exactly as before; empty, they render the same wrapper (`math-block` / `math-inline`, `math-annotatable`, `data-math-tex`, `data-math-display`, `aria-label`, `data-block-id`) with the trimmed TeX as a text child, load the renderer from an effect, and re-render typeset when it lands. Annotation restore and block targeting key on those attributes, so a placeholder is addressable exactly like the typeset node. `throwOnError: false` and `trust: false` are applied to every renderer, including one you register.
+
+   **This is the one place the pass-nothing law bends.** A host that renders `Viewer` and never imports the eager entry now gets lazy math: one frame of TeX text, then typeset. The one-line opt-back for the old behavior:
+
+   ```ts
+   import '@plannotator/ui/utils/math-eager';
+   ```
+
+   The seam for the lazy path: `configurePlannotatorUI({ mathRendererLoader: () => Promise.all([import('katex'), import('katex/dist/katex.min.css')]).then(([m]) => m.default) })` puts KaTeX and its CSS on one chunk; `loadMathRenderer()` can be awaited before mounting a body that carries math if you would rather gate first paint yourself.
+
+   **Where the default `import('katex')` lives, and how to drop its chunk (0.33.0, from 0.32.0 adoption feedback).** The default loader is `utils/math-default-loader` (`loadDefaultMathRenderer`), the package's only runtime mention of `katex` outside `math-eager`; `utils/math` calls it only while no loader is registered (`loader === null`), and a registered loader is never backfilled by it, not even after the host's load rejects (pinned in `utils/math.test.ts`). So with a loader registered the default is never *requested*. One pre-existing ordering rule still applies: a default load already in flight when the host registers its loader keeps going and fills the slot when it lands (documented on `setMathRendererLoader`), so register the loader before the first math node renders, in your entry, not in an effect. It is still *emitted*: Rollup decides chunks statically and cannot see a runtime registration, so a host build that registers a loader still carries a `katex-*.js` chunk with an `import()` site pointing at it from the package. Measured on a two-entry Vite 6 consumer of this checkout (one entry registering a loader that is not KaTeX, one registering nothing): both builds emit one 484 KB chunk carrying the KaTeX body. A host that wants that chunk gone aliases the default module at a stub, which is why it is its own module:
+
+   ```ts
+   // vite.config.ts of a host that registers mathRendererLoader
+   resolve: { alias: [{ find: /^(\.\/|@plannotator\/ui\/utils\/)math-default-loader$/, replacement: '/src/no-default-math.ts' }] }
+   // src/no-default-math.ts
+   export function loadDefaultMathRenderer(): Promise<never> { return Promise.reject(new Error('default math loader aliased out')); }
+   ```
+
+   With the alias the same consumer build emits zero chunks carrying the KaTeX body out of the package and the entry's only `import()` in that area is the host's own loader chunk. Do not alias without registering a loader: math would then render as TeX text forever. Plannotator's entries import `math-eager`, so the slot is filled before the first render and this branch is never reached there; the single-file builds inline the default through `inlineDynamicImports` as before (`tests/entry-assets.test.ts` pins the split: `utils/math` has no `import('katex')` site, `utils/math-default-loader` has the only one).
+
+   **Mermaid's own KaTeX, and the last shared chunk (0.34.0, from 0.33.0 adoption feedback).** The alias above is not the whole story once a page can render a Mermaid diagram. The Mermaid runtime (11.15.0 in this checkout) typesets `$$...$$` labels through its own `import("katex")`, inside `renderKatexUnsanitized`, and it offers nothing to turn that off: `legacyMathML` / `forceLegacyMathML` only choose the output mode, the guard around the import is the `@mermaid-js/tiny` build marker, and there is no hook to hand it a renderer. The import only *runs* for a label that matches Mermaid's `$$` test, but it is *emitted* regardless, so a host that registered a loader and aliased the default still built a `katex-*.js` chunk, and because that chunk then had two dynamic importers (the host's loader module and the Mermaid runtime) Rollup kept it separate from the host's loader chunk: a math document fetched two files, the 57-byte loader chunk plus the shared 261 KB KaTeX chunk. Measured on the scratch Vite 6 consumer of this checkout (loader registered, default aliased, a document with inline math, a display block and a flowchart with a `$$` label): one chunk carried the KaTeX body before, `katex-*.js`, imported by `mermaid.core-*.js` and by the host's loader chunk; 367 JS chunks in all.
+
+   The fix is a bundler-facing redirect to a package module, `utils/mermaid-math-slot`, whose default export has the one method Mermaid calls (`renderToString`) and delegates to whatever fills the math slot, with Mermaid's own options (`throwOnError: true`, `displayMode: true`, the MathML `output` mode) passed through untouched, so a KaTeX renderer produces exactly the markup Mermaid produced from its direct import. Redirect the `katex` specifier for importers inside the `mermaid` package ONLY; a plain `resolve.alias` on `katex` would also rewrite your own loader's import and break math everywhere:
+
+   ```ts
+   // vite.config.ts of a host that registers mathRendererLoader (beside the math-default-loader alias)
+   import { fileURLToPath } from 'node:url';
+   const configFile = fileURLToPath(import.meta.url);
+   const mermaidKatexToSlot: Plugin = {
+     name: 'mermaid-katex-to-plannotator-slot',
+     enforce: 'pre',
+     resolveId(source, importer) {
+       if (source !== 'katex' || !importer || !/[\\/]node_modules[\\/]mermaid[\\/]/.test(importer)) return null;
+       return this.resolve('@plannotator/ui/utils/mermaid-math-slot', configFile, { skipSelf: true });
+     },
+   };
+   // plugins: [mermaidKatexToSlot, react(), ...]
+   ```
+
+   Two details of that snippet are layout-proofing. The importer test is `node_modules/mermaid/` anywhere in the path, not a pattern for one install layout: a hoisted install puts the runtime at `node_modules/mermaid/`, Bun's isolated layout at `node_modules/.bun/mermaid@11.15.0/node_modules/mermaid/`, and pnpm's at `node_modules/.pnpm/mermaid@11.15.0/node_modules/mermaid/`; every one of them ends in that segment, and the trailing separator keeps `mermaid-something` packages out. The slot module is resolved from the host's own config file (`configFile`), not from the Mermaid importer: resolving from the importer walks up from Mermaid's location, which finds `@plannotator/ui` on hoisted and Bun-isolated installs but not under pnpm's strict `node_modules`, where the package is only visible from the host root. Resolving from the config file is the same lookup the host's own imports use; passing an absolute path to the file (`path.resolve(...)` of the installed `utils/mermaid-math-slot.ts`) works too.
+
+   With the redirect the same consumer build emits one chunk carrying the KaTeX body, the host's own loader chunk (`host-katex-*.js`, 261 KB, reached only by the entry's `import()`), `mermaid.core-*.js` has no KaTeX import left, and the chunk count drops to 366: one KaTeX chunk, owned by the host, one file fetched. The slot must be filled by the time Mermaid asks, so `MermaidBlock` awaits `loadMathRenderer()` before rendering a diagram whose source carries a `$$` label (`hasMermaidMath`, Mermaid's own regex); on a filled slot that resolves at once, on the lazy path it runs your loader, and if that load fails the label throws a message naming the cause (`MERMAID_MATH_SLOT_EMPTY_MESSAGE`) which the block's error panel shows with the source. Do not import the module yourself; it exists to be resolved to. Plannotator does not redirect: its Mermaid keeps its direct KaTeX, inlined by the single-file builds with everything else, and the pre-render wait is a resolved promise there because `math-eager` filled the slot at startup. No test in the repo renders a real Mermaid diagram with a math label (Mermaid does not render under happy-dom), and nothing in Plannotator's own documents exercises `$$` labels; the bridge is pinned by `utils/mermaid-math-slot.test.ts` (delegation with Mermaid's exact options, KaTeX parity, the empty-slot error, the label regex) and the pre-render warm by the "Mermaid math labels warm the math slot" cases in `components/DiagramBlock.lazyRetry.test.tsx`.
+
+   **`resetMathRenderer()` keeps the loader (0.34.0).** Through 0.33.0 the reset hook also nulled the registered loader, so a host test harness that reset the slot between cases silently fell back to the package default `import('katex')` on the next render. Reset now empties the renderer and its source, forgets a load in flight (its late result no longer fills the slot; the next `loadMathRenderer()` invokes the registered loader afresh) and leaves the loader registered. `setMathRendererLoader(null)` is the explicit way back to the package default, and `getMathRendererLoader()` reads the registration; `configurePlannotatorUI` cannot unregister a loader (a `null` or absent `mathRendererLoader` is a no-op there), so only a direct `setMathRendererLoader(null)` does. `setMathRendererLoader` itself is unchanged: a load already in flight at registration still fills the slot, because the component that started it is waiting on that result. The other reset-style helpers were reviewed and are consistent with their names: `resetIdentityProvider` and `resetIdentityGenerator` reset exactly the thing they name (the provider, the generator), and Mermaid's `__setMermaidRuntimeLoaderForTests` is a stand-in by name. Pinned in `utils/math.test.ts`.
+
+3. **Identity: a generator slot, filled eagerly by Plannotator.** `utils/generateIdentity` no longer imports `unique-username-generator`. It holds a synchronous generator slot (`setIdentityGenerator`, `getIdentityGenerator`) with a built-in fallback that produces the same `adjective-noun-tater` shape from a 16 x 16 pool. `utils/identity-tater` registers the full dictionary as a side effect and is what Plannotator's entries import. A host with `identityProvider` never calls the generator and, with the static import gone, no longer ships the word lists; delete any dictionary shim. A host that wants the full dictionary without its own provider imports `@plannotator/ui/utils/identity-tater`, or passes its own `identityGenerator` to `configurePlannotatorUI`. The slot is synchronous on purpose: `configStore` persists the first generated name to the identity cookie during the first render-time settings read, so a name that arrived later would be a visible identity change.
+
+4. **Scope, as of 0.34.0.** 0.32.0 shipped items 1 to 3 and deliberately left two things out of the design record's list: the raw-HTML bridge script as a separately served asset, and a lazy table popout. 0.33.0 ships the first (see "HTML viewer bridge as an asset" below) and, from adoption feedback, the `utils/math-default-loader` split in item 2. 0.34.0 adds the Mermaid KaTeX redirect and the `resetMathRenderer` fix in item 2, both from 0.33.0 adoption feedback. The lazy table popout is still not shipped and stays tracked in the design record for a follow-up.
+
+Pinned by `utils/math.test.ts`, `utils/mermaid-math-slot.test.ts`, `components/MathBlock.firstPaint.test.tsx`, `utils/generateIdentity.test.ts`, `components/MermaidBlock.test.ts`, `components/DiagramBlock.lazyRetry.test.tsx`, and the eager-entry and built-HTML marker guards in `tests/entry-assets.test.ts`.
+
+---
+
+## HTML viewer bridge as an asset (0.33.0)
+
+`HtmlViewer` injects a 185 KB bridge script (`BRIDGE_SCRIPT`, `components/html-viewer/bridge-script.ts`) into every srcdoc document it renders. For a host that bundles by route that literal rode in the viewer chunk and was re-parsed by the browser per document. This release adds an opt-in, `bridgeScriptUrl`, and leaves the default untouched: Plannotator passes nothing, every Plannotator surface (the annotate srcdoc path, the version diff, PR HTML artifacts, linked `.html` docs, the share portal) still inlines the string, the live-app proxy still serves the same inline bridge from its own `/__plannotator__/bridge.js` route, the Pi and OpenCode copies are built from the same code, and the single-file bundles carry the literal exactly once as before (`tests/entry-assets.test.ts` counts it; the A/B of a Plannotator HTML annotate session on a main build against this build found identical DOM, requests and console).
+
+**What the package ships.** `prepack` now also runs `scripts/build-bridge-assets.ts`, which derives two gitignored files beside the source module, both deterministic and both verified against the module's exports by `components/html-viewer/bridgeAsset.test.ts`:
+
+- `components/html-viewer/bridge-script.asset.js`: byte-for-byte `BRIDGE_SCRIPT`, the runnable IIFE. Export subpath `@plannotator/ui/components/html-viewer/bridge-script.asset.js`. The `.asset.js` name is deliberate: a plain `bridge-script.js` next to `bridge-script.ts` would be picked first by Vite's extension probe for the package's own `./bridge-script` imports and break every consumer build.
+- `components/html-viewer/bridge-script.lite.ts`: the same `ANNOTATION_HIGHLIGHT_CSS`, `BRIDGE_PROTOCOL_VERSION` and `LIVE_BRIDGE_BOOTSTRAP` with `BRIDGE_SCRIPT = ""`. Export subpath `@plannotator/ui/components/html-viewer/bridge-script.lite`. An alias target only (below).
+
+The TS module stays the source of truth because the Plannotator CLI and the Pi extension import its string exports under Bun.
+
+**Host wiring (Workspaces).** Serve the asset same-origin as a hashed file through a Vite `?url` import and pass the URL to the viewer:
+
+```ts
+import bridgeScriptUrl from "@plannotator/ui/components/html-viewer/bridge-script.asset.js?url";
+
+<HtmlViewer
+  rawHtml={html}
+  bridgeScriptUrl={bridgeScriptUrl}
+  bridgeReadyTimeoutMs={5000}          // default; the wait for `ready` per document load
+  onBridgeUnavailable={(info) => ...}  // { kind: 'timeout' | 'version-mismatch', url, ... }
+  ...
+/>
+```
+
+With the prop set, `buildSrcdocInjection` emits `<script src="…"></script>` in the exact position the inline `<script>` occupied (there is one injection point, `buildBridgeScriptTag` in `srcdoc.ts`, for both paths), so placement is unchanged: at the end of `<head>`, before the body, on both paths (the page's head scripts run before the bridge, its body scripts after). The URL is resolved against the PARENT document (`resolveBridgeScriptUrl(url, document.baseURI)`) before it is written into the srcdoc, never against the framed page: the injection follows any `<base href>` the page declares, so a relative URL left unresolved would let a hostile document point the viewer at an attacker-served bridge and defeat the version check. The srcdoc is rebuilt on `rawHtml`, theme and diff changes and the browser then re-fetches the asset from cache, so serve it with normal immutable-asset cache headers. An empty string counts as absent (inline). The prop is ignored in live (`src`) mode, where the proxy injects the bridge.
+
+**CSP.** Confirmed by grep and pinned by test: the package never writes a CSP `<meta>` into the srcdoc document (the injection is one `<style>` and one `<script>`; an author-written CSP meta is still neutralized as before), and the bridge sets none at runtime. The srcdoc frame is an opaque origin, and a classic `<script src>` executes without CORS; no `crossorigin` attribute is set, so do not expect one. A `Content-Security-Policy` HTTP header on the host page IS inherited by the srcdoc document: a host with its own CSP must allow `script-src` for the origin the asset is served from (same-origin `'self'` in the wiring above). Note the asset form is easier under CSP than the inline form, which would need `'unsafe-inline'` or a nonce. One more header to check: an asset served with `Cross-Origin-Resource-Policy: same-origin` (common with COEP) is blocked for the opaque-origin frame; serve the bridge asset with a CORP that admits cross-origin loads (`cross-origin`) or without CORP.
+
+**Protocol version.** `BRIDGE_PROTOCOL_VERSION` (exported from `components/html-viewer/bridge-script` and re-exported from `components/html-viewer`) is embedded in the bridge text and stamped on its `ready` message as `protocolVersion`. Note for the design record's "current state": `BRIDGE_SCRIPT` now carries its first `${}` interpolation (that constant, evaluated at module load); it remains a plain string export with no per-session values, so the CLI, Pi and the live proxy consume it exactly as before. The parent (`checkBridgeProtocolVersion`, `HtmlViewer`'s ready branch) compares it: on the inline path and in live sessions the two sides come from one bundle and always match; on the URL path a cached asset from a previous package version answers with an older stamp, or none, and the viewer logs one console warning naming both versions, shows a dismissible error banner over the top of the frame (`[data-bridge-error="version-mismatch"]`, `role="alert"`, a `[data-bridge-error-dismiss]` button; the page stays visible) and calls `onBridgeUnavailable` once. The ready is still honored (an older bridge answers every message shape it knows), so this is a loud diagnostic, not a refusal. Bump the constant whenever a bridge message shape changes in a way an older bridge or parent would misread; a bump forces a warning against any not-yet-redeployed asset, which is the point.
+
+**Who renders the strip (`bridgeErrorDisplay`; 0.34.0, from 0.33.0 adoption feedback).** The package owns the failure strip by default: `bridgeErrorDisplay="banner"` renders the `[data-bridge-error]` element for both the mismatch and the timeout states exactly as 0.33.0 did, so Plannotator and every existing host are unchanged. A host that renders its own notice from `onBridgeUnavailable` passes `bridgeErrorDisplay="none"`: no strip and no dismiss button are rendered for either state, while `onBridgeUnavailable` fires exactly as before and a version mismatch still logs its one console warning. Through 0.33.0 the strip could not be suppressed, so such a host showed two banners. The prop is meaningless on the inline path, which never shows a strip. Pinned by the two `bridgeErrorDisplay` cases in `components/html-viewer/HtmlViewer.bridgeAsset.test.tsx`.
+
+**Ready timeout.** On the URL path only, `bridgeReadyTimeoutMs` (default 5000) is armed once per document load (URL or srcdoc change), read through a ref, so changing the prop after the bridge is ready never re-arms it; with no `ready` in time the surface shows `[data-bridge-error="timeout"]` naming the URL and the wait (not dismissible: the surface is dead), and `onBridgeUnavailable({ kind: 'timeout', url, timeoutMs })` fires. A late `ready` clears it. The inline path arms no timer and can never show a banner.
+
+**Dropping the literal from the host chunk (optional).** The URL path alone leaves the inline string in the chunk unused, because `srcdoc.ts` imports it statically (the default must stay synchronous). To remove it, alias the package's `./bridge-script` resolution to the generated lite module in your bundler; with Vite:
+
+```ts
+resolve: {
+  alias: [{
+    find: /^\.\/bridge-script$/,
+    replacement: "@plannotator/ui/components/html-viewer/bridge-script.lite",
+  }],
+}
+```
+
+The `find` is anchored on purpose (0.34.0; 0.33.0 documented `/\/bridge-script$/`). Every import of the module inside the package is the relative sibling form, `./bridge-script` (`srcdoc.ts`, `useHtmlAnnotation.ts`, `index.ts`), so `/^\.\/bridge-script$/` matches exactly those. The unanchored form matched any specifier ENDING in `/bridge-script`, which is also the shape of another package's entry point (`some-dependency/bridge-script`) or of a deeper import in your own tree (`../vendor/bridge-script`), and would have silently swapped those for the lite module too. If your own source has a sibling module named `bridge-script`, add an importer check (a `customResolver` on the alias entry, or a `resolveId` plugin that tests `importer` for `@plannotator/ui/components/html-viewer/`) rather than widening the pattern.
+
+Under that alias an `HtmlViewer` rendered WITHOUT `bridgeScriptUrl` throws at render (`buildBridgeScriptTag` refuses to emit an empty inline script), so the misconfiguration cannot ship as a silently dead surface. Measured on the proof harness (PR #1398's description): the viewer chunk shrinks by the size of the literal, 557 kB to 371 kB (168 kB to 118 kB gzip).
+
+**Live app annotation is unaffected.** `packages/shared/live-proxy-bridge-inline.test.ts` pins at source level that both proxy transports and both runtimes' composers still ship the inline bridge from the proxy route and never reference `bridgeScriptUrl` or the generated files.
+
+Pinned by `components/html-viewer/bridgeAsset.test.ts` (generator bytes, manifest wiring, the single injection point, no CSP meta, the real bridge's stamped ready), `components/html-viewer/HtmlViewer.bridgeAsset.test.tsx` (URL srcdoc, stale-asset warning and banner, timeout and late ready, inline path unchanged), `packages/shared/live-proxy-bridge-inline.test.ts` and the bridge marker count in `tests/entry-assets.test.ts`.
+
+---
+
 ## Frozen markdown diff (0.28.0)
 
 One additive component for the Workspaces versions/approvals surface: `components/MarkdownDiff`, a theme-bridging shim over `@plannotator/markdown-editor@0.4.0`'s `MarkdownDiff` — a **frozen two-revision markdown comparison**. The newer revision renders as the real document (uncollapsed, full length); deletions are projected struck-through at their original positions; changed spans get character/word emphasis; a toolbar shows the change count with prev/next navigation; a clickable, keyboard-accessible overview rail and a changed-line gutter complete the review chrome. Every 0.27.0 surface is unchanged.
@@ -465,12 +640,47 @@ Pinned by "unanchored ids are reported on change" in `components/html-viewer/src
 
 ---
 
+## HTML annotation parity seams (0.32.0)
+
+Nine additive seams so a host can run the raw-HTML annotation surface with the same experience Plannotator ships, without app-local code around `HtmlViewer`. Every default reproduces 0.31.0 behavior; Plannotator's own app passes the same defaults and renders the same DOM (proven by a real-browser A/B of the header, the overlay markers and the annotations panel on a main build versus this build).
+
+1. **`projectHostThreads(threads, { openOnly?, documentLevel?, maxTargets? })`** and **`buildPersistedHtmlAnchor(source, { maxBytes = 16384, maxTargets = 16 })`** are exported from `components/html-viewer` (pure, from `@plannotator/core/html-anchor`). The first projects a host's stored rows (`{ id, originalText, htmlAnchor?, htmlAdditionalTargets?, state?, text?, author?, createdA?, images? }`) onto the `annotations` prop **in the host's order, which is the marker numbering**; an element anchor without quoted text stays a page `COMMENT`, anchors validate fail-closed, and `maxTargets` caps additional targets on read (default: the viewer's 16). A row with nothing restorable (no quote, no element anchor) projects by `documentLevel`: **`'global'` (the default, Plannotator's model)** makes it a `GLOBAL_COMMENT`, a document-level comment the panel renders without a quote line and the unanchored report never names; **`'unanchored'`** keeps it a page `COMMENT` with an empty quote and no anchor, which the unanchored report names (the panel shows an empty quote line), for hosts that treat such rows as comments that lost their place. The second trims a composed comment's anchor for persistence: product cap first, then a byte budget that truncates the quote down to its 400-char floor before shedding targets from the end, with `droppedTargets` (the total), `capDroppedTargets` and `sizeDroppedTargets` reported (a size drop must never be announced as the product cap). Kept targets serialize with keys in `text, label, anchor` order, the reference host's wire order, so stored anchors and fingerprints over them are stable on adoption. An input already in that order and within every bound round-trips byte-identical. **`projectHostThreads` is HTML-only.** The projection carries exactly what the raw-HTML surface reads (`originalText`, `htmlAnchor`, `htmlAdditionalTargets`, the type, the presentational fields) and pins `blockId` to `""`, `startOffset` / `endOffset` to `0`, with no `startMeta` / `endMeta`. On the markdown `Viewer` a projected `COMMENT` with quoted text still re-anchors: `hooks/useAnnotationHighlighter` requires `blockId` only on the math path and for a metas restore, and with no metas it falls to `findTextInDOM(originalText)`, a whole-container text search never scoped by block. What such a row loses with `blockId` `""` and offsets `0`: export ordering (`exportAnnotations` sorts by block index, which is `-1` for every such row, so they all sort first and tie), the "lines N-M" location label (`null` without a block), disambiguation when the same text appears more than once (first match wins), and the no-flash meta restore. A host that needs any of those carries `blockId`, the offsets and the web-highlighter metas in its own projection; a markdown-aware projection is more than a metas passthrough (the block id and offsets are the anchor) and is deliberately not attempted here.
+
+2. **`onUnanchoredChange` is complete over the `annotations` prop and keyed to the bridge's restore.** On every bridge `ready` (a fresh document, a srcdoc reload) the viewer posts its restore batch and then asks the bridge for one complete report (`report-unanchored`); the bridge answers after its next complete overlay pass **even when the set is unchanged, the empty set included**, and that answer is the first delivery for that document. Nothing is delivered before it, per document and per reload generation: a prop-side change that lands before the bridge's first post-restore report is folded into that report, not delivered on its own, so a host must not wait on a prop-side set arriving before the restore (a "no callback yet" state until then is the contract, not a missed event). Later bridge reports deliver as they arrive; a prop-side change delivers only when the union actually changes. The union adds what the bridge cannot see: page rows with no quoted text and no element anchor are reported without being posted (a `GLOBAL_COMMENT` is not, by design), and an id the viewer minted for a locally created comment that the host swapped out of `annotations` for its own id is dropped. What this replaces on the host side: the `mark-applied` bookkeeping that fed an unanchored set (failed verdicts, textless rows, the swapped-out local id). It does not replace `mark-applied` for the local-to-server mark swap itself: the package still does not parse that message, and a host that wants the no-flash swap keeps removing its local mark with `removeHighlight` on its own refetch (a host content with one frame of no mark removes it on the prop change instead).
+
+3. **`hooks/useHtmlRefresh({ enabled?, documentKey?, fetchSnapshot, onSnapshot, onUnanchored?, onResult? })`** returns `{ canRefresh, isRefreshing, reloadGeneration, refresh, reportAnnotationRestore }`. `fetchSnapshot(documentKey)` resolves `{ status: 'ok', rawHtml } | { status: 'missing' } | { status: 'unavailable' }`; a rejection counts as `unavailable`. Key the viewer on `reloadGeneration` and wire its `onUnanchoredChange` to `reportAnnotationRestore`. The hook owns the guards: a fetch superseded by a newer refresh or by a `documentKey` change never applies, and the restore acknowledgement fires once per reload generation with the viewer's first report for the remounted document, which by item 2 is the bridge's post-restore set, the empty set included, so a host clears its chip when a previous orphan re-anchors. Notifications are the host's, through `onResult`.
+
+4. **`components/HtmlSurfaceControls({ armed, onToggleArmed?, toolsHidden?, onToggleTools?, canRefresh?, onRefresh?, isRefreshing?, compact?, labels? })`**: the eye, the refresh and the pen with the exact markup, data attributes (`data-html-tools-toggle`, `data-html-refresh`, `data-html-annotate-toggle`), `aria-pressed` on the pen and the eye, `aria-disabled` on an in-flight refresh (focus is kept), and the pen's pixel-stable border. Each control renders only when its handler is passed; `compact` renders nothing. `labels` overrides any string per key (`annotateTitle`, `interactTitle`, `annotateLabel`, `interactLabel`, `hideTools`, `showTools`, `refresh`, `refreshing`, `refreshTitle`, `refreshingTitle`); the defaults are Plannotator's pen and eye strings, the refresh default is the neutral "Refresh document", and no pen `aria-label` is emitted unless a label is passed. Pin the armed state to `annotateModeActive` and pass `onAnnotateModeExit` / `onAnnotateModeToggle` to the viewer so Esc and Mod+Shift+A work.
+
+5. **`AnnotationPanel` `unanchoredIds?: ReadonlySet<string>`** renders a small "Unanchored" chip (`data-annotation-unanchored`) on matching cards. Absent, the DOM is unchanged (pinned by comparing the markup against an explicit empty set).
+
+6. **`HtmlViewer` `scrollBehavior?: 'smooth' | 'auto'`** rides `scroll-to { id, behavior? }` so a host can carry its `prefers-reduced-motion` across the iframe boundary. Absent means smooth, as before; anything else fails closed to smooth.
+
+7. **`HtmlViewer` `maxAdditionalTargets?: number`** (0..16, default 16) is the host's product cap on shift-click targets per comment: enforced at the parent trust boundary, on submit and on restore, and carried on `arm-multi-select { key, max }` so the bridge's toggle stops at the same number for that draft (reset with the arm on every draft; a value above 16 never raises the package cap). Absent leaves the arm message unchanged. A host that adopts the package's 16 needs neither this prop nor a message-counting listener. Consequence for a host that passes a smaller cap: because it is enforced upstream at every step (the bridge stops the toggle, the parent boundary trims on submit and on restore, `projectHostThreads` `maxTargets` trims on read), a composed comment never reaches host code with more targets than the cap, so the host's own cap-dropped handling (`capDroppedTargets` from `buildPersistedHtmlAnchor`, or a counting listener) is unreachable in normal operation. Keep it only as a backstop for rows written by an older host build or another writer; the byte-budget drop (`sizeDroppedTargets`) is a different path and remains reachable.
+
+8. **`ExternalAnnotationTransport.subscribe` may emit `snapshot` from a host push.** `useExternalAnnotations` falls back to 500 ms version-gated polling only when the stream errors before its first event. A transport whose `subscribe` delivers a `{ type: 'snapshot', annotations, version }` event whenever the host's realtime layer signals a change (a Durable Object poke, a socket message) keeps the hook on the push path and the fallback poll is never entered. No package change; this is the sanctioned shape.
+
+9. **Blessed imports:** `shortcuts` (`useHtmlAnnotateShortcuts` and the scope registry) and `utils/inputMethod` join the supported table above. Both are fetch-free and `/api`-free (verified by grep over the modules and everything they import); `utils/inputMethod` persists through the `storageBackend` seam.
+
+Behavior is pinned by `../core/html-anchor.test.ts`, `components/html-viewer/unanchored.test.ts` and the "unanchored report" suite in `components/html-viewer/htmlPinpointProtocol.test.tsx`, `hooks/useHtmlRefresh.test.tsx`, `components/HtmlSurfaceControls.test.tsx`, `components/AnnotationPanel.unanchored.test.tsx`, and the cap and scroll-to cases in `components/html-viewer/srcdoc.test.ts` and `htmlPinpointProtocol.test.tsx`.
+
+### `@plannotator/core` 0.25.0
+
+Additive only, but required: `@plannotator/ui` 0.32.0 imports the new `@plannotator/core/html-anchor` subpath (`projectHostThreads`, `buildPersistedHtmlAnchor`), absent from published core 0.24.0, so core 0.25.0 must be installed/published first. Also carries the regenerated `guide-viewer-manifest` that pins the guides.show stylesheet with the `HtmlSurfaceControls` rules (see "Publishing & versioning").
+
+0.32.0 also ships the WebMCP provider engine (`@plannotator/ui/webmcp`, the `webmcp` seam on `configurePlannotatorUI`, and the additive `Annotation.inReplyTo` field); see README.md "WebMCP provider".
+
+---
+
 ## Publishing & versioning
 
-- `@plannotator/ui` is now `0.30.0`; `@plannotator/core` is `0.23.0`. **Publish `core` first** — ui 0.29.0 imports `@plannotator/core/annotatable`, which does not exist in core 0.22.0. The ui→core dependency resolves exactly at pack time.
+- The current pair is `@plannotator/ui` `0.34.0` on `@plannotator/core` `0.25.0`. **No lockstep again**: nothing under `packages/core` changed since the 0.32.0 pair, so core is not republished and ui 0.34.0 pins the already published core 0.25.0 (only the ui tarball is built and published). 0.34.0 carries the 0.33.0 adoption feedback: the Mermaid KaTeX redirect target `utils/mermaid-math-slot`, `HtmlViewer` `bridgeErrorDisplay`, the anchored bridge-script alias, and `resetMathRenderer` keeping the registered loader (with `setMathRendererLoader(null)` and `getMathRendererLoader`). 0.33.0 carried the bridge-script asset (`bridge-script.asset.js`, `bridge-script.lite`, both generated by `prepack`), the `utils/math-default-loader` split, and `HANDOFF.md` inside the tarball so the README's section references resolve for a consumer.
+- Recent pairs, for the consumer's install matrix: ui 0.31.0 on core 0.24.0 (lockstep), ui 0.32.0 on core 0.25.0 (lockstep, `html-anchor`), ui 0.33.0 and ui 0.34.0 on core 0.25.0 (ui only, core unchanged).
+- When a pair IS lockstep, **publish `core` first**: ui 0.32.0 imports the new `@plannotator/core/html-anchor` subpath, which no earlier published core (0.24.0 and before) has, just as ui 0.29.0 needed core 0.23.0 for `@plannotator/core/annotatable`. The ui→core dependency resolves exactly at pack time, from the lockfile: after a version bump, run `bun install` so `bun.lock` carries the new workspace versions, or `bun pm pack` will still stamp the previous core version into ui's tarball (the 0.31.0 lesson).
+- The HTML annotation seams also changed the guides.show viewer **stylesheet** (five utility rules from `HtmlSurfaceControls`; the viewer JS is unchanged), so `packages/core/guide-viewer-manifest.ts` now pins a CSS hash that exists on guides.show only after the deploy workflow has published this build's `/v1/` assets. A guide exported from this build before that deploy would pin a stylesheet the host does not serve yet: **deploy guides.show before any release that ships this manifest.**
 - They depend on each other via `workspace:*`. At publish time that must resolve to the **exact** version in the tarball, so publish with a tool that does that resolution (the repo's existing flow uses `bun pm pack` to build the tarball, then `npm publish *.tgz --access public`). Publish **`core` first, then `ui`**.
 - **`--provenance` only works from a supported CI environment (GitHub Actions OIDC)** — a local publish fails with `Automatic provenance generation not supported for provider: null`. Until a CI publish job exists for these two packages, local publishes drop the flag. Publishing under `--tag next` first lets the consumer preflight before `npm dist-tag add <pkg>@<version> latest` promotes it.
-- `styles.css` is built by the `prepack` script (`bun run build:css`) so the published tarball always carries fresh precompiled CSS.
+- `styles.css` is built by the `prepack` script (`bun run build:css`) so the published tarball always carries fresh precompiled CSS; since 0.33.0 `prepack` also runs `build:bridge-assets`, which generates the gitignored `bridge-script.asset.js` and `bridge-script.lite.ts` beside their source. Both are in `files`, so a tarball built without `prepack` (a hand-rolled `npm pack --ignore-scripts`) would ship export subpaths that resolve to nothing; always build with `bun pm pack`.
 - There is **no CI publish job for these two packages yet** — first publish is manual from `main` after merge. (Wiring a CI publish job is a follow-up.)
 
 ---

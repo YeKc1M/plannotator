@@ -14,6 +14,7 @@ import {
 	serializeSSEEvent,
 	HEARTBEAT_COMMENT,
 	HEARTBEAT_INTERVAL_MS,
+	validateReplyTarget,
 	type StorableAnnotation,
 	type ExternalAnnotationEvent,
 } from "../generated/external-annotation.ts";
@@ -146,17 +147,31 @@ export function createExternalAnnotationHandler(mode: "plan" | "review") {
 					json(res, { error: "Missing ?id parameter" }, 400);
 					return true;
 				}
+				let body: unknown;
 				try {
-					const body = await parseBody(req);
-					const updated = store.update(id, body as Partial<StorableAnnotation>);
-					if (!updated) {
-						json(res, { error: "Not found" }, 404);
-						return true;
-					}
-					json(res, { annotation: updated });
+					body = await parseBody(req);
 				} catch {
 					json(res, { error: "Invalid JSON" }, 400);
+					return true;
 				}
+				// A reply must point at an existing, different annotation and must
+				// not close a cycle: the export and the panel treat cycle members as
+				// roots, but the invalid state should not be creatable in the first
+				// place. (POST never carries inReplyTo, so PATCH is the only ingest.)
+				// Mirrors packages/server/external-annotations.ts.
+				if (body && typeof body === "object" && "inReplyTo" in body) {
+					const problem = validateReplyTarget(store.getAll(), id, (body as { inReplyTo?: unknown }).inReplyTo);
+					if (problem) {
+						json(res, { error: problem }, 400);
+						return true;
+					}
+				}
+				const updated = store.update(id, body as Partial<StorableAnnotation>);
+				if (!updated) {
+					json(res, { error: "Not found" }, 404);
+					return true;
+				}
+				json(res, { annotation: updated });
 				return true;
 			}
 

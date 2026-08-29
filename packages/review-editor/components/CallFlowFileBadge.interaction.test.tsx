@@ -236,4 +236,74 @@ describe('CallFlowFileBadge Lens', () => {
     await act(async () => rawLine?.click());
     expect(document.querySelector('[data-comment-popover="true"]')).not.toBeNull();
   });
+
+  // Guards the hover-intent delay: scrolling a diff drags file headers under a
+  // stationary pointer, and instant open made every passing badge pop the Lens.
+  test.skipIf(!hasDom)('hover opens only after the intent delay', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <ReviewStateProvider value={lensState()}>
+          <CallFlowFileBadge filePath="src/order.ts" />
+        </ReviewStateProvider>,
+      );
+    });
+
+    const trigger = host.querySelector<HTMLButtonElement>('.call-flow-file-badge');
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: document.body }));
+    });
+    expect(document.querySelector('.call-flow-popover')).toBeNull();
+
+    // A pointer that leaves before the delay elapses must not open the Lens.
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, relatedTarget: document.body }));
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    });
+    expect(document.querySelector('.call-flow-popover')).toBeNull();
+
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: document.body }));
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    });
+    expect(document.querySelector('.call-flow-popover')).not.toBeNull();
+  });
+
+  // Guards the Safari scroll-chaining regression: a page scroll slides the
+  // anchored popup out from under a stationary pointer, fires mouseleave, and
+  // used to close the Lens mid-scroll. In-flight scrolls must hold the close;
+  // a pointer genuinely outside after the scroll settles still closes it.
+  test.skipIf(!hasDom)('scroll holds a pending hover-close, then closes once settled', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <ReviewStateProvider value={lensState()}>
+          <CallFlowFileBadge filePath="src/order.ts" />
+        </ReviewStateProvider>,
+      );
+    });
+
+    const trigger = host.querySelector<HTMLButtonElement>('.call-flow-file-badge');
+    await act(async () => trigger?.click());
+    const popup = document.querySelector<HTMLElement>('.call-flow-popover');
+    expect(popup).not.toBeNull();
+
+    // Pointer slides off the popup (schedules the close), then a scroll lands.
+    await act(async () => {
+      popup?.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, relatedTarget: document.body }));
+      document.body.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 320));
+    });
+    expect(document.querySelector('.call-flow-popover')).not.toBeNull();
+
+    // Scroll settled with the pointer outside: the Lens now closes gracefully.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(document.querySelector('.call-flow-popover')).toBeNull();
+  });
 });

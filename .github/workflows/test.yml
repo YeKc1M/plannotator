@@ -37,6 +37,13 @@ jobs:
       - name: Type check
         run: bun run typecheck
 
+      # The extension has its own tsconfig (Node libs, no DOM) and is not part
+      # of the root typecheck, so nothing was checking it. A type error in the
+      # panel cookie seed shipped that way; this is the step that would have
+      # caught it.
+      - name: Type check VS Code extension
+        run: bun run --cwd apps/vscode-extension lint
+
       - name: Run tests
         run: bun test
 
@@ -77,7 +84,9 @@ jobs:
           packages/ui/codeAnnotationDraftPersistence.test.tsx
           packages/ui/components/html-viewer/srcdoc.test.ts
           packages/ui/components/html-viewer/htmlPinpointProtocol.test.tsx
+          packages/ui/components/html-viewer/htmlLiveProtocol.test.tsx
           packages/ui/components/html-viewer/HtmlViewer.vimHud.test.tsx
+          packages/ui/components/html-viewer/HtmlViewer.bridgeAsset.test.tsx
           packages/ui/components/Viewer.vimMode.integration.test.tsx
           packages/ui/hooks/useVimSelection.test.tsx
           packages/ui/utils/codeHighlight.test.ts
@@ -85,6 +94,7 @@ jobs:
           packages/ui/utils/inputMethod.test.ts
           packages/ui/utils/vimNavigation.test.ts
           packages/ui/utils/clipboard.test.ts
+          apps/vscode-extension/src/vscode-theme.test.ts
           packages/ui/utils/vimScroll.test.ts
           packages/ui/components/InlineMarkdown.resolveLinkedDoc.test.tsx
           packages/ui/components/MarkdownDiff.frozen.test.tsx
@@ -95,12 +105,14 @@ jobs:
           packages/ui/components/sidebar/FileBrowser.test.ts
           packages/editor/editableDocumentsHook.test.tsx
           packages/review-editor/components/ReviewSubmissionDialog.ui.test.tsx
+          packages/review-editor/components/AnnotationToolbar.placement.test.tsx
           packages/review-editor/dock/panels/ReviewPROverviewPanel.ui.test.tsx
           packages/review-editor/components/FileHeader.edit.test.tsx
           packages/review-editor/edit/useEditSession.recovery.test.tsx
           packages/review-editor/edit/discardRestoreRender.test.tsx
           packages/review-editor/edit/selectionActionPopover.test.ts
           packages/review-editor/components/AllFilesCodeView.lifecycle.test.tsx
+          packages/review-editor/components/AllFilesCodeView.generated.test.tsx
           packages/review-editor/components/DiffViewer.compactTouchSelection.test.tsx
           packages/guide-viewer/GuideSectionCard.test.tsx
           packages/guide-viewer/GuideView.test.tsx
@@ -135,8 +147,20 @@ jobs:
           packages/ui/components/DocBadges.test.tsx
           packages/editor/planDiffAutoExit.test.tsx
           packages/editor/App.archiveReadOnly.test.tsx
-          packages/editor/App.htmlHideTools.test.tsx
+          packages/editor/App.htmlChrome.test.tsx
+          packages/ui/components/HtmlSurfaceControls.test.tsx
+          packages/ui/components/AnnotationPanel.unanchored.test.tsx
+          packages/ui/hooks/useHtmlRefresh.test.tsx
+          packages/ui/hooks/useSharing.contentRevision.test.tsx
+          packages/ui/components/AnnotationToolbar.commentOnly.test.tsx
+          packages/ui/components/CommentPopover.quickLookGood.test.tsx
           packages/editor/actionsLabelMode.test.ts
+          packages/ui/webmcp/useToolset.seam.test.tsx
+          packages/ui/components/AnnotationPanel.inReplyTo.test.tsx
+          packages/editor/webmcp/useDocumentWebMcp.toggle.test.tsx
+          packages/editor/components/AppHeader.webmcpIndicator.test.tsx
+          packages/ui/components/MathBlock.firstPaint.test.tsx
+          packages/ui/components/DiagramBlock.lazyRetry.test.tsx
 
   opencode-v2:
     name: OpenCode 2 installed package
@@ -243,6 +267,23 @@ jobs:
       - name: Size budgets
         if: steps.gate.outputs.run == 'true'
         run: bun run --cwd apps/guides-show check:budgets
+
+      # The viewer build is deterministic across platforms at the pinned Bun and
+      # lockfile (macOS and Linux produce identical hashes from a clean install),
+      # but a drifted local environment silently builds different bytes: a bun
+      # store with stale duplicate package versions reproduced exactly that. This
+      # Linux build is the authority the pin must match, so publish its manifest;
+      # when the check below fails and a fresh local regen still disagrees,
+      # download this artifact to apps/guides-show/dist/viewer/manifest.json, run
+      # `bun run --cwd apps/guides-show sync:manifest`, commit the result, and
+      # rebuild your environment (rm -rf node_modules && bun install --frozen-lockfile).
+      - name: Publish built viewer manifest for pin regeneration
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6.0.0
+        with:
+          name: guide-viewer-manifest
+          path: apps/guides-show/dist/viewer/manifest.json
+          retention-days: 7
 
       - name: Checked-in manifest matches this build
         if: steps.gate.outputs.run == 'true'

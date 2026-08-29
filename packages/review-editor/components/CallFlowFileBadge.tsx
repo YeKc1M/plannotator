@@ -10,7 +10,14 @@ import {
 import { CallFlowRawView } from './CallFlowRawView';
 import { splitCallFlowFilePath } from '../utils/callFlowPresentation';
 
-const CLOSE_DELAY_MS = 140;
+const CLOSE_DELAY_MS = 250;
+// Hover intent: scrolling the diff drags file headers under a stationary
+// pointer; without a delay every badge that passes under the cursor pops the
+// Lens open.
+const OPEN_DELAY_MS = 100;
+// After the last scroll event, how long before a pointer that ended up outside
+// the Lens is allowed to close it.
+const SCROLL_SETTLE_MS = 160;
 
 /** Per-file call-flow Lens. The same shared analysis powers this and the Dock. */
 export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }> = ({ filePath, oldPath }) => {
@@ -19,8 +26,11 @@ export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }>
   const [view, setView] = useState<'paths' | 'raw'>('paths');
   const annotationDraftActiveRef = useRef(false);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pointerInsideRef = useRef(false);
   useEffect(() => () => {
     if (closeTimer.current) clearTimeout(closeTimer.current);
+    if (openTimer.current) clearTimeout(openTimer.current);
   }, []);
   const analysis = state?.callFlowAnalysis;
   const focusFiles = useMemo(
@@ -51,7 +61,6 @@ export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }>
   const skippedLanguage = useMemo(() => analysis?.status === 'ready'
     ? analysis.data.skippedLanguages.find((language) => language.files.some((file) => focusFiles.includes(file)))
     : undefined, [analysis, focusFiles]);
-  if (!state || !state.callFlowAvailable || !analysis) return null;
   const cancelClose = () => {
     if (!closeTimer.current) return;
     clearTimeout(closeTimer.current);
@@ -63,10 +72,55 @@ export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }>
       if (!annotationDraftActiveRef.current) setOpen(false);
     }, CLOSE_DELAY_MS);
   };
+  const cancelScheduledOpen = () => {
+    if (!openTimer.current) return;
+    clearTimeout(openTimer.current);
+    openTimer.current = null;
+  };
+  const scheduleOpen = () => {
+    cancelClose();
+    if (open || openTimer.current) return;
+    openTimer.current = setTimeout(() => {
+      openTimer.current = null;
+      setOpen(true);
+    }, OPEN_DELAY_MS);
+  };
   const closeLens = () => {
     annotationDraftActiveRef.current = false;
+    cancelScheduledOpen();
     setOpen(false);
   };
+  // Scroll-chaining guard (reported on X for Safari): when the page scrolls —
+  // including momentum chained out of the Lens's own scroll container — the
+  // popup tracks its moving anchor and can slide out from under a stationary
+  // pointer, firing mouseleave and closing the Lens mid-scroll. While a scroll
+  // is in flight, hold any pending close; once it settles, close only if the
+  // pointer really ended up outside.
+  useEffect(() => {
+    if (!open) return;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const onScroll = () => {
+      if (closeTimer.current) {
+        clearTimeout(closeTimer.current);
+        closeTimer.current = null;
+      }
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => {
+        settleTimer = null;
+        if (!pointerInsideRef.current && !annotationDraftActiveRef.current) {
+          closeTimer.current = setTimeout(() => {
+            if (!annotationDraftActiveRef.current) setOpen(false);
+          }, CLOSE_DELAY_MS);
+        }
+      }, SCROLL_SETTLE_MS);
+    };
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll, { capture: true });
+      if (settleTimer) clearTimeout(settleTimer);
+    };
+  }, [open]);
+  if (!state || !state.callFlowAvailable || !analysis) return null;
   const openNode = (node: CallFlowNode) => {
     if (!node.file) return;
     state.openDiffFile(node.file);
@@ -108,6 +162,7 @@ export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }>
       open={open}
       onOpenChange={(nextOpen) => {
         if (!nextOpen && annotationDraftActiveRef.current) return;
+        cancelScheduledOpen();
         setOpen(nextOpen);
       }}
     >
@@ -115,8 +170,8 @@ export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }>
         <button
           type="button"
           className="call-flow-file-badge"
-          onMouseEnter={() => { cancelClose(); setOpen(true); }}
-          onMouseLeave={scheduleClose}
+          onMouseEnter={() => { pointerInsideRef.current = true; scheduleOpen(); }}
+          onMouseLeave={() => { pointerInsideRef.current = false; cancelScheduledOpen(); scheduleClose(); }}
           title={`${impacts.length} changed call-flow ${impacts.length === 1 ? 'step' : 'steps'} in this file`}
           aria-label={`Call-flow impact for ${filePath}`}
         />
@@ -130,8 +185,8 @@ export const CallFlowFileBadge: React.FC<{ filePath: string; oldPath?: string }>
             className="call-flow-popover shadow-lg popover-enter"
             data-call-flow-lens="true"
             initialFocus={false}
-            onMouseEnter={cancelClose}
-            onMouseLeave={scheduleClose}
+            onMouseEnter={() => { pointerInsideRef.current = true; cancelClose(); }}
+            onMouseLeave={() => { pointerInsideRef.current = false; scheduleClose(); }}
           >
             <div className="call-flow-popover-header">
               <div className="call-flow-popover-title" title={filePath}>

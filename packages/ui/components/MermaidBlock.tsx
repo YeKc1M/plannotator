@@ -1,33 +1,32 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import mermaid from 'mermaid';
+import type { Mermaid } from 'mermaid';
 import type { Block } from '../types';
 import { normalizeMermaidSvgMarkup } from './mermaidSvg';
+import {
+  MERMAID_CONFIG,
+  getMermaidRetryDelayMs,
+  loadMermaidRuntime,
+  __setMermaidRuntimeLoaderForTests,
+} from '../utils/mermaid';
+import { loadMathRenderer } from '../utils/math';
+import { hasMermaidMath } from '../utils/mermaid-math-slot';
+import { createRuntimeRetryEpoch } from '../utils/runtimeRetry';
 
-mermaid.initialize({
-  startOnLoad: false,
-  securityLevel: 'strict',
-  theme: 'dark',
-  themeVariables: {
-    primaryColor: '#3b82f6',
-    primaryTextColor: '#f8fafc',
-    primaryBorderColor: '#475569',
-    lineColor: '#64748b',
-    secondaryColor: '#1e293b',
-    tertiaryColor: '#0f172a',
-    background: '#1e293b',
-    mainBkg: '#1e293b',
-    nodeBorder: '#475569',
-    clusterBkg: '#1e293b',
-    clusterBorder: '#475569',
-    titleColor: '#f8fafc',
-    edgeLabelBackground: '#1e293b',
-  },
-  flowchart: {
-    htmlLabels: true,
-    curve: 'basis',
-  },
-});
+/** One Retry re-attempts every block whose runtime import failed (see utils/runtimeRetry). */
+const mermaidRetryEpoch = createRuntimeRetryEpoch();
+
+// Re-exported: the config pin test and the lazy-retry test import them from here.
+export { MERMAID_CONFIG, __setMermaidRuntimeLoaderForTests };
+
+/**
+ * The runtime comes from the slot in utils/mermaid: filled eagerly by
+ * Plannotator (utils/mermaid-eager, imported by the editor App), loaded
+ * lazily otherwise. See that module for the retry contract.
+ */
+const getMermaid = loadMermaidRuntime;
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 interface ViewBox {
   x: number;
@@ -133,8 +132,23 @@ const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
   const expandedOverlayRef = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // True when the failure was the runtime import itself (a chunking host's
+  // fetch), which is the only failure a Retry can change; a diagram syntax
+  // error keeps the panel exactly as it always was.
+  const [runtimeUnavailable, setRuntimeUnavailable] = useState(false);
+  const [retryToken, setRetryToken] = useState(0);
   const [showSource, setShowSource] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  // A sibling's Retry re-attempts this block too, but only while its own
+  // failure was the shared runtime import; a healthy block or a diagram
+  // syntax error is left alone.
+  const runtimeUnavailableRef = useRef(runtimeUnavailable);
+  runtimeUnavailableRef.current = runtimeUnavailable;
+  useEffect(() => mermaidRetryEpoch.subscribe(() => {
+    if (!runtimeUnavailableRef.current) return;
+    setError(null);
+    setRetryToken((token) => token + 1);
+  }), []);
 
   // All zoom/pan state as refs to avoid re-renders
   const zoomLevelRef = useRef(1);
@@ -188,7 +202,42 @@ const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
 
     // Render mermaid diagram
     const renderDiagram = async () => {
+      let mermaid: Mermaid;
       try {
+        try {
+          mermaid = await getMermaid();
+        } catch {
+          // Transient chunk failure on a chunking host: one automatic
+          // re-attempt with a fresh import() after a short delay. In a
+          // single-file build the first await never rejects, so this branch
+          // is unreachable there and the success path is unchanged.
+          await wait(getMermaidRetryDelayMs());
+          if (cancelled) return;
+          mermaid = await getMermaid();
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to render diagram');
+          setRuntimeUnavailable(true);
+          setSvg('');
+        }
+        return;
+      }
+      try {
+        // A `$$` label makes Mermaid render KaTeX. On a host that redirects
+        // Mermaid's `katex` import to `utils/mermaid-math-slot` the label is
+        // typeset through the math slot, which must be filled by then: warm
+        // it with the registered loader first. A filled slot (Plannotator's
+        // eager entry) resolves at once; a load failure is left to the
+        // render, whose error panel names it with the source.
+        if (hasMermaidMath(block.content)) {
+          try {
+            await loadMathRenderer();
+          } catch {
+            // Reported by the render below.
+          }
+          if (cancelled) return;
+        }
         const id = `mermaid-${block.id}`;
         const { svg: renderedSvg } = await mermaid.render(id, block.content);
         if (!cancelled) {
@@ -196,10 +245,12 @@ const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
           naturalBoundsRef.current = parseViewBoxFromMarkup(normalizedSvg);
           setSvg(normalizedSvg);
           setError(null);
+          setRuntimeUnavailable(false);
         }
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Failed to render diagram');
+          setRuntimeUnavailable(false);
           setSvg('');
         }
       }
@@ -210,7 +261,7 @@ const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
     return () => {
       cancelled = true;
     };
-  }, [block.content, block.id]);
+  }, [block.content, block.id, retryToken]);
 
   // Reset zoom and pan when content changes
   useEffect(() => {
@@ -419,6 +470,16 @@ const MermaidBlockImpl: React.FC<{ block: Block }> = ({ block }) => {
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
           </svg>
           <span className="text-xs text-destructive font-medium">Mermaid Error</span>
+          {runtimeUnavailable && (
+            <button
+              type="button"
+              onClick={() => mermaidRetryEpoch.bump()}
+              className="ml-auto rounded-md border border-destructive/30 px-2 py-0.5 text-xs text-destructive hover:bg-destructive/10"
+              title="Retry loading the diagram renderer"
+            >
+              Retry
+            </button>
+          )}
         </div>
         <pre className="p-3 text-xs text-destructive/80 overflow-x-auto">{error}</pre>
         <pre className="p-3 text-xs text-muted-foreground bg-muted/30 border-t border-border/30 overflow-x-auto">

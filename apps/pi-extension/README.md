@@ -164,7 +164,7 @@ Later layers overwrite earlier ones. If a field is omitted, it inherits the valu
 | `phases.executing` | object | Settings for execution mode |
 | `phases.reviewing` | object | Reserved for future review-mode customization |
 | `model` | `{ provider, id }` \| `null` | Sets the model for the phase; `null` leaves the current model unchanged |
-| `thinking` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `null` | Sets the thinking level; `null` leaves the current level unchanged |
+| `thinking` | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `null` | Sets the thinking level; `null` leaves the current level unchanged. Pi clamps a level the running model does not support, and an unrecognized value is reported as a warning instead of being ignored |
 | `activeTools` | string[] \| `null` | Tools to turn on for the phase. Setting it **replaces** the inherited list rather than adding to it (phase overrides `defaults`, your config overrides the built-in one); `[]` or `null` means no extra phase tools. `plannotator_submit_plan` is always enabled during planning regardless of this setting |
 | `statusLabel` | string \| `null` | Optional UI label for the phase; empty/null clears it |
 | `instructions` | string \| `null` | Phase framing template, delivered **once** as a hidden conversation message when the phase is entered; empty/null disables the framing message. Replaces the removed `systemPrompt` key, which is now ignored with a warning |
@@ -184,6 +184,7 @@ Use these inside `instructions` strings. They render once, when the phase is ent
 
 - **Plannotator never modifies Pi's system prompt.** Pi's base prompt (AGENTS.md context, the skills catalog, tools guidance, `--append-system-prompt` text, working directory) always reaches the model untouched. Phase framing is injected as conversation messages instead, so prompt-cache invalidation reduces to appends at the tail of the conversation plus one history adjustment per phase transition.
 - The `instructions` template is delivered exactly once per phase entry as a hidden message; later prompts in the same phase inject nothing. During execution, a small todo-status message is added per prompt as steps complete. Only the newest framing for the current phase is kept in model context: stale framing from other phases or earlier plan cycles is filtered out, and everything Plannotator injected is filtered while idle.
+- The one exception while idle is a hidden "plan mode off" notice, delivered on the first prompt after plan mode is turned off (or a plan completes/hands off), which tells the model the planning/execution instructions no longer apply. It is delivered once but then stays anchored in model context for the rest of the idle session; unlike phase framing it is not re-delivered after a compaction. Sessions that never enter plan mode inject nothing at all.
 - Executing `instructions` that do not reference `${todoList}` get the entry-time todo snapshot appended automatically, so the first executing prompt always carries the checklist.
 - The old `systemPrompt` config key is obsolete and ignored; a warning at session start points to `instructions`.
 - Unknown template variables trigger a warning in the UI and are rendered as empty strings.
@@ -268,6 +269,8 @@ Plannotator does not send `Continue with the approved plan`, enter its executing
 ### Markdown annotation
 
 Run `/plannotator-annotate <file.md>` to open any markdown file in the annotation UI. Useful for reviewing documentation or design specs with the agent.
+
+URL targets work too. A loopback `http` URL that answers with an HTML page (a running dev app, e.g. `http://localhost:5173`) opens **live**: the app is served through a local reverse proxy and annotated in place, with HMR and WebSockets passed through. `--static` forces the classic markdown conversion; `--app` requires a live session and errors instead of falling back. Live sessions are unavailable in remote mode (`PLANNOTATOR_REMOTE`).
 
 ### Annotate last message
 

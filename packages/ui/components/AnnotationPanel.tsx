@@ -7,6 +7,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { OverlayScrollArea } from './OverlayScrollArea';
 import { Button } from './ui/button';
 import { cn } from '../lib/utils';
+import { resolveReplyParents, resolveThreadRootTimestamps } from '@plannotator/core/annotation-threads';
 
 // Card type-word colors. Deletion uses `destructive` (reliably red on every
 // theme, matching the in-document .deletion highlight). Comment uses the
@@ -37,6 +38,49 @@ const TrashCardIcon = () => (
     <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
   </svg>
 );
+
+/**
+ * Order annotations so every reply follows its parent (replies among
+ * themselves stay in creation order). The threading rule is the shared one
+ * (resolveReplyParents, also what the export applies): a reply whose parent
+ * is absent, a self-reference, and every member of an `inReplyTo` cycle
+ * render as top-level cards in input order, so nothing is ever dropped.
+ * Without any `inReplyTo` the input order is returned unchanged, so
+ * annotations without replies render exactly as before.
+ */
+export function threadReplies(sorted: Annotation[]): Array<{ annotation: Annotation; isReply: boolean }> {
+  if (!sorted.some((a) => a.inReplyTo)) return sorted.map((annotation) => ({ annotation, isReply: false }));
+  const parents = resolveReplyParents(sorted);
+  const byParent = new Map<string, Annotation[]>();
+  for (const a of sorted) {
+    const parent = parents.get(a.id);
+    if (!parent) continue;
+    const list = byParent.get(parent) ?? [];
+    list.push(a);
+    byParent.set(parent, list);
+  }
+  // Depth-first, iteratively: a 5,000-deep chain must not recurse 5,000
+  // frames deep. The stack holds each node's replies in reverse so they pop
+  // in creation order.
+  const out: Array<{ annotation: Annotation; isReply: boolean }> = [];
+  const stack: Array<{ annotation: Annotation; isReply: boolean }> = [];
+  const pushReplies = (a: Annotation) => {
+    const replies = byParent.get(a.id);
+    if (!replies) return;
+    for (let i = replies.length - 1; i >= 0; i--) stack.push({ annotation: replies[i], isReply: true });
+  };
+  for (const a of sorted) {
+    if (parents.get(a.id)) continue;
+    out.push({ annotation: a, isReply: false });
+    pushReplies(a);
+    while (stack.length > 0) {
+      const next = stack.pop()!;
+      out.push(next);
+      pushReplies(next.annotation);
+    }
+  }
+  return out;
+}
 
 interface DirectEditsPanelItem {
   id: string;
@@ -89,6 +133,10 @@ interface PanelProps {
   /** Embed only the timeline body in a host-owned stage. The host owns the
     *  title, close control, visible-viewport geometry, and focus boundary. */
   presentation?: 'panel' | 'embedded';
+  /** Ids of annotations with no live location in the document (e.g. the
+    *  HTML viewer's onUnanchoredChange report after a refresh). Matching
+    *  cards show a small "Unanchored" chip. Absent: no chip, DOM unchanged. */
+  unanchoredIds?: ReadonlySet<string>;
 }
 
 export const AnnotationPanel: React.FC<PanelProps> = ({
@@ -115,6 +163,7 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
   renderCardFooter,
   readOnly = false,
   presentation = 'panel',
+  unanchoredIds,
 }) => {
   const isMobile = useIsMobile();
   const embedded = presentation === 'embedded';
@@ -123,10 +172,22 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
   const listRef = useRef<HTMLDivElement>(null);
   const sortedAnnotations = [...annotations].sort((a, b) => a.createdA - b.createdA);
   const sortedCodeAnnotations = [...codeAnnotations].sort((a, b) => a.createdAt - b.createdAt);
+  // Replies (`inReplyTo`) thread under their parent: each reply is lifted to
+  // sit right after its parent (and the parent's earlier replies) at the
+  // parent's timeline position. With no replies the order is untouched.
+  const threadedAnnotations = threadReplies(sortedAnnotations);
+  // Thread timestamps are resolved once per render, linearly (shared helper),
+  // and the comparator only reads the map: resolving each chain inside the
+  // comparator with a linear parent lookup was O(n^2 log n) and froze the
+  // tab on a few thousand threaded comments.
+  const threadRootTs = resolveThreadRootTimestamps(sortedAnnotations);
   const timelineEntries = [
-    ...sortedAnnotations.map(annotation => ({ kind: 'plan' as const, ts: annotation.createdA, annotation })),
-    ...sortedCodeAnnotations.map(annotation => ({ kind: 'code' as const, ts: annotation.createdAt, annotation })),
-  ].sort((a, b) => a.ts - b.ts);
+    ...threadedAnnotations.map(({ annotation, isReply }) => ({ kind: 'plan' as const, ts: annotation.createdA, threadTs: threadRootTs.get(annotation.id) ?? annotation.createdA, annotation, isReply })),
+    ...sortedCodeAnnotations.map(annotation => ({ kind: 'code' as const, ts: annotation.createdAt, threadTs: annotation.createdAt, annotation, isReply: false })),
+  ].sort((a, b) => {
+    if (a.threadTs !== b.threadTs) return a.threadTs - b.threadTs;
+    return a.ts - b.ts;
+  });
   const totalCount = annotations.length + codeAnnotations.length + (editorAnnotations?.length ?? 0);
 
   // Scroll selected annotation card into view
@@ -221,6 +282,25 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
           <>
             {timelineEntries.map(entry => (
               entry.kind === 'plan' ? (
+                entry.isReply ? (
+                  <div
+                    key={entry.annotation.id}
+                    data-annotation-reply="true"
+                    className="ml-3 border-l-2 border-border/40 pl-1.5"
+                  >
+                    <AnnotationCard
+                      annotation={entry.annotation}
+                      isSelected={selectedId === entry.annotation.id}
+                      isMe={isCurrentUser(entry.annotation.author)}
+                      onSelect={() => onSelect(entry.annotation.id)}
+                      onDelete={() => onDelete(entry.annotation.id)}
+                      onEdit={onEdit ? (updates: Partial<Annotation>) => onEdit(entry.annotation.id, updates) : undefined}
+                      readOnly={readOnly}
+                      footer={renderCardFooter?.(entry.annotation)}
+                      unanchored={unanchoredIds?.has(entry.annotation.id) ?? false}
+                    />
+                  </div>
+                ) : (
                 <AnnotationCard
                   key={entry.annotation.id}
                   annotation={entry.annotation}
@@ -231,7 +311,9 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
                   onEdit={onEdit ? (updates: Partial<Annotation>) => onEdit(entry.annotation.id, updates) : undefined}
                   readOnly={readOnly}
                   footer={renderCardFooter?.(entry.annotation)}
+                  unanchored={unanchoredIds?.has(entry.annotation.id) ?? false}
                 />
+                )
               ) : (
                 <CodeAnnotationCard
                   key={entry.annotation.id}
@@ -458,7 +540,9 @@ const AnnotationCard: React.FC<{
   onEdit?: (updates: Partial<Annotation>) => void;
   readOnly?: boolean;
   footer?: React.ReactNode;
-}> = ({ annotation, isSelected, isMe, onSelect, onDelete, onEdit, readOnly = false, footer }) => {
+  /** The annotation has no live location in the document (host-reported). */
+  unanchored?: boolean;
+}> = ({ annotation, isSelected, isMe, onSelect, onDelete, onEdit, readOnly = false, footer, unanchored = false }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(annotation.text || '');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -553,6 +637,23 @@ const AnnotationCard: React.FC<{
         {annotation.diffContext && (
           <span className="text-[9px] px-1.5 py-0.5 rounded font-medium bg-muted text-muted-foreground">
             diff
+          </span>
+        )}
+        {annotation.pageUrl && (
+          <span
+            className="text-[9px] px-1.5 py-0.5 rounded font-medium bg-muted text-muted-foreground truncate max-w-[10rem]"
+            title={annotation.pageUrl}
+          >
+            {annotation.pageUrl}
+          </span>
+        )}
+        {unanchored && (
+          <span
+            data-annotation-unanchored="true"
+            className="text-[9px] px-1.5 py-0.5 rounded font-medium bg-muted text-muted-foreground"
+            title="This comment no longer matches a location in the document"
+          >
+            Unanchored
           </span>
         )}
         <span className="text-[10px] text-muted-foreground/50 truncate">

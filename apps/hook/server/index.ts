@@ -119,6 +119,15 @@ import { enableTailscaleServe } from "@plannotator/server/tailscale-serve";
 import { writeUrlQr } from "@plannotator/server/qr";
 import { resolveAnnotateTarget } from "./annotate-resolution";
 import { buildKimiDecisionJson, parseKimiHookEvent } from "./kimi-plan";
+import { LIVE_APP_REMOTE_MESSAGE } from "@plannotator/shared/live-probe";
+// Bridge sources for live app sessions: the CLI supplies them so
+// @plannotator/server never imports @plannotator/ui (mirrors the existing
+// htmlContent precedent).
+import {
+  ANNOTATION_HIGHLIGHT_CSS,
+  BRIDGE_SCRIPT,
+  LIVE_BRIDGE_BOOTSTRAP,
+} from "@plannotator/ui/components/html-viewer/bridge-script";
 import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
@@ -322,6 +331,15 @@ if (renderHtmlFlag) args.splice(renderHtmlIdx, 1);
 const renderMarkdownIdx = args.indexOf("--markdown");
 const renderMarkdownFlag = renderMarkdownIdx !== -1;
 if (renderMarkdownFlag) args.splice(renderMarkdownIdx, 1);
+// Live app annotation flags (annotate, loopback URLs): --app forces live
+// mode, --static forces the classic conversion pipeline. Transport-shape
+// flags: never echoed in the tolerant handoff's re-run flag list.
+const appFlagIdx = args.indexOf("--app");
+const appFlag = appFlagIdx !== -1;
+if (appFlag) args.splice(appFlagIdx, 1);
+const staticFlagIdx = args.indexOf("--static");
+const staticFlag = staticFlagIdx !== -1;
+if (staticFlag) args.splice(staticFlagIdx, 1);
 
 // Stdout matrix for annotate / annotate-last / copilot annotate-last.
 //
@@ -497,7 +515,10 @@ const pasteApiUrl = process.env.PLANNOTATOR_PASTE_URL || undefined;
 //   > Copilot CLI (COPILOT_CLI)
 //   > OpenCode (OPENCODE)
 //   > Gemini CLI (GEMINI_CLI)
-//   > Claude Code (default fallback)
+//   > oh-my-pi harness (OMPCODE) — checked last because OMP exports OMPCODE
+//     into every shell it spawns; runtimes launched from an OMP session must
+//     still be detected as themselves. OMPCODE still wins over the terminal
+//     fallback below.
 //
 // To add a new agent, also add an entry to AGENT_CONFIG in
 // packages/shared/agents.ts (see header comment there).
@@ -508,6 +529,7 @@ const detectedOrigin: Origin =
   process.env.COPILOT_CLI ? "copilot-cli" :
   process.env.OPENCODE ? "opencode" :
   process.env.GEMINI_CLI ? "gemini-cli" :
+  process.env.OMPCODE ? "oh-my-pi" :
   "claude-code";
 
 type OpenCodeBridgeAgent = {
@@ -1098,9 +1120,13 @@ if (args[0] === "sessions") {
     );
   }
 
+  if (appFlag && staticFlag) {
+    exitAnnotateStartupFailure("--app and --static are mutually exclusive");
+  }
+
   const rawFilePath = args[1];
   if (!rawFilePath) {
-    exitAnnotateStartupFailure("Usage: plannotator annotate <file.md | file.txt | file.html | https://... | folder/>  [--markdown] [--no-jina] [--gate] [--json] [--hook] [--require-approval] [--result-file <path>]");
+    exitAnnotateStartupFailure("Usage: plannotator annotate <file.md | file.txt | file.html | https://... | folder/>  [--markdown] [--no-jina] [--app] [--static] [--gate] [--json] [--hook] [--require-approval] [--result-file <path>]");
   }
 
   // Use PLANNOTATOR_CWD if set (original working directory before script cd'd)
@@ -1151,6 +1177,8 @@ if (args[0] === "sessions") {
           projectRoot,
           noJina: cliNoJina,
           renderMarkdown: renderMarkdownFlag,
+          forceApp: appFlag,
+          forceStatic: staticFlag,
         });
 
   if (tolerantMultiToken) {
@@ -1161,6 +1189,8 @@ if (args[0] === "sessions") {
         projectRoot,
         noJina: cliNoJina,
         renderMarkdown: renderMarkdownFlag,
+        forceApp: appFlag,
+        forceStatic: staticFlag,
       });
     } else if (selection.kind === "multiple") {
       exitAnnotateStartupFailure(buildAmbiguousAnnotateArgsMessage(selection.candidates));
@@ -1200,6 +1230,8 @@ if (args[0] === "sessions") {
       projectRoot,
       noJina: cliNoJina,
       renderMarkdown: renderMarkdownFlag,
+      forceApp: appFlag,
+      forceStatic: staticFlag,
     });
   }
 
@@ -1216,7 +1248,26 @@ if (args[0] === "sessions") {
     sourceInfo,
     sourceConverted,
     isUrl,
+    liveApp: liveAppResolved,
   } = resolution;
+
+  // Remote hard-off (layer 1 of 3; the server throw and the proxy's
+  // unconditional loopback bind are the others). No override env var exists
+  // on purpose: a live proxy relays the user's authenticated dev app.
+  if (liveAppResolved && isRemoteSession()) {
+    exitAnnotateStartupFailure(LIVE_APP_REMOTE_MESSAGE);
+  }
+
+  // --tailscale is the same exposure in different clothes: the annotate
+  // server stays loopback-bound but is published across the tailnet through
+  // the serve proxy, so a live proxy would relay the user's authenticated
+  // dev app to every tailnet peer. Hard-off, matching how the annotate agent
+  // terminal treats tailnet publication; the server throw backstops this.
+  if (liveAppResolved && tailscaleFlag) {
+    exitAnnotateStartupFailure(
+      "Live app annotation is unavailable with --tailscale (the session is reachable across your tailnet). Run without --tailscale, or use --static to annotate a converted snapshot of the page.",
+    );
+  }
 
   const annotateProject = (await detectProjectName()) ?? "_unknown";
 
@@ -1225,7 +1276,15 @@ if (args[0] === "sessions") {
     markdown,
     filePath: absolutePath,
     origin: detectedOrigin,
-    mode: annotateMode,
+    mode: liveAppResolved ? "annotate-app" : annotateMode,
+    liveApp: liveAppResolved
+      ? {
+          targetUrl: absolutePath,
+          bridgeScript: BRIDGE_SCRIPT,
+          bridgeBootstrap: LIVE_BRIDGE_BOOTSTRAP,
+          annotationCss: ANNOTATION_HIGHLIGHT_CSS,
+        }
+      : undefined,
     folderPath,
     sourceInfo,
     sourceConverted,

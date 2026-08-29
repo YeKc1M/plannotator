@@ -76,6 +76,7 @@ import {
 
 import { resolvePoolCwd, type WorktreePool } from "../generated/worktree-pool.ts";
 import { createCommitAvatarResolver } from "../generated/commit-avatars.ts";
+import { detectGeneratedFiles, detectGeneratedFilesByName } from "../generated/generated-files.ts";
 
 import { createEditorAnnotationHandler } from "./annotations.ts";
 import { createAgentJobHandler, whichCmd as commandExists } from "./agent-jobs.ts";
@@ -663,6 +664,36 @@ export async function startReviewServer(options: {
 		if (!isSinceBaseActive(diffType)) return undefined;
 		const cwd = resolveVcsCwd(diffType as DiffType, options.gitContext?.cwd);
 		return (await getSinceBaseSections(reviewRuntime, base, cwd)) ?? undefined;
+	}
+
+	// --- Generated-files sidecar (#1317, mirrors Bun review.ts) ----------------
+	// Two-layer generated detection for the served patch's paths so the client
+	// can collapse those diffs by default, GitHub-style: built-in name defaults
+	// (lockfiles, minified assets — no git needed) refined by `.gitattributes`
+	// `linguist-generated`, which wins in both directions (set marks, unset
+	// un-marks even a built-in name, unspecified keeps the default).
+	// Presentation-layer only: the patch is never filtered and snapshot/
+	// fingerprint semantics are untouched. Attribute refinement runs for plain
+	// local Git sessions only — PR worktrees, workspace multi-repo, jj, and
+	// GitButler get the name-based defaults alone rather than guessing
+	// attributes for a tree git can't authoritatively resolve here. Patch and
+	// diff type are parameterized for the same pin-before-await discipline as
+	// buildSectionsSidecar.
+	async function buildGeneratedFilesSidecar(
+		patch: string = currentPatch,
+		diffType: string = currentDiffType as string,
+	): Promise<string[] | undefined> {
+		const paths = listPatchFiles(patch).map((f) => f.path);
+		const plainLocalGit =
+			!isPRMode && !workspace && options.gitContext && (sessionVcsType ?? "git") === "git";
+		const generated = plainLocalGit
+			? await detectGeneratedFiles(
+					reviewRuntime,
+					resolveVcsCwd(diffType as DiffType, options.gitContext!.cwd),
+					paths,
+				)
+			: detectGeneratedFilesByName(paths);
+		return generated.length > 0 ? generated : undefined;
 	}
 
 	// Decoupled startup probes (a forwarded initialBase must NOT suppress the
@@ -1920,6 +1951,7 @@ export async function startReviewServer(options: {
 			const servedGitContext = clientGitContext;
 			const sections = await buildSectionsSidecar(servedBase, servedDiffType as string);
 			const commitInfo = await buildCommitInfoSidecar(servedDiffType as string);
+			const generatedFiles = await buildGeneratedFilesSidecar(servedPatch, servedDiffType as string);
 			json(res, {
 				rawPatch: servedPatch,
 				aiReviewContext: buildCurrentAiReviewContext(servedPatch, servedBase, servedDiffType as DiffType),
@@ -1962,6 +1994,7 @@ export async function startReviewServer(options: {
 				...(isPRMode && initialViewedFiles.length > 0 && { viewedFiles: initialViewedFiles }),
 				...(sections && { sections }),
 				...(commitInfo && { commitInfo }),
+				...(generatedFiles && { generatedFiles }),
 				...(baseBehindRemote && { baseBehindRemote: true }),
 				...(servedError && { error: servedError }),
 				semanticDiff: await getSemanticDiffAdvert(servedDiffType as DiffType),
@@ -2313,6 +2346,7 @@ export async function startReviewServer(options: {
 				).catch(() => false);
 				const sections = await buildSectionsSidecar(nextBase, newType as string);
 				const commitInfo = await buildCommitInfoSidecar(newType as string);
+				const generatedFiles = await buildGeneratedFilesSidecar(result.patch, newType as string);
 				const [switchSemanticDiff, switchCallFlow] = await Promise.all([
 					getSemanticDiffAdvert(newType as DiffType),
 					getCallFlowAdvert(newType as DiffType),
@@ -2353,6 +2387,7 @@ export async function startReviewServer(options: {
 					hideWhitespace: currentHideWhitespace,
 					...(sections ? { sections } : {}),
 					...(commitInfo ? { commitInfo } : {}),
+					...(generatedFiles ? { generatedFiles } : {}),
 					...(baseBehindRemote ? { baseBehindRemote: true } : {}),
 					...(updatedContext ? { gitContext: updatedContext } : {}),
 					...(currentError ? { error: currentError } : {}),

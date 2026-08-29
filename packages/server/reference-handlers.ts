@@ -81,6 +81,18 @@ export interface HandleDocOptions {
 	annotateHistory?: {
 		compute: (resolvedFilePath: string, content: string) => FolderAnnotateHistory | null;
 	};
+	/**
+	 * Single-file rendered-HTML sessions: when /api/doc serves the session's
+	 * ROOT document (`path` equals the resolved root path) as raw HTML, merge
+	 * the version-diff fields `compute` derives from the bytes just read
+	 * (`previousPlan`/`versionInfo`/`diffHtml`, the same names /api/plan
+	 * uses) into the response. This is what lets the in-app Refresh keep the
+	 * version diff. Every other document is untouched.
+	 */
+	rootHtmlVersionDiff?: {
+		path: string;
+		compute: (currentHtml: string) => Record<string, unknown>;
+	};
 }
 
 interface HandleDocExistsOptions {
@@ -219,6 +231,17 @@ function applyDocOptions<T extends Record<string, unknown>>(
 	sourceSnapshot?: SourceFileSnapshot,
 ): DocOptionsResult<T> {
 	const next: Record<string, unknown> = { ...data };
+	// Root-document version diff (see HandleDocOptions.rootHtmlVersionDiff):
+	// computed on the raw bytes, before the asset rewrite below, because the
+	// diff renderer rewrites its own output the same way.
+	if (
+		options.rootHtmlVersionDiff &&
+		data.renderAs === "html" &&
+		typeof data.rawHtml === "string" &&
+		data.filepath === options.rootHtmlVersionDiff.path
+	) {
+		Object.assign(next, options.rootHtmlVersionDiff.compute(data.rawHtml));
+	}
 	if (
 		typeof next.rawHtml === "string" &&
 		typeof next.filepath === "string" &&

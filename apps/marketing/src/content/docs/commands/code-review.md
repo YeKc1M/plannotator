@@ -130,6 +130,24 @@ The review UI shows your changes in a familiar diff format:
 - **Unified diff** showing additions and deletions in context
 - **Annotation tools** with the same annotation types as plan review (delete, comment, quick label, "looks good")
 
+### Auto-mark viewed
+
+Files check themselves off as you read. On the all-files surface a file is
+marked viewed when you scroll past it, and in the single-file panel when you
+move on to another file; in both cases only after it was actually on screen
+long enough to have been read, so a fast flick to the bottom marks nothing.
+Collapsed cards never mark, which means generated files stay unchecked until
+you deliberately expand them.
+
+Un-viewing a file is a "come back to this" gesture: auto-view never re-marks a
+file you un-checked, until you mark it viewed by hand again. A file whose
+content changes under a refresh loses its checkmark, because a check on code
+the agent just rewrote is misleading.
+
+It is on by default, and there are two off switches: **Settings → Git →
+Auto-mark viewed**, and the **Auto-mark viewed** row in the gear popover above
+the file list. The first time it fires, a toast points at both.
+
 ### Optional analysis layers
 
 Open **Settings → Analysis** to control Semantic Changes and Call Flow independently. A one-time review welcome presents the same two switches side by side. Disabling either layer avoids its analysis work and leaves the ordinary patch unchanged.

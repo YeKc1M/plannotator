@@ -1,3 +1,5 @@
+import { supportsSwitchAgent, type V2ContextLike } from "./v2-client";
+
 export interface OpenCodeAgentLike {
   name?: string;
 }
@@ -70,4 +72,45 @@ export async function resolveValidatedTargetAgent(input: {
 
   warnAgentUnavailable(input.client, targetAgent, input.delivery ?? "feedback");
   return undefined;
+}
+
+/**
+ * OpenCode 2 agent switch.
+ *
+ * `ctx.session.switchAgent` arrived with the same plugin-API generation as
+ * native command execution, so it is duck-typed rather than imported: on a host
+ * without it the plan is still approved and the caller is told the switch was
+ * skipped. Returns the agent actually switched to, or undefined when the
+ * session's agent was left alone.
+ */
+export async function switchV2SessionAgent(input: {
+  ctx: V2ContextLike;
+  sessionID: string;
+  requestedAgent?: string;
+  getAgents: () => Promise<OpenCodeAgentLike[]>;
+  warn?: (message: string) => void;
+}): Promise<string | undefined> {
+  const warn = input.warn ?? ((message: string) => console.error(message));
+  const targetAgent = resolveTargetAgent(input.requestedAgent);
+  if (!targetAgent) return undefined;
+
+  const available = (await input.getAgents()).some((agent) => agent.name === targetAgent);
+  if (!available) {
+    warn(`[Plannotator] Configured OpenCode agent "${targetAgent}" is not available; approving the plan without switching agents.`);
+    return undefined;
+  }
+
+  if (!supportsSwitchAgent(input.ctx)) {
+    warn("[Plannotator] This OpenCode 2 host does not expose agent switching to plugins; approving the plan without switching agents.");
+    return undefined;
+  }
+
+  try {
+    await input.ctx.session!.switchAgent!({ sessionID: input.sessionID, agent: targetAgent });
+  } catch (error) {
+    warn(`[Plannotator] Could not switch the OpenCode session to "${targetAgent}": ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+
+  return targetAgent;
 }

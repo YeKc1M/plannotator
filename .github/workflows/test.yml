@@ -37,6 +37,12 @@ jobs:
       - name: Type check
         run: bun run typecheck
 
+      - name: Smoke-test published UI package
+        # This packs the real tarball and installs it with a pinned pnpm CLI in
+        # a temp consumer outside the monorepo. It prevents workspace protocols
+        # from leaking into the manifest published to external consumers.
+        run: bun run --cwd packages/ui smoke:package
+
       # The extension has its own tsconfig (Node libs, no DOM) and is not part
       # of the root typecheck, so nothing was checking it. A type error in the
       # panel cookie seed shipped that way; this is the step that would have
@@ -75,10 +81,12 @@ jobs:
           packages/review-editor/components/DiffViewer.headerControls.test.tsx
 
       # Seam contracts + the remaining DOM-gated tests. Scoped to the DOM files
-      # (not the whole ui suite) to keep this process light.
+      # (not the whole ui suite) to keep this process light. Files get isolated
+      # globals because theme, storage, and DOM test state must not leak between
+      # suites when Bun schedules them differently across platforms.
       - name: Run UI seam-contract + DOM tests
         run: >-
-          DOM_TESTS=1 bun test
+          DOM_TESTS=1 bun test --isolate
           packages/ui/markdownEditorFidelity.test.tsx
           packages/ui/annotationDraftPersistence.test.tsx
           packages/ui/codeAnnotationDraftPersistence.test.tsx
@@ -113,12 +121,18 @@ jobs:
           packages/review-editor/edit/selectionActionPopover.test.ts
           packages/review-editor/components/AllFilesCodeView.lifecycle.test.tsx
           packages/review-editor/components/AllFilesCodeView.generated.test.tsx
+          packages/review-editor/components/AllFilesCodeView.autoViewed.test.tsx
           packages/review-editor/components/DiffViewer.compactTouchSelection.test.tsx
           packages/guide-viewer/GuideSectionCard.test.tsx
           packages/guide-viewer/GuideView.test.tsx
           packages/guide-viewer/GuideViewportManager.test.tsx
           packages/review-editor/components/guide/GuideExportButton.test.tsx
           packages/review-editor/hooks/useReviewSearch.test.tsx
+          packages/review-editor/hooks/useTokenHover.test.tsx
+          packages/review-editor/components/TokenHoverCard.test.tsx
+          packages/review-editor/components/TokenHoverAnnouncementDialog.test.tsx
+          packages/review-editor/utils/stitchTokenIdentifier.test.ts
+          packages/review-editor/hooks/useAutoViewed.test.tsx
           packages/review-editor/hooks/useCallFlowAnalysis.test.tsx
           packages/review-editor/hooks/useCallFlowInstall.test.tsx
           packages/review-editor/hooks/useCallFlowAutoInstall.test.tsx
@@ -132,7 +146,10 @@ jobs:
           packages/ui/components/Settings.analysis.test.tsx
           packages/ui/components/AnnotationPanel.props.test.tsx
           packages/ui/components/Viewer.consumer.test.tsx
+          packages/ui/components/Viewer.documentHeader.test.tsx
           packages/ui/components/Viewer.codeBlockHighlightSwap.test.tsx
+          packages/ui/components/ImageAnnotator/ImageAnnotator.shortcuts.test.tsx
+          packages/ui/utils/undoHistory.dom.test.ts
           packages/ui/utils/codeBlockMark.test.ts
           packages/ui/components/InlineMarkdown.seam.test.tsx
           packages/ui/components/ImageThumbnail.seam.test.tsx
@@ -148,11 +165,17 @@ jobs:
           packages/editor/planDiffAutoExit.test.tsx
           packages/editor/App.archiveReadOnly.test.tsx
           packages/editor/App.htmlChrome.test.tsx
+          packages/editor/App.decisionControl.test.tsx
+          packages/review-editor/App.decisionControl.test.tsx
+          packages/review-editor/components/ReviewSidebar.generalComment.test.tsx
           packages/ui/components/HtmlSurfaceControls.test.tsx
           packages/ui/components/AnnotationPanel.unanchored.test.tsx
           packages/ui/hooks/useHtmlRefresh.test.tsx
           packages/ui/hooks/useSharing.contentRevision.test.tsx
+          packages/ui/hooks/useSharing.shortUrlLifecycle.test.tsx
           packages/ui/components/AnnotationToolbar.commentOnly.test.tsx
+          packages/ui/components/AnnotationToolstrip.test.tsx
+          packages/ui/components/StickyHeaderLane.test.tsx
           packages/ui/components/CommentPopover.quickLookGood.test.tsx
           packages/editor/actionsLabelMode.test.ts
           packages/ui/webmcp/useToolset.seam.test.tsx
@@ -161,6 +184,10 @@ jobs:
           packages/editor/components/AppHeader.webmcpIndicator.test.tsx
           packages/ui/components/MathBlock.firstPaint.test.tsx
           packages/ui/components/DiagramBlock.lazyRetry.test.tsx
+          packages/ui/components/DecisionControl.test.tsx
+          packages/ui/components/ActionMenu.test.tsx
+          packages/ui/components/PlanHeaderMenu.mobile.test.tsx
+          packages/review-editor/components/ReviewHeaderMenu.mobile.test.tsx
 
   opencode-v2:
     name: OpenCode 2 installed package

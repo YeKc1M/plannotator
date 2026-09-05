@@ -7,10 +7,12 @@ interface ToolbarProps {
   color: string;
   strokeSize: number;
   canUndo: boolean;
+  canRedo?: boolean;
   onToolChange: (tool: Tool) => void;
   onColorChange: (color: string) => void;
   onStrokeSizeChange: (size: number) => void;
   onUndo: () => void;
+  onRedo?: () => void;
   onClear: () => void;
   onSave: () => void;
 }
@@ -41,6 +43,13 @@ const UndoIcon = () => (
   <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
     <path d="M3 7v6h6" />
     <path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13" />
+  </svg>
+);
+
+const RedoIcon = () => (
+  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+    <path d="M21 7v6h-6" />
+    <path d="M3 17a9 9 0 019-9 9 9 0 016 2.3L21 13" />
   </svg>
 );
 
@@ -81,10 +90,12 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   color,
   strokeSize,
   canUndo,
+  canRedo = false,
   onToolChange,
   onColorChange,
   onStrokeSizeChange,
   onUndo,
+  onRedo,
   onClear,
   onSave,
 }) => {
@@ -191,6 +202,22 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       >
         <UndoIcon />
       </button>
+
+      {onRedo && (
+        <button
+          type="button"
+          onClick={onRedo}
+          disabled={!canRedo}
+          title="Redo (Cmd+Shift+Z)"
+          className={`p-1.5 rounded transition-colors ${
+            canRedo
+              ? 'hover:bg-muted text-muted-foreground hover:text-foreground'
+              : 'text-muted-foreground/30 cursor-not-allowed'
+          }`}
+        >
+          <RedoIcon />
+        </button>
+      )}
 
       {/* Clear all */}
       <button

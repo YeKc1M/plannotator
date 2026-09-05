@@ -131,12 +131,13 @@ import {
 import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
-  getReviewApprovedPrompt,
+  composeReviewApprovedMessage,
   getReviewDeniedSuffix,
   getPlanDeniedPrompt,
   getPlanToolName,
   buildPlanFileRule,
 } from "@plannotator/shared/prompts";
+import { supportsReviewApprovalNotes } from "./review-output";
 import { registerSession, unregisterSession, listSessions } from "@plannotator/server/sessions";
 import { openBrowser } from "@plannotator/server/browser";
 import { inlineHtmlLocalAssets } from "@plannotator/server/html-assets";
@@ -183,6 +184,7 @@ import {
   isUninstallConfirmationAccepted,
   parseUninstallOptions,
 } from "./cli";
+import { exitOnUnknownSubcommand } from "./unknown-subcommand";
 import { completeAnnotateCommand } from "./annotate-command";
 import {
   annotateStartupFailureExitCode,
@@ -389,6 +391,8 @@ if (helpSubcommand) {
   console.log(formatSubcommandHelp(helpSubcommand));
   process.exit(0);
 }
+
+exitOnUnknownSubcommand(args);
 
 if (args[0] === "uninstall") {
   let options: ReturnType<typeof parseUninstallOptions>;
@@ -1042,6 +1046,7 @@ if (args[0] === "sessions") {
     gitRef,
     error: diffError,
     origin: detectedOrigin,
+    project: reviewProject,
     diffType: workspace ? (initialDiffType ?? workspace.diffType) : gitContext ? (initialDiffType ?? "unstaged") : undefined,
     gitContext,
     initialFingerprint,
@@ -1052,6 +1057,9 @@ if (args[0] === "sessions") {
     worktreePool,
     sharingEnabled,
     shareBaseUrl,
+    // The approved branch below prints result.feedback after the prompt, so
+    // this CLI's origins may see approve-carrying menu items (spec §6.4).
+    approvalNotesSupported: supportsReviewApprovalNotes(detectedOrigin),
     htmlContent: reviewHtmlContent,
     onCleanup: worktreeCleanup,
     onReady: async (url, isRemote, port) => {
@@ -1090,7 +1098,10 @@ if (args[0] === "sessions") {
   if (result.exit) {
     console.log("Review session closed without feedback.");
   } else if (result.approved) {
-    console.log(getReviewApprovedPrompt(detectedOrigin));
+    // PR5 delivery (spec §6.4): a bare approval prints the approved prompt,
+    // byte-identical to before; an approval carrying reviewer notes prints
+    // the approved-with-notes framing (non-blocking guidance) instead.
+    console.log(composeReviewApprovedMessage(detectedOrigin, result.feedback));
   } else {
     console.log(result.feedback);
     // Append the verification-only suffix whenever the reviewer sent annotations to
@@ -1721,7 +1732,7 @@ if (args[0] === "sessions") {
   // in a host that cannot import Bun-only server modules directly.
 
   const inputJson = await Bun.stdin.text();
-  const input = parseOpenCodeBridgeInput<{ arguments?: unknown }>(
+  const input = parseOpenCodeBridgeInput<{ arguments?: unknown; supportsApprovalNotes?: unknown }>(
     "opencode-review",
     inputJson,
   );
@@ -1814,6 +1825,7 @@ if (args[0] === "sessions") {
     gitRef,
     error: diffError,
     origin: "opencode",
+    project: reviewProject,
     diffType: isPRMode ? undefined : userDiffType,
     gitContext,
     initialFingerprint,
@@ -1823,6 +1835,15 @@ if (args[0] === "sessions") {
     agentCwd,
     sharingEnabled: bridgeSharingEnabled,
     shareBaseUrl: bridgeShareBaseUrl,
+    // Fail-closed approval-notes handshake: this branch's JSON record already
+    // carries feedback on approve, but DELIVERY to the agent lives in the
+    // independently-versioned plugin (buildReviewPromptFromBridgeOutcome,
+    // spec §6.3 #3), so the advert requires the plugin's own stdin
+    // declaration. An old plugin omits `supportsApprovalNotes`, the advert
+    // stays false, and no approve-carrying item renders — a new binary can
+    // never trick an old bridge into dropping a reviewer's note.
+    approvalNotesSupported:
+      supportsReviewApprovalNotes("opencode") && input.supportsApprovalNotes === true,
     htmlContent: reviewHtmlContent,
     opencodeClient: makeOpenCodeBridgeClient(input.agents),
     onReady: (url, isRemote, port) => {

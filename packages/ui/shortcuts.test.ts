@@ -4,6 +4,7 @@ import { reviewSettingsShortcutRegistry } from '../review-editor/shortcuts';
 import {
   annotationModeShortcuts,
   createShortcutRegistry,
+  decisionControlShortcuts,
   defineShortcutScope,
   dispatchShortcutEvent,
   formatShortcutBindingText,
@@ -82,6 +83,7 @@ describe('shortcuts', () => {
       'Vim Text Navigation',
       'Vim Annotation Actions',
       'Image Annotator',
+      'History',
     ]);
 
     expect(annotateSections.map(section => section.title)).toEqual([
@@ -94,11 +96,14 @@ describe('shortcuts', () => {
       'Vim Text Navigation',
       'Vim Annotation Actions',
       'Image Annotator',
+      'History',
     ]);
 
     expect(getShortcut(planReviewSettingsShortcutRegistry, 'plan-review-editor-settings', 'submitPlan')?.description).toBe('Approve / Send feedback');
     expect(getShortcut(planReviewSettingsShortcutRegistry, 'plan-review-editor-settings', 'submitAnnotations')).toBeUndefined();
-    expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-editor-settings', 'submitAnnotations')?.description).toBe('Send annotations');
+    // Fact-guard, not a prose pin: the annotate registry's submit action must
+    // describe the adaptive Done/Send primary (distinct from plan review's).
+    expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-editor-settings', 'submitAnnotations')?.description).toContain('Done / Send feedback');
     expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-editor-settings', 'submitPlan')).toBeUndefined();
     expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-sidebar', 'toggleContents')?.description).toBe('Toggle Contents sidebar');
 
@@ -107,6 +112,7 @@ describe('shortcuts', () => {
       'Search',
       'Layout',
       'File Actions',
+      'History',
       'File Navigation',
       'All-Files View',
       'Annotations',
@@ -348,6 +354,18 @@ describe('shortcuts', () => {
     expect(preventDefaultCalls).toBe(0);
   });
 
+  it('assigns review history, copy, and collapse chords to their real registry owners', () => {
+    const claimants = (binding: string) => listRegistryShortcuts(reviewSettingsShortcutRegistry)
+      .filter((entry) => entry.bindings.includes(binding))
+      .map((entry) => `${entry.scopeId}.${entry.actionId}`);
+
+    expect(claimants('Mod+Z')).toEqual(['history.undo']);
+    expect(claimants('Mod+Shift+Z')).toEqual(['history.redo']);
+    expect(claimants('Mod+Y')).toEqual(['history.redo']);
+    expect(claimants('Z')).toEqual(['review-all-files-diff.undoCollapse']);
+    expect(claimants('Mod+Shift+Y')).toEqual(['review-editor.copyFeedback']);
+  });
+
   it('switches annotation mode on Shift+1-4 across keyboard layouts', () => {
     const calls: string[] = [];
     const handlers = {
@@ -375,6 +393,19 @@ describe('shortcuts', () => {
 
     expect(calls).toEqual(['comment', 'redline']);
     expect(preventDefaultCalls).toBe(2);
+  });
+
+  // PR2/PR3 registered the decision-control scope in both adopting settings
+  // registries (the entries feed the help modal and the generated marketing
+  // shortcuts page — bindings must match shipped behavior). Guards the live
+  // registrations: a duplicate scope id or non-normalized binding token would
+  // only surface as a throw at app startup otherwise.
+  it('decision-control scope is registered for annotate and review', () => {
+    expect(decisionControlShortcuts.id).toBe('decision-control');
+    expect([...annotateSettingsShortcutRegistry].some((scope) => scope.id === 'decision-control')).toBe(true);
+    expect([...reviewSettingsShortcutRegistry].some((scope) => scope.id === 'decision-control')).toBe(true);
+    expect(validateShortcutRegistry([...annotateSettingsShortcutRegistry])).toEqual([]);
+    expect(validateShortcutRegistry([...reviewSettingsShortcutRegistry])).toEqual([]);
   });
 
   it('leaves annotation mode alone when Alt is held', () => {

@@ -15,6 +15,13 @@ import {
 } from '@plannotator/core/agent-terminal';
 import type { DiffLineBgIntensity } from '@plannotator/core/config-types';
 import { isFaviconStyle, type FaviconStyle } from '@plannotator/core/favicon';
+import {
+  DEFAULT_TOKEN_HOVER_DELAY_MS,
+  isTokenHoverDelay,
+  resolveStoredTokenHoverTrigger,
+  type TokenHoverDelay,
+  type TokenHoverTrigger,
+} from '@plannotator/core/token-hover';
 import { storage } from '../utils/storage';
 import { generateIdentity } from '../utils/generateIdentity';
 import {
@@ -261,6 +268,59 @@ export const SETTINGS = {
     serverKey: undefined, fromServer: undefined, toServer: undefined,
   },
 
+  // Mark a file viewed when the reviewer scrolls past it or moves on to
+  // another file. Cookie-only like the other review-chrome preferences: it
+  // shapes how the local file list checks itself off and changes no review
+  // semantics (viewed gates nothing on submit).
+  reviewAutoViewed: {
+    defaultValue: true as boolean,
+    fromCookie: () => {
+      const value = storage.getItem('plannotator-review-auto-viewed');
+      return value === 'true' ? true : value === 'false' ? false : undefined;
+    },
+    toCookie: (value: boolean) =>
+      storage.setItem('plannotator-review-auto-viewed', String(value)),
+    serverKey: undefined, fromServer: undefined, toServer: undefined,
+  },
+
+  // Hovering a token in a code-review diff opens a card with what the search
+  // backend knows about that symbol. Cookie-only like the other review-chrome
+  // preferences: it is presentational, per-browser, and changes no review
+  // semantics — `off` simply means no listeners, no requests and no card.
+  //
+  // This one select REPLACED the original `tokenHoverCards` boolean rather
+  // than sitting beside it: a toggle plus a mode has an unreachable state
+  // (disabled + modifier) and asks one question with two controls. The legacy
+  // cookie is still read — on every load until the user touches this setting,
+  // since a migrating read returns a value and so never triggers the
+  // registry's default-seeding write — so an early adopter who turned cards
+  // off stays off. Resolution is pure and identical every time; see
+  // resolveStoredTokenHoverTrigger.
+  tokenHoverTrigger: {
+    defaultValue: 'hover' as TokenHoverTrigger,
+    fromCookie: () => resolveStoredTokenHoverTrigger(
+      storage.getItem('plannotator-token-hover-trigger'),
+      storage.getItem('plannotator-token-hover-cards'),
+    ),
+    toCookie: (value: TokenHoverTrigger) =>
+      storage.setItem('plannotator-token-hover-trigger', value),
+    serverKey: undefined, fromServer: undefined, toServer: undefined,
+  },
+
+  // How long the pointer rests on a symbol before a card is requested. Three
+  // fixed steps, not a slider: "too eager" is a real complaint that neither
+  // `modifier` nor `off` answers, but nobody can tell 340ms from 360ms.
+  tokenHoverDelay: {
+    defaultValue: DEFAULT_TOKEN_HOVER_DELAY_MS as TokenHoverDelay,
+    fromCookie: () => {
+      const parsed = Number(storage.getItem('plannotator-token-hover-delay'));
+      return isTokenHoverDelay(parsed) ? parsed : undefined;
+    },
+    toCookie: (value: TokenHoverDelay) =>
+      storage.setItem('plannotator-token-hover-delay', String(value)),
+    serverKey: undefined, fromServer: undefined, toServer: undefined,
+  },
+
   reviewShowStageControls: {
     defaultValue: true as boolean,
     fromCookie: () => {
@@ -273,18 +333,18 @@ export const SETTINGS = {
   },
 
   defaultDiffType: {
-    defaultValue: 'since-base' as 'since-base' | 'uncommitted' | 'unstaged' | 'staged' | 'merge-base' | 'all',
+    defaultValue: 'since-base' as 'since-base' | 'local-vs-remote' | 'uncommitted' | 'unstaged' | 'staged' | 'merge-base' | 'all',
     fromCookie: () => {
       const v = storage.getItem('plannotator-default-diff-type');
       if (v === 'branch') return 'merge-base' as const;
-      return v === 'since-base' || v === 'uncommitted' || v === 'unstaged' || v === 'staged' || v === 'merge-base' || v === 'all' ? v : undefined;
+      return v === 'since-base' || v === 'local-vs-remote' || v === 'uncommitted' || v === 'unstaged' || v === 'staged' || v === 'merge-base' || v === 'all' ? v : undefined;
     },
     toCookie: (v: string) => storage.setItem('plannotator-default-diff-type', v),
     serverKey: 'diffOptions',
     fromServer: (sc: Record<string, unknown>) => {
       const v = (sc.diffOptions as Record<string, unknown> | undefined)?.defaultDiffType;
       if (v === 'branch') return 'merge-base' as const;
-      return v === 'since-base' || v === 'uncommitted' || v === 'unstaged' || v === 'staged' || v === 'merge-base' || v === 'all' ? v : undefined;
+      return v === 'since-base' || v === 'local-vs-remote' || v === 'uncommitted' || v === 'unstaged' || v === 'staged' || v === 'merge-base' || v === 'all' ? v : undefined;
     },
     toServer: (v: string) => ({ diffOptions: { defaultDiffType: v } }),
   },

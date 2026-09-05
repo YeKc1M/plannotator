@@ -112,7 +112,8 @@ import {
   extractMarkerNonce,
   type MarkerEngineId,
 } from "./marker-review";
-import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveCursorSandbox, resolveGuideHistory } from "./config";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory } from "./config";
+import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "@plannotator/shared/feedback-archive";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
 import { type PRMetadata, type PRRef, type PRReviewFileComment, type PRStackTree, type PRListItem, fetchPR, fetchPRFileContent, fetchPRContext, submitPRReview, fetchPRViewedFiles, markPRFilesViewed, fetchPRStack, fetchPRList, getPRUser, parsePRUrl, prRefFromMetadata, isSameProject, getDisplayRepo, getMRLabel, getMRNumberLabel, prCommandRuntime } from "./pr";
 import {
@@ -131,7 +132,7 @@ import { isAIEndpointPath, type AIEndpoints } from "@plannotator/ai";
 import { isWSL } from "./browser";
 import { handleOpenInApps, handleOpenIn } from "./open-in";
 import type { LocalWorkspaceReview, WorkspaceDiffType } from "./review-workspace";
-import { handleCodeNavResolve, extractChangedFiles } from "./code-nav";
+import { handleCodeNavResolve, handleCodeNavHover, extractChangedFiles } from "./code-nav";
 import { discoverCuratedSkills, resolveRequestedReviewProfile, listAllSkills, enableReviewSkill } from "./review-skill-loader";
 import { readGuideInstructions, writeGuideInstructions } from "@plannotator/shared/guide-instructions-store";
 import {
@@ -180,6 +181,17 @@ export interface ReviewServerOptions {
   initialFingerprint?: string;
   /** Whether URL sharing is enabled (default: true) */
   sharingEnabled?: boolean;
+  /**
+   * Whether this session's decision consumer delivers approve-time feedback
+   * (decision-control spec §6.4). Echoed as `approvalNotesSupported` on every
+   * diff payload (`/api/diff`, `/api/diff/switch`, `/api/pr-diff-scope`,
+   * `/api/pr-switch`) so the advert survives a diff switch; the client gates
+   * its approve-carrying menu items on it. Default false — a caller that does
+   * not pass it (an older consumer whose approved branch still discards
+   * `result.feedback`) advertises "not capable" and the client renders no
+   * approve-carrying items, exactly the pre-PR5 behavior.
+   */
+  approvalNotesSupported?: boolean;
   /** Custom base URL for share links (default: https://share.plannotator.ai) */
   shareBaseUrl?: string;
   /** Called when server starts with the URL, remote status, and port */
@@ -196,6 +208,15 @@ export interface ReviewServerOptions {
    * once a pool checkout is ready.
    */
   prPatchIncomplete?: boolean;
+  /**
+   * Detected project name, used to key the durable feedback archive
+   * (`feedback/{project}/`). Mirrors the annotate server's `project` option.
+   * Callers should pass `detectProjectName()`; without it the server falls
+   * back to deriving a name from the review's working directory, which is
+   * wrong in PR mode (no `gitContext`, and `--local` points `agentCwd` at a
+   * `pool/pr-<n>` checkout, so records would bucket under `pr-123`).
+   */
+  project?: string;
   /** Working directory for agent processes (e.g., --local worktree). Independent of diff pipeline. */
   agentCwd?: string;
   /** Per-PR worktree pool. When set, pr-switch creates worktrees instead of checking out. */
@@ -237,6 +258,9 @@ export async function startReviewServer(
   options: ReviewServerOptions
 ): Promise<ReviewServerResult> {
   const { htmlContent, origin, gitContext, sharingEnabled = true, shareBaseUrl, onReady } = options;
+  // Session-constant capability advert; rides every diff payload (see the
+  // option's doc). Absent option = false, so old callers advertise honestly.
+  const approvalNotesSupported = options.approvalNotesSupported === true;
   const submitPlatformReview = options.prReviewSubmitter ?? submitPRReview;
   const aiEnabled = resolveAIEnabled();
 
@@ -835,6 +859,88 @@ export async function startReviewServer(
   // mode round-trips.
   const currentSnapshotId = (): string =>
     `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}`;
+
+  // --- Durable feedback archive --------------------------------------------
+  //
+  // Code review was the headline gap: /api/feedback deleted the draft, settled
+  // the decision promise, and persisted NOTHING. When the invoking agent had
+  // already timed out, the review existed nowhere — the exact failure #678
+  // fixed for annotate. Every submission now appends one record to
+  // feedback/{project}/index.jsonl (plus a markdown sidecar when it carries
+  // content) BEFORE the draft is deleted.
+  //
+  // Project bucketing: prefer the caller's detected project name. The cwd
+  // fallback is only right for a plain local review — PR mode has no
+  // gitContext, and `--local` sets agentCwd to a `pool/pr-<n>` checkout, so
+  // deriving from cwd there would file every PR review under `pr-123`.
+  //
+  // Known limitation, deliberately not chased here: a caller that passes no
+  // project AND reviews a moved/renamed working directory buckets under the
+  // new directory name, exactly like the rest of the data dir does.
+  const feedbackProject = (): string =>
+    options.project?.trim()
+      ? options.project
+      : deriveFeedbackProject(gitContext?.cwd ?? options.agentCwd ?? process.cwd());
+
+  // Diff IDENTITY only: refs, view, snapshot id, and size metadata. The patch
+  // bytes are deliberately not archived (guide history already showed what
+  // uncapped patch copies cost); the user can regenerate the diff from these.
+  const feedbackReviewTarget = (): FeedbackReviewTarget => {
+    const target: FeedbackReviewTarget = {
+      diffType: String(currentDiffType),
+      base: currentBase,
+      gitRef: currentGitRef,
+      snapshotId: currentSnapshotId(),
+      changedFiles: countChangedFiles(currentPatch),
+      patchBytes: currentPatch.length,
+    };
+    if (sessionVcsType) target.vcsType = sessionVcsType;
+    else if (workspace) target.vcsType = "workspace";
+    const cwd = gitContext?.cwd ?? options.agentCwd;
+    if (cwd) target.cwd = cwd;
+    if (prMetadata) {
+      target.pr = {
+        provider: prMetadata.platform,
+        repo:
+          prMetadata.platform === "github"
+            ? `${prMetadata.owner}/${prMetadata.repo}`
+            : prMetadata.projectPath,
+        number: prMetadata.platform === "github" ? prMetadata.number : prMetadata.iid,
+      };
+    }
+    return target;
+  };
+
+  /**
+   * Append the archive record for one submission.
+   *
+   * Returns whether the draft delete may proceed: true when the record was
+   * written, when the archive is switched off, or when there was no user
+   * content to lose; false only when a durable write was expected and failed,
+   * in which case the caller keeps the draft as the recovery copy.
+   */
+  const archiveReviewSubmission = (
+    feedback: unknown,
+    annotations: unknown,
+    decision: FeedbackDecision,
+  ): boolean => {
+    if (!resolveFeedbackHistory(loadConfig())) return true;
+    const feedbackText = typeof feedback === "string" ? feedback : "";
+    const annotationList = Array.isArray(annotations) ? annotations : [];
+    const hasContent = feedbackText.trim().length > 0 || annotationList.length > 0;
+    const written = appendFeedbackRecord({
+      project: feedbackProject(),
+      origin,
+      surface: "review",
+      decision,
+      target: { review: feedbackReviewTarget() },
+      feedback: feedbackText,
+      annotations: annotationList,
+    });
+    // A failed decision-only line has nothing to recover, so it must not
+    // change the legacy draft behavior.
+    return written !== null || !hasContent;
+  };
 
   const buildCurrentAiReviewContext = (
     patch: string = currentPatch,
@@ -1952,6 +2058,7 @@ export async function startReviewServer(
               ...(workspace && { diffOptions: workspace.diffOptions }),
               gitContext: hasLocalAccess ? servedGitContext : undefined,
               sharingEnabled,
+              approvalNotesSupported,
               shareBaseUrl,
               repoInfo,
               isWSL: wslFlag,
@@ -2308,6 +2415,7 @@ export async function startReviewServer(
                   aiReviewContext: buildCurrentAiReviewContext(snapshot.rawPatch),
                   gitRef: currentGitRef,
                   snapshotId: currentSnapshotId(),
+                  approvalNotesSupported,
                   diffType: currentDiffType,
                   diffOptions: workspace.diffOptions,
                   hideWhitespace: currentHideWhitespace,
@@ -2436,6 +2544,7 @@ export async function startReviewServer(
                 aiReviewContext: buildCurrentAiReviewContext(result.patch, currentBase),
                 gitRef: currentGitRef,
                 snapshotId: currentSnapshotId(),
+                approvalNotesSupported,
                 diffType: currentDiffType,
                 // Echo the base the server actually used. resolveBaseBranch
                 // trusts the caller verbatim; this echo lets the client
@@ -2485,6 +2594,7 @@ export async function startReviewServer(
                   aiReviewContext: buildCurrentAiReviewContext(),
                   gitRef: currentGitRef,
                   snapshotId: currentSnapshotId(),
+                  approvalNotesSupported,
                   prDiffScope: currentPRDiffScope,
                   ...(layerPatchIncomplete && { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable }),
                   ...(currentError && { error: currentError }),
@@ -2541,6 +2651,7 @@ export async function startReviewServer(
                   aiReviewContext: buildCurrentAiReviewContext(),
                   gitRef: currentGitRef,
                   snapshotId: currentSnapshotId(),
+                  approvalNotesSupported,
                   prDiffScope: currentPRDiffScope,
                   ...(layerPatchIncomplete && { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable }),
                   ...((currentError ?? upgradeError) && { error: currentError ?? upgradeError }),
@@ -2588,6 +2699,7 @@ export async function startReviewServer(
                 aiReviewContext: buildCurrentAiReviewContext(),
                 gitRef: currentGitRef,
                 snapshotId: currentSnapshotId(),
+                approvalNotesSupported,
                 prDiffScope: currentPRDiffScope,
                 semanticDiff: await getSemanticDiffAdvert(),
                 callFlow: await getCallFlowAdvert(),
@@ -2716,6 +2828,7 @@ export async function startReviewServer(
                 aiReviewContext: buildCurrentAiReviewContext(),
                 gitRef: currentGitRef,
                 snapshotId: currentSnapshotId(),
+                approvalNotesSupported,
                 prMetadata: pr.metadata,
                 // The new PR's checkout (null while warming) so Open-in re-roots
                 // immediately on switch instead of waiting for the 5s probe.
@@ -2982,6 +3095,34 @@ export async function startReviewServer(
             }
             const changedFiles = extractChangedFiles(currentPatch);
             return handleCodeNavResolve(req, navCwd, changedFiles);
+          }
+
+          // API: Code navigation hover card (same guards as /resolve — the
+          // hover pipeline reads exactly what Cmd+click reads).
+          if (url.pathname === "/api/code-nav/hover" && req.method === "POST") {
+            if (isGitButlerCommittedView()) {
+              return Response.json(
+                { error: "Code navigation is unavailable for committed GitButler views" },
+                { status: 400 },
+              );
+            }
+            const hasCodeNavAccess = !!workspace || !!gitContext || !!options.agentCwd || !!options.worktreePool;
+            if (!hasCodeNavAccess) {
+              return Response.json(
+                { error: "Code navigation requires local access" },
+                { status: 400 },
+              );
+            }
+            // PR mode: the checkout must actually exist — ripgrep over a
+            // fallback directory returns confidently-wrong results.
+            const navCwd = options.worktreePool && prMetadata
+              ? await ensurePRLocalCwd()
+              : await resolveAgentCwdReady();
+            if (!navCwd) {
+              return Response.json({ error: "Local checkout unavailable" }, { status: 400 });
+            }
+            const changedFiles = extractChangedFiles(currentPatch);
+            return handleCodeNavHover(req, navCwd, changedFiles);
           }
 
           // API: Code navigation file preview (read file from working tree)
@@ -3276,6 +3417,10 @@ export async function startReviewServer(
 
           // API: Exit review session without feedback
           if (url.pathname === "/api/exit" && req.method === "POST") {
+            // Decision-only line: a dismissal carries no content, and how
+            // often reviews are closed without feedback is exactly the
+            // behavior data the archive exists to answer.
+            archiveReviewSubmission("", [], "dismissed");
             deleteDraft(draftKey, readDraftGenerationFromUrl(req));
             resolveDecision({ approved: false, feedback: "", annotations: [], exit: true });
             return Response.json({ ok: true });
@@ -3292,11 +3437,26 @@ export async function startReviewServer(
                 draftGeneration?: number;
               };
 
-              deleteDraft(draftKey, readDraftGenerationFromBody(body));
+              // Archive BEFORE the draft delete: a failed write keeps the
+              // draft as the reviewer's recovery copy (#678 ordering).
+              // Defensive on the body's own types: a malformed value must
+              // degrade to the legacy behavior (settle + 200), never throw.
+              const approved = body.approved ?? false;
+              const feedbackValue = body.feedback || "";
+              const annotationsValue = body.annotations || [];
+              const hasContent =
+                (typeof feedbackValue === "string" && feedbackValue.trim().length > 0) ||
+                (Array.isArray(annotationsValue) && annotationsValue.length > 0);
+              const durable = archiveReviewSubmission(
+                feedbackValue,
+                annotationsValue,
+                approved ? (hasContent ? "approved-with-notes" : "lgtm") : "feedback",
+              );
+              if (durable) deleteDraft(draftKey, readDraftGenerationFromBody(body));
               resolveDecision({
-                approved: body.approved ?? false,
-                feedback: body.feedback || "",
-                annotations: body.annotations || [],
+                approved,
+                feedback: feedbackValue,
+                annotations: annotationsValue,
                 agentSwitch: body.agentSwitch,
               });
 

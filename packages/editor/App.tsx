@@ -243,6 +243,7 @@ import {
   pathIsInsideDir,
 } from './sourceDocumentPaths';
 import { pickRestoredSingleFileDraftToDisplay } from './draftRestoreSelection';
+import { scrollableEditSurface } from './editScroll';
 
 type NoteAutoSaveResults = {
   obsidian?: boolean;
@@ -461,6 +462,10 @@ const App: React.FC = () => {
   // render-assigned ref (same pattern as headerHandlersRef) so keyboard and
   // header share literally one submitPrimaryDecision.
   const submitPrimaryDecisionRef = useRef<() => void>(() => {});
+  // The `document-view` scope is registered above `handleEditToggle`; the
+  // handler is read through a render-assigned ref (same pattern as above) so
+  // the chord and the card's `Edit` control share one enter path.
+  const handleEditToggleRef = useRef<() => void>(() => {});
   const [agentWarningMessage, setAgentWarningMessage] = useState('');
   const [isPanelOpen, setIsPanelOpen] = useState(() => window.innerWidth >= 768);
   const [rightSidebarTab, setRightSidebarTab] = useState<'annotations' | 'ai'>('annotations');
@@ -1458,18 +1463,14 @@ const App: React.FC = () => {
   // Shared gate for the chrome-level keyboard commands (sidebars, focus mode):
   // never while a dialog, an overlay, a submission, or a text field owns the
   // keystroke. Annotate-only commands layer their own conditions on top.
-  const canHandleDocumentChromeShortcut = useCallback((event: KeyboardEvent) => {
-    if (archive.archiveMode || goalSetupMode) return false;
-    if (event.defaultPrevented) return false;
-    if (document.querySelector('[data-plannotator-confirm-dialog="true"]')) return false;
+  const chromeShortcutBlocked = useCallback((event: KeyboardEvent) => {
+    if (archive.archiveMode || goalSetupMode) return true;
+    if (event.defaultPrevented) return true;
+    if (document.querySelector('[data-plannotator-confirm-dialog="true"]')) return true;
     if (showExport || showImport || showFeedbackPrompt || showClaudeCodeWarning ||
         showSourceFileEditWarning ||
-        showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return false;
-    if (submitted || isSubmitting || isExiting || isEditingMarkdown) return false;
-
-    const target = event.target as HTMLElement | null;
-    const tag = target?.tagName;
-    return tag !== 'INPUT' && tag !== 'TEXTAREA' && !target?.isContentEditable;
+        showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return true;
+    return submitted || isSubmitting || isExiting;
   }, [
     archive.archiveMode,
     goalSetupMode,
@@ -1485,6 +1486,19 @@ const App: React.FC = () => {
     submitted,
     isSubmitting,
     isExiting,
+  ]);
+
+  const canHandleDocumentChromeShortcut = useCallback((event: KeyboardEvent) => {
+    if (chromeShortcutBlocked(event)) return false;
+    // The editor owns its own keystrokes: chrome commands stand down while a
+    // markdown edit session is open (the exit chord has its own path below).
+    if (isEditingMarkdown) return false;
+
+    const target = event.target as HTMLElement | null;
+    const tag = target?.tagName;
+    return tag !== 'INPUT' && tag !== 'TEXTAREA' && !target?.isContentEditable;
+  }, [
+    chromeShortcutBlocked,
     isEditingMarkdown,
   ]);
 
@@ -1534,6 +1548,15 @@ const App: React.FC = () => {
           canHandleDocumentChromeShortcut(event)
           && ((canUseWideMode && !isHtmlSurface) || wideModeType !== null),
         handle: handleToggleFocusMode,
+      },
+      // Enter only. `canEditMarkdown` is the same gate the card's `Edit`
+      // control uses, so the chord is a no-op on every read-only surface
+      // (archive, HTML/live, plan diff, gate, linked docs). The exit half
+      // lives below: while the editor has focus the chrome guard stands down
+      // on purpose, so it needs its own listener.
+      toggleEditMode: {
+        when: (event) => canEditMarkdown && canHandleDocumentChromeShortcut(event),
+        handle: () => handleEditToggleRef.current(),
       },
     },
   });
@@ -2621,7 +2644,21 @@ const App: React.FC = () => {
     scheduleDraftSave();
   }, [annotationHistory, restoreDraft, validateDraftSavedFileChanges, editStats, isEditingMarkdown, editableDocuments, activeEditableDocument, markdown, applyEditedDocument, repaintHighlights, scheduleDraftSave]);
 
+  // The Viewer ↔ MarkdownEditor swap replaces the content of the scroll
+  // container, and a real browser clamps that container to the top as the old
+  // subtree leaves it. Carry the offset across the swap so toggling stays in
+  // place (#1479); `scrollableEditSurface` decides where the offset lives —
+  // desktop scrolls the document viewport, a bounded shell scrolls the editor.
+  const editScrollRestoreRef = useRef<number | null>(null);
+  const captureEditScroll = useCallback(() => {
+    const editorScroller = markdownEditorHandleRef.current?.getContentDOM()?.parentElement ?? null;
+    const viewport = usesDocumentScroll ? getDocumentScrollViewport() : mainViewportRef.current;
+    const source = scrollableEditSurface(editorScroller, viewport, isEditingMarkdown);
+    editScrollRestoreRef.current = source ? source.scrollTop : null;
+  }, [isEditingMarkdown, usesDocumentScroll]);
+
   const handleEditToggle = useCallback(() => {
+    captureEditScroll();
     if (isEditingMarkdown) {
       commitMarkdownEdits();
       return;
@@ -2650,7 +2687,29 @@ const App: React.FC = () => {
         : base !== null && normalized !== base
     );
     setIsEditingMarkdown(true);
-  }, [activeEditableDocument, displayedMarkdown, editableDocuments, isEditingMarkdown, commitMarkdownEdits]);
+  }, [activeEditableDocument, displayedMarkdown, editableDocuments, isEditingMarkdown, commitMarkdownEdits, captureEditScroll]);
+  handleEditToggleRef.current = handleEditToggle;
+
+  // Restore after the swap has committed. Two timing facts decide the shape:
+  // the editor publishes its handle, and establishes its height, in its own
+  // effects — the surface comes up short for one frame, so a single write
+  // clamps to the top; and either surface can be the scroller depending on the
+  // shell. Write both (the one that cannot scroll clamps to a no-op) now and
+  // again once CodeMirror has measured.
+  useEffect(() => {
+    const target = editScrollRestoreRef.current;
+    if (target === null) return;
+    editScrollRestoreRef.current = null;
+    const viewport = usesDocumentScroll ? getDocumentScrollViewport() : mainViewportRef.current;
+    const apply = () => {
+      const editorScroller = markdownEditorHandleRef.current?.getContentDOM()?.parentElement ?? null;
+      if (viewport) viewport.scrollTop = target;
+      if (editorScroller) editorScroller.scrollTop = target;
+    };
+    apply();
+    const frame = requestAnimationFrame(apply);
+    return () => cancelAnimationFrame(frame);
+  }, [isEditingMarkdown, usesDocumentScroll]);
 
   // Live dirty tracking for the open editor session. String compare per
   // keystroke is fine at plan sizes; setState bails out on unchanged values.
@@ -2732,6 +2791,38 @@ const App: React.FC = () => {
     }
     handleEditToggle();                                          // commit edits + exit
   }, [isEditingMarkdown, cancelMode, confirmCancelEdits, handleEditToggle, handleDiscardEdits]);
+  // Mod+E while the editor owns focus. The chrome-shortcut guard deliberately
+  // stands down inside the editor (contenteditable target + open edit session),
+  // so the exit gets its own listener rather than weakening that guard. It
+  // mirrors the card's `Done` exactly, including the two-step `Cancel →
+  // Discard` refusal: with unsaved source-backed changes the chord is a no-op,
+  // never a silent discard.
+  //
+  // NOTE: mounting atomic-editor's `selectionToolbar()` on this CodeMirror
+  // instance would dead-key this chord — that extension claims Mod-e and
+  // preventDefaults it before the event ever bubbles out to this listener.
+  useEffect(() => {
+    if (!isEditingMarkdown) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== 'e' || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return;
+      // Native text fields keep Mod+E (macOS "use selection for find", etc.):
+      // only serve the chord from CodeMirror's contenteditable or the chrome.
+      // CodeMirror's content DOM is contenteditable, never INPUT/TEXTAREA, so
+      // this cannot break the exit-from-editor path.
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') &&
+        !target.closest('.cm-editor')
+      ) return;
+      if (chromeShortcutBlocked(event)) return;
+      event.preventDefault();
+      if (cancelMode) return;
+      handleEditToggle();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isEditingMarkdown, cancelMode, chromeShortcutBlocked, handleEditToggle]);
   // Drop the discard confirmation once it no longer applies — exited the editor,
   // or the doc went clean (e.g. the user saved).
   useEffect(() => {

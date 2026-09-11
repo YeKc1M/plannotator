@@ -150,7 +150,7 @@ import { SectionsPanel } from './components/SectionsPanel';
 import { CommitsPanel } from './components/CommitsPanel';
 import { useCommitsView } from './hooks/useCommitsView';
 import { ReviewSetupDialog } from './components/ReviewSetupDialog';
-import { initializeReviewSetup, markReviewSetupSeen } from './utils/reviewSetup';
+import { initializeReviewSetup, markReviewSetupSeen, shouldOfferReviewSetup, shouldRepairPanelPair } from './utils/reviewSetup';
 import { resolvePanelView } from './utils/resolvePanelView';
 import { isCommitDiffType, resolveCommitExitDiff, type CommitViewRestoreTarget } from './utils/commitViewRestore';
 import { GuideIntroDialog } from './components/GuideIntroDialog';
@@ -607,6 +607,10 @@ const ReviewApp: React.FC = () => {
   }, []);
   // First-run review-setup chooser (panel view + tree default diff).
   const [showReviewSetup, setShowReviewSetup] = useState(false);
+  // The caller pinned this session's opening diff type and/or base (CLI
+  // flags). Mount effects must not auto-switch the diff or consume the
+  // one-time review-setup cookie for such a session.
+  const [openStatePinned, setOpenStatePinned] = useState(false);
   // True only for the first-run showing (where dismissing applies the recommended
   // default). A reopen from the header menu must NOT snap the user's mid-session
   // diff back to the default.
@@ -2004,6 +2008,7 @@ const ReviewApp: React.FC = () => {
         commitInfo?: CommitDiffInfo;
         generatedFiles?: string[];
         baseBehindRemote?: boolean;
+        openStatePinned?: boolean;
         snapshotId?: string;
         serverConfig?: Record<string, unknown> & { displayName?: string; gitUser?: string };
       }) => {
@@ -2070,6 +2075,7 @@ const ReviewApp: React.FC = () => {
         setCommitInfo(data.commitInfo ?? null);
         setGeneratedFiles(new Set(data.generatedFiles ?? []));
         setBaseBehindRemote(data.baseBehindRemote === true);
+        setOpenStatePinned(data.openStatePinned === true);
         // First-run: offer the review-view chooser for a plain local git
         // session (not workspace/PR/jj/p4), once. An unseen reviewer's panel
         // is initialized to Tree while inheriting the resolved diff default;
@@ -2086,9 +2092,20 @@ const ReviewApp: React.FC = () => {
         const sinceBaseAvailable = !!data.gitContext?.diffOptions?.some(
           (o: { id: string }) => o.id === 'since-base',
         );
+        // shouldOfferReviewSetup MUST come first in the && chain:
+        // initializeReviewSetup() consumes the one-time seen cookie as a side
+        // effect of being CALLED, and a caller-pinned session (openStatePinned)
+        // must neither burn that cookie nor open a dialog whose dismiss would
+        // handleDiffSwitch the flags away.
         if (
-          data.gitContext && data.mode !== 'workspace' && !data.prMetadata &&
-          data.gitContext.vcsType === 'git' && sinceBaseAvailable && initializeReviewSetup()
+          shouldOfferReviewSetup({
+            openStatePinned: data.openStatePinned,
+            hasGitContext: !!data.gitContext,
+            isWorkspace: data.mode === 'workspace',
+            isPR: !!data.prMetadata,
+            vcsType: data.gitContext?.vcsType,
+            sinceBaseAvailable,
+          }) && initializeReviewSetup()
         ) {
           reviewSetupIsFirstRun.current = true;
           setShowReviewSetup(true);
@@ -2876,6 +2893,8 @@ const ReviewApp: React.FC = () => {
             defaultBranch: data.gitContext!.defaultBranch,
             diffOptions: data.gitContext!.diffOptions,
             compareTarget: data.gitContext!.compareTarget,
+            diffAvailability: data.gitContext!.diffAvailability,
+            diffFallback: data.gitContext!.diffFallback,
             jjEvologs: data.gitContext!.jjEvologs,
             // HEAD differs per worktree, so refresh the commit-baseline picker.
             recentCommits: data.gitContext!.recentCommits,
@@ -3048,6 +3067,11 @@ const ReviewApp: React.FC = () => {
   // session default once, on load only — a commit diff the USER opens later
   // in this session must never be snapped, hence the one-shot ref that burns
   // on the first settled load regardless of what it observed.
+  //
+  // Deliberately NOT gated on openStatePinned: `--diff-type` does not accept
+  // commit:<sha> in v1, so a pinned session can never be serving a commit
+  // diff on load. If v1.1 ever adds commit:<sha> to the accepted open states,
+  // this snap-back would clobber the flag — re-gate it then.
   const snappedCommitDiffOnLoad = useRef(false);
   useEffect(() => {
     if (snappedCommitDiffOnLoad.current || isLoading || !diffData) return;
@@ -3077,18 +3101,27 @@ const ReviewApp: React.FC = () => {
   const healedPanelPairOnLoad = useRef(false);
   useEffect(() => {
     if (healedPanelPairOnLoad.current || isLoading || !diffData) return;
-    // First-run resets + applies the pair itself (on dialog dismiss).
-    if (!sectionsCapable || reviewSetupIsFirstRun.current) return;
-    if (persistedPanelView !== 'sections') return;
+    // shouldRepairPanelPair bails ENTIRELY for a caller-pinned session (not
+    // just the diff-switch leg): the repair's other half is a config.json
+    // write, and a flagged session must not cause a settings write it would
+    // not otherwise cause. First-run resets + applies the pair itself (on
+    // dialog dismiss).
+    if (
+      !shouldRepairPanelPair({
+        openStatePinned,
+        sectionsCapable,
+        isFirstRunSetup: reviewSetupIsFirstRun.current,
+        persistedPanelView,
+        defaultDiffType: configStore.get('defaultDiffType'),
+      })
+    ) return;
     healedPanelPairOnLoad.current = true;
-    if (configStore.get('defaultDiffType') !== 'since-base') {
-      // Re-assert the pair through the coupled setter (repairs cookie +
-      // config.json), then bring the live session along. This is a repair,
-      // not a user choice — it must not overwrite the last-used memo.
-      setReviewPanelView('sections', { recordLastUsed: false });
-      if (activeDiffBase !== 'since-base') void handleDiffSwitch('since-base');
-    }
-  }, [isLoading, diffData, sectionsCapable, persistedPanelView, activeDiffBase, handleDiffSwitch]);
+    // Re-assert the pair through the coupled setter (repairs cookie +
+    // config.json), then bring the live session along. This is a repair,
+    // not a user choice — it must not overwrite the last-used memo.
+    setReviewPanelView('sections', { recordLastUsed: false });
+    if (activeDiffBase !== 'since-base') void handleDiffSwitch('since-base');
+  }, [isLoading, diffData, sectionsCapable, persistedPanelView, activeDiffBase, handleDiffSwitch, openStatePinned]);
 
   // Switch worktree context (or back to main repo). Preserves the current
   // diff mode across the switch — if the reviewer was looking at "PR Diff"
@@ -4936,6 +4969,31 @@ const ReviewApp: React.FC = () => {
               </button>
             </div>
           ) : null
+        )}
+
+        {gitContext?.diffFallback && (
+          <div className="shrink-0 border-b border-warning/20 bg-warning/10 px-3 py-2 text-xs text-warning">
+            <div>{gitContext.diffFallback.message}</div>
+            {!!gitContext.diffFallback.candidates?.length && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {gitContext.diffFallback.candidates.map((candidate) => (
+                  <button
+                    key={candidate.revision}
+                    type="button"
+                    className="rounded border border-warning/30 bg-background/50 px-2 py-1 text-left hover:bg-background"
+                    title={candidate.subject || candidate.revision}
+                    onClick={() => {
+                      setSelectedBase(candidate.revision);
+                      void fetchDiffSwitch(gitContext.diffFallback!.requestedDiffType, candidate.revision, { explicitBase: true });
+                    }}
+                  >
+                    {candidate.labels[0] ?? candidate.revision.slice(0, 8)}
+                    {candidate.subject && <span className="ml-1 text-muted-foreground">· {candidate.subject}</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {/* Main content */}

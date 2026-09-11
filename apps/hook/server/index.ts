@@ -101,7 +101,9 @@ import {
 } from "@plannotator/server/goal-setup";
 import { type DiffType, detectManagedVcs, prepareLocalReviewDiff, gitRuntime } from "@plannotator/server/vcs";
 import { loadConfig, resolveDefaultDiffType, resolveSharingEnabled } from "@plannotator/shared/config";
-import { parseReviewArgs } from "@plannotator/shared/review-args";
+import { parseReviewArgs, type ParsedReviewArgs } from "@plannotator/shared/review-args";
+import { resolveReviewOpenState, type ReviewOpenState } from "@plannotator/shared/review-open-state";
+import { listBranches, type AvailableBranches } from "@plannotator/shared/review-core";
 import {
   normalizeGoalSetupBundle,
   type GoalSetupStage,
@@ -131,13 +133,11 @@ import {
 import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
-  composeReviewApprovedMessage,
-  getReviewDeniedSuffix,
   getPlanDeniedPrompt,
   getPlanToolName,
   buildPlanFileRule,
 } from "@plannotator/shared/prompts";
-import { supportsReviewApprovalNotes } from "./review-output";
+import { buildReviewOutput, supportsReviewApprovalNotes } from "./review-output";
 import { registerSession, unregisterSession, listSessions } from "@plannotator/server/sessions";
 import { openBrowser } from "@plannotator/server/browser";
 import { inlineHtmlLocalAssets } from "@plannotator/server/html-assets";
@@ -169,7 +169,7 @@ import {
   resolveSessionLogByCwdScan,
   type RenderedMessage,
 } from "./session-log";
-import { findCodexRolloutByThreadId, getLatestCodexPlan, getRecentCodexMessages } from "./codex-session";
+import { findCodexRolloutsByThreadId, getLatestCodexPlan, getRecentCodexMessages } from "./codex-session";
 import { findCopilotPlanContent, findCopilotSessionByAncestorPids, findCopilotSessionForCwd, getRecentCopilotMessages } from "./copilot-session";
 import {
   formatInteractiveNoArgClarification,
@@ -360,6 +360,67 @@ const emitAnnotateOutcome = createAnnotateOutcomeEmitter({
   hook: hookFlag,
   json: jsonFlag,
 });
+
+/**
+ * Resolve the `--base` / `--diff-type` open-state seed for a review
+ * invocation: probe the requested base ref with git (in `cwd`), validate
+ * against the provider/PR/workspace matrix, print notices on stderr, and exit
+ * 1 on a fatal error (reviews have no strict-gate mode, so every failure here
+ * is exit 1 like the other review startup failures). Returns the seed to
+ * thread into `prepareLocalReviewDiff`. A flagless invocation is a no-op.
+ */
+async function resolveCliReviewOpenState(
+  reviewArgs: ParsedReviewArgs,
+  options: {
+    isPRMode: boolean;
+    isWorkspace: boolean;
+    providerId?: "git" | "gitbutler" | "jj" | "p4";
+    resolvedDefaultDiffType: DiffType;
+    cwd?: string;
+  },
+): Promise<ReviewOpenState> {
+  if (reviewArgs.base === undefined && reviewArgs.diffType === undefined) {
+    return { notices: [] };
+  }
+  let baseResolves: boolean | undefined;
+  let availableBranches: AvailableBranches | undefined;
+  if (
+    reviewArgs.base !== undefined &&
+    !options.isPRMode &&
+    !options.isWorkspace &&
+    options.providerId === "git"
+  ) {
+    // The probe is the whole point of CLI-side resolution: without it a
+    // typo'd base produces a confidently-mislabelled merge-base→HEAD diff
+    // (review-core's since-base degrade). --end-of-options blocks flag
+    // injection through hostile ref names.
+    const probe = await gitRuntime.runGit(
+      ["rev-parse", "--verify", "--quiet", "--end-of-options", `${reviewArgs.base}^{commit}`],
+      { cwd: options.cwd },
+    );
+    baseResolves = probe.exitCode === 0;
+    if (!baseResolves) {
+      // Near-match suggestions: cheap (one for-each-ref) and the single most
+      // useful thing an agent caller can act on.
+      availableBranches = await listBranches(gitRuntime, options.cwd);
+    }
+  }
+  const openState = resolveReviewOpenState({
+    parsed: reviewArgs,
+    isPRMode: options.isPRMode,
+    isWorkspace: options.isWorkspace,
+    providerId: options.providerId,
+    resolvedDefaultDiffType: options.resolvedDefaultDiffType,
+    baseResolves,
+    availableBranches,
+  });
+  if (openState.error) {
+    console.error(openState.error);
+    process.exit(1);
+  }
+  for (const notice of openState.notices) console.error(notice);
+  return openState;
+}
 
 async function loadGoalSetupBundle(
   stage: GoalSetupStage,
@@ -744,9 +805,23 @@ if (args[0] === "sessions") {
   // ============================================
 
   const reviewArgs = parseReviewArgs(args.slice(1));
+  // Argument-shape failures (unknown/typo'd flags) refuse to start a session:
+  // silently dropping them is how `--bse main` used to open a review as if
+  // nothing happened. Review has no strict-gate mode, so this is exit 1 like
+  // every other review startup failure.
+  if (reviewArgs.errors.length > 0) {
+    for (const parseError of reviewArgs.errors) console.error(parseError);
+    console.error("Run 'plannotator review --help' for usage.");
+    process.exit(1);
+  }
   const urlArg = reviewArgs.prUrl;
   const isPRMode = urlArg !== undefined;
   const useLocal = isPRMode && reviewArgs.useLocal;
+  // Caller-pinned open state: `--base` / `--diff-type` seed this session only
+  // (nothing is persisted). Pinned sessions advertise openStatePinned so the
+  // client's mount effects don't auto-switch the diff away from the flags.
+  const openStatePinned = reviewArgs.base !== undefined || reviewArgs.diffType !== undefined;
+  let initialBaseFromFlags: string | undefined;
 
   let rawPatch: string;
   let gitRef: string;
@@ -763,6 +838,13 @@ if (args[0] === "sessions") {
 
   if (isPRMode) {
     // --- PR Review Mode ---
+    // The base comes from the pull request — the open-state flags always
+    // error here (validated before any auth check or platform fetch).
+    await resolveCliReviewOpenState(reviewArgs, {
+      isPRMode: true,
+      isWorkspace: false,
+      resolvedDefaultDiffType: resolveDefaultDiffType(loadConfig()),
+    });
     const prRef = parsePRUrl(urlArg);
     if (!prRef) {
       console.error(`Invalid PR/MR URL: ${urlArg}`);
@@ -1010,8 +1092,22 @@ if (args[0] === "sessions") {
     const forcedVcs = !!reviewArgs.vcsType && reviewArgs.vcsType !== "auto";
 
     if (managedVcs || forcedVcs) {
+      const providerId = (managedVcs?.id ?? reviewArgs.vcsType) as
+        | "git"
+        | "gitbutler"
+        | "jj"
+        | "p4"
+        | undefined;
+      const openState = await resolveCliReviewOpenState(reviewArgs, {
+        isPRMode: false,
+        isWorkspace: false,
+        providerId,
+        resolvedDefaultDiffType: resolveDefaultDiffType(config),
+      });
       const diffResult = await prepareLocalReviewDiff({
         vcsType: reviewArgs.vcsType,
+        requestedDiffType: openState.requestedDiffType,
+        requestedBase: openState.requestedBase,
         configuredDiffType: resolveDefaultDiffType(config),
         hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
       });
@@ -1021,7 +1117,18 @@ if (args[0] === "sessions") {
       gitRef = diffResult.gitRef;
       diffError = diffResult.error;
       initialFingerprint = diffResult.fingerprint;
+      // Forward the base the patch was actually computed against — without it
+      // the server would serve this patch under the detected default: a
+      // mixed-base review (wrong file-content fetches, wrong agent prompts).
+      if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
     } else {
+      // Multi-repo workspace review has no base parameter — the open-state
+      // flags always error here.
+      await resolveCliReviewOpenState(reviewArgs, {
+        isPRMode: false,
+        isWorkspace: true,
+        resolvedDefaultDiffType: resolveDefaultDiffType(config),
+      });
       workspace = await buildLocalWorkspaceReview(process.cwd(), {
         configuredDiffType: resolveDefaultDiffType(config),
         hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
@@ -1049,6 +1156,9 @@ if (args[0] === "sessions") {
     project: reviewProject,
     diffType: workspace ? (initialDiffType ?? workspace.diffType) : gitContext ? (initialDiffType ?? "unstaged") : undefined,
     gitContext,
+    initialBase: initialBaseFromFlags,
+    initialBaseExplicit: initialBaseFromFlags !== undefined,
+    openStatePinned,
     initialFingerprint,
     prMetadata,
     prPatchIncomplete,
@@ -1095,23 +1205,8 @@ if (args[0] === "sessions") {
   server.stop();
 
   // Output feedback (captured by slash command)
-  if (result.exit) {
-    console.log("Review session closed without feedback.");
-  } else if (result.approved) {
-    // PR5 delivery (spec §6.4): a bare approval prints the approved prompt,
-    // byte-identical to before; an approval carrying reviewer notes prints
-    // the approved-with-notes framing (non-blocking guidance) instead.
-    console.log(composeReviewApprovedMessage(detectedOrigin, result.feedback));
-  } else {
-    console.log(result.feedback);
-    // Append the verification-only suffix whenever the reviewer sent annotations to
-    // act on — in PR mode too. Platform PR actions (approve/comment posted to
-    // the host) come back with an empty annotation set and a status message;
-    // those must NOT get the "verify findings and don't change code" instruction.
-    if (result.annotations.length > 0) {
-      console.log(getReviewDeniedSuffix(detectedOrigin));
-    }
-  }
+  const output = buildReviewOutput(result, detectedOrigin);
+  console.log(jsonFlag ? JSON.stringify(output) : output.message);
   process.exit(0);
 
 } else if (args[0] === "annotate") {
@@ -1408,14 +1503,19 @@ if (args[0] === "sessions") {
     if (process.env.PLANNOTATOR_DEBUG) {
       console.error(`[DEBUG] Codex detected, thread ID: ${codexThreadId}`);
     }
-    const rolloutPath = findCodexRolloutByThreadId(codexThreadId);
-    if (rolloutPath) {
+    // A thread can span multiple rollout files; the newest segment may be
+    // empty or aborted, so fall back until one yields a message (#1367).
+    for (const rolloutPath of findCodexRolloutsByThreadId(codexThreadId)) {
       if (process.env.PLANNOTATOR_DEBUG) {
         console.error(`[DEBUG] Rollout: ${rolloutPath}`);
       }
-      recentMessages = getRecentCodexMessages(rolloutPath, RECENT_MESSAGES_LIMIT, { beforeActiveTurn: true })
+      const recent = getRecentCodexMessages(rolloutPath, RECENT_MESSAGES_LIMIT, { beforeActiveTurn: true })
         .map((m) => ({ messageId: m.messageId, text: m.text, lineNumbers: [], timestamp: m.timestamp }));
-      lastMessage = recentMessages[0] ?? null;
+      if (recent.length > 0) {
+        recentMessages = recent;
+        lastMessage = recent[0];
+        break;
+      }
     }
   } else if (isDroid) {
     // Droid/Factory path: resolve the current repo's session log from
@@ -1737,8 +1837,20 @@ if (args[0] === "sessions") {
     inputJson,
   );
   const reviewArgs = parseReviewArgs(typeof input.arguments === "string" ? input.arguments : "");
+  // Same refusal as the direct `review` branch. Errors go to stderr so the
+  // bridge's machine-readable stdout contract stays untouched.
+  if (reviewArgs.errors.length > 0) {
+    for (const parseError of reviewArgs.errors) console.error(parseError);
+    console.error("Run 'plannotator review --help' for usage.");
+    process.exit(1);
+  }
   const urlArg = reviewArgs.prUrl;
   const isPRMode = urlArg !== undefined;
+  // Caller-pinned open state (--base/--diff-type through the plugin's
+  // verbatim rawArgs forward) — session-only seed, mirrors the direct
+  // `review` branch.
+  const openStatePinned = reviewArgs.base !== undefined || reviewArgs.diffType !== undefined;
+  let initialBaseFromFlags: string | undefined;
 
   let rawPatch: string;
   let gitRef: string;
@@ -1752,6 +1864,11 @@ if (args[0] === "sessions") {
   let agentCwd: string | undefined;
 
   if (isPRMode) {
+    await resolveCliReviewOpenState(reviewArgs, {
+      isPRMode: true,
+      isWorkspace: false,
+      resolvedDefaultDiffType: resolveDefaultDiffType(loadConfig()),
+    });
     const prRef = parsePRUrl(urlArg);
     if (!prRef) {
       console.error(`Invalid PR/MR URL: ${urlArg}`);
@@ -1787,9 +1904,24 @@ if (args[0] === "sessions") {
     const forcedVcs = !!reviewArgs.vcsType && reviewArgs.vcsType !== "auto";
 
     if (managedVcs || forcedVcs) {
+      const providerId = (managedVcs?.id ?? reviewArgs.vcsType) as
+        | "git"
+        | "gitbutler"
+        | "jj"
+        | "p4"
+        | undefined;
+      const openState = await resolveCliReviewOpenState(reviewArgs, {
+        isPRMode: false,
+        isWorkspace: false,
+        providerId,
+        resolvedDefaultDiffType: resolveDefaultDiffType(config),
+        cwd,
+      });
       const diffResult = await prepareLocalReviewDiff({
         cwd,
         vcsType: reviewArgs.vcsType,
+        requestedDiffType: openState.requestedDiffType,
+        requestedBase: openState.requestedBase,
         configuredDiffType: resolveDefaultDiffType(config),
         hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
       });
@@ -1799,7 +1931,14 @@ if (args[0] === "sessions") {
       gitRef = diffResult.gitRef;
       diffError = diffResult.error;
       initialFingerprint = diffResult.fingerprint;
+      if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
     } else {
+      await resolveCliReviewOpenState(reviewArgs, {
+        isPRMode: false,
+        isWorkspace: true,
+        resolvedDefaultDiffType: resolveDefaultDiffType(config),
+        cwd,
+      });
       workspace = await buildLocalWorkspaceReview(cwd, {
         configuredDiffType: resolveDefaultDiffType(config),
         hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
@@ -1828,6 +1967,9 @@ if (args[0] === "sessions") {
     project: reviewProject,
     diffType: isPRMode ? undefined : userDiffType,
     gitContext,
+    initialBase: initialBaseFromFlags,
+    initialBaseExplicit: initialBaseFromFlags !== undefined,
+    openStatePinned,
     initialFingerprint,
     prMetadata,
     prPatchIncomplete,
@@ -2251,20 +2393,32 @@ if (args[0] === "sessions") {
   }
 
   if (event.hook_event_name === "Stop") {
-    const rolloutPath =
-      (typeof event.transcript_path === "string" && event.transcript_path) ||
-      (process.env.CODEX_THREAD_ID
-        ? findCodexRolloutByThreadId(process.env.CODEX_THREAD_ID)
-        : null);
+    const transcriptPath = typeof event.transcript_path === "string" && event.transcript_path
+      ? event.transcript_path
+      : null;
+    // A thread can span multiple rollout files, but the Stop hook asks a
+    // TURN-level question and the current turn can only live in the newest
+    // segment. Take the first existing candidate only — never fall back to an
+    // older segment: findTurnStartIndex degrades to last-turn-in-file when
+    // the turn_id is absent, so a fallback file's plan is stale by
+    // construction (older segments routinely end with an already-decided
+    // <proposed_plan>) and would deterministically reopen settled plan
+    // reviews on every turn end. Contrast the annotate-last leg above, which
+    // asks a thread-level question and correctly falls back across segments
+    // (#1367).
+    const rolloutPaths = transcriptPath
+      ? [transcriptPath]
+      : process.env.CODEX_THREAD_ID
+        ? findCodexRolloutsByThreadId(process.env.CODEX_THREAD_ID)
+        : [];
+    const rolloutPath = rolloutPaths.find((path) => existsSync(path)) ?? null;
 
-    if (!rolloutPath || !existsSync(rolloutPath)) {
-      process.exit(0);
-    }
-
-    const latestPlan = getLatestCodexPlan(rolloutPath, {
-      turnId: typeof event.turn_id === "string" ? event.turn_id : undefined,
-      stopHookActive: !!event.stop_hook_active,
-    });
+    const latestPlan = rolloutPath
+      ? getLatestCodexPlan(rolloutPath, {
+          turnId: typeof event.turn_id === "string" ? event.turn_id : undefined,
+          stopHookActive: !!event.stop_hook_active,
+        })
+      : null;
 
     if (!latestPlan?.text) {
       process.exit(0);

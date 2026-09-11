@@ -188,6 +188,7 @@ jobs:
           packages/ui/components/ActionMenu.test.tsx
           packages/ui/components/PlanHeaderMenu.mobile.test.tsx
           packages/review-editor/components/ReviewHeaderMenu.mobile.test.tsx
+          packages/editor/App.editModeShortcut.test.tsx
 
   opencode-v2:
     name: OpenCode 2 installed package

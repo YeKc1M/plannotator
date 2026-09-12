@@ -1,0 +1,52 @@
+name: Sync upstream into feature branch
+
+on:
+  schedule:
+    # 23:22 UTC = 07:22 Beijing time (UTC+8), daily
+    - cron: '22 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-feature-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # This repo is a Bun monorepo (bun.lock + bunfig.toml); Bun is needed by
+      # the conflict-resolution verification step. Node 24 hosts the kimi CLI.
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Restore bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+
+      - name: Install kimi CLI
+        run: npm install -g @moonshot-ai/kimi-code
+
+      - name: Sync upstream into feature branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          FEATURE_BRANCH: ${{ vars.FEATURE_BRANCH }}
+          SYNC_BRANCH: ${{ vars.SYNC_BRANCH }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/sync-feature-upstream.sh

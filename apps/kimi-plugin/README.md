@@ -41,15 +41,13 @@ In the Kimi Code TUI:
 
 ## Ask AI
 
-The review UI's Ask AI panel gains a **Kimi** provider automatically when the `kimi` CLI is on your `PATH` (you already have it, since you run Kimi Code) — it wraps `kimi -p` headless mode and reuses your existing Kimi login, no API key configuration needed. Kimi-origin sessions prefer this provider; `claude`, `codex`, `pi`, and `opencode` are still detected the same way. If no supported CLI is available, the panel is hidden and everything else works unchanged.
+The review UI's Ask AI panel gains a **Kimi** provider automatically when the `kimi` CLI is on your `PATH` (you already have it, since you run Kimi Code) — it drives a long-lived `kimi acp` agent over ACP (Agent Client Protocol) and reuses your existing Kimi login, no API key configuration needed. Kimi-origin sessions prefer this provider; `claude`, `codex`, `pi`, and `opencode` are still detected the same way. If no supported CLI is available, the panel is hidden and everything else works unchanged.
 
-Known limitations of the Kimi provider (inherent to `kimi -p` today):
+Over ACP the Kimi provider supports token-level streaming, a thinking stream, interactive Allow/Deny permission cards for tool calls, a model picker (discovered from the agent, activated on first use), and forking the host Kimi session's history into Ask AI. Requires a Kimi Code CLI new enough to provide `kimi acp` — older versions fail with an upgrade hint.
 
-- **Message-level streaming**: answers appear at message boundaries, not token by token.
-- **No permission cards**: print mode forces auto permission mode, so tools run without Allow/Deny prompts.
-- **No model selector**: the CLI's `-m` aliases can't be enumerated; the provider uses your configured default model.
-- **No fork**: Ask AI can't inherit the host Kimi session's history (same as the Pi/Codex providers).
-- **No cost/turn stats and no thinking display**: the stream-json output carries no such metadata.
+Known limitations of the Kimi provider:
+
+- **No cost statistics**: the kimi engine exposes no pricing data, so Ask AI shows no per-query cost.
 
 ## How it works
 
@@ -62,4 +60,4 @@ Known limitations of the Kimi provider (inherent to `kimi -p` today):
 
 ## 中文说明
 
-前置条件：`plannotator` 二进制在 `PATH` 上（安装命令见上），并开启实验 flag（`KIMI_CODE_EXPERIMENTAL_HOOK_PERMISSION_DECISIONS=1` 或 `config.toml` 里 `[experimental] hook_permission_decisions = true`）。在 Kimi Code TUI 中用 `/plugins install <本目录路径或 GitHub URL>` 安装本插件。之后 agent 调用 `ExitPlanMode` 时会自动打开浏览器里的可视化 plan 评审界面：可以直接批准，也可以批注后打回，反馈会作为 deny 原因返回给 agent。评审界面里的 Ask AI 面板在检测到 `PATH` 上的 `kimi` CLI 时会自动出现 Kimi provider（包装 `kimi -p` headless 模式，复用已有登录态，无需配置 API key；已知限制：消息级流式、无权限卡片、无模型选择、无 fork、无费用统计）；`claude`/`codex`/`pi`/`opencode` 照旧检测，都没有时面板不显示。flag 未开启时回退到内置审批面板。
+前置条件：`plannotator` 二进制在 `PATH` 上（安装命令见上），并开启实验 flag（`KIMI_CODE_EXPERIMENTAL_HOOK_PERMISSION_DECISIONS=1` 或 `config.toml` 里 `[experimental] hook_permission_decisions = true`）。在 Kimi Code TUI 中用 `/plugins install <本目录路径或 GitHub URL>` 安装本插件。之后 agent 调用 `ExitPlanMode` 时会自动打开浏览器里的可视化 plan 评审界面：可以直接批准，也可以批注后打回，反馈会作为 deny 原因返回给 agent。评审界面里的 Ask AI 面板在检测到 `PATH` 上的 `kimi` CLI 时会自动出现 Kimi provider（通过 ACP 协议驱动长驻的 `kimi acp` 进程，复用已有登录态，无需配置 API key；支持 token 级流式输出、thinking 流、工具调用的权限卡片、模型选择器和 fork 宿主会话历史；需要足够新、提供 `kimi acp` 子命令的 Kimi Code CLI，已知限制仅剩无费用统计——kimi 引擎不提供定价数据）；`claude`/`codex`/`pi`/`opencode` 照旧检测，都没有时面板不显示。flag 未开启时回退到内置审批面板。

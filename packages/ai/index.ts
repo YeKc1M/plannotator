@@ -58,6 +58,8 @@ export type {
   AIMessage,
   AITextMessage,
   AITextDeltaMessage,
+  AIThinkingDeltaMessage,
+  AIUsageMessage,
   AIToolUseMessage,
   AIToolResultMessage,
   AIErrorMessage,

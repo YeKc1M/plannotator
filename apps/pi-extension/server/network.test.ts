@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import {
+	chmodSync,
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
+import os, { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { closeServer, occupyConsecutivePorts } from "../../../tests/helpers/ports.ts";
 import {
 	buildAdvertisedUrl,
@@ -7,6 +17,7 @@ import {
 	getServerPort,
 	getServerPorts,
 	isNoOpBrowserSentinel,
+	isPosixBrowserTarget,
 	isRemoteSession,
 	listenOnPort,
 	openBrowser,
@@ -328,5 +339,113 @@ describe("pi buildAdvertisedUrl", () => {
 		expect(getServerHostname()).toBe("127.0.0.1");
 		process.env.PLANNOTATOR_REMOTE = "1";
 		expect(getServerHostname()).toBe("0.0.0.0");
+	});
+});
+
+// --- WSL PLANNOTATOR_BROWSER routing (#1472) ---
+
+const realPlatform = process.platform;
+const realRelease = os.release;
+
+/** Pretend to run under WSL: the WSL test is process.platform + os.release(). */
+function mockWsl() {
+	Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+	os.release = () => "5.15.90.1-microsoft-standard-WSL2";
+}
+
+function restoreHostPlatform() {
+	Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+	os.release = realRelease;
+}
+
+function writeExecutable(dir: string, name: string, body: string): string {
+	const file = join(dir, name);
+	writeFileSync(file, `#!/bin/sh\n${body}\n`);
+	chmodSync(file, 0o755);
+	return file;
+}
+
+async function waitForFile(file: string, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!existsSync(file)) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${file}`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+const URL = "http://127.0.0.1:19432/plan";
+
+describe("pi WSL configured browser launch", () => {
+	afterEach(() => {
+		restoreHostPlatform();
+	});
+
+	test("a POSIX path is spawned directly with the URL", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "plannotator-pi-browser-"));
+		const log = join(dir, "args.txt");
+		const script = writeExecutable(dir, "fake-browser", `printf '%s' "$1" > '${log}'`);
+		try {
+			clearEnv();
+			mockWsl();
+			process.env.PLANNOTATOR_BROWSER = script;
+
+			expect(await openBrowser(URL)).toEqual({ opened: true });
+			await waitForFile(log);
+			expect(readFileSync(log, "utf8")).toBe(URL);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a Windows .exe target still routes through cmd.exe", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "plannotator-pi-browser-"));
+		const cmdLog = join(dir, "cmd.txt");
+		const directLog = join(dir, "direct.txt");
+		writeExecutable(dir, "cmd.exe", `printf '%s' "$*" > '${cmdLog}'`);
+		writeExecutable(dir, "chrome.exe", `printf '%s' "$1" > '${directLog}'`);
+		const originalPath = process.env.PATH;
+		try {
+			process.env.PATH = `${dir}${delimiter}${originalPath ?? ""}`;
+			clearEnv();
+			mockWsl();
+			process.env.PLANNOTATOR_BROWSER = "chrome.exe";
+
+			expect(await openBrowser(URL)).toEqual({ opened: true });
+			await waitForFile(cmdLog);
+			expect(readFileSync(cmdLog, "utf8")).toContain("chrome.exe");
+			expect(existsSync(directLog)).toBe(false);
+		} finally {
+			if (originalPath === undefined) delete process.env.PATH;
+			else process.env.PATH = originalPath;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a missing configured browser warns and reports opened: false", async () => {
+		const missing = join(tmpdir(), "plannotator-missing-1472", "browser");
+		const originalWrite = process.stderr.write;
+		const chunks: string[] = [];
+		(process.stderr as { write: unknown }).write = (chunk: string) => {
+			chunks.push(String(chunk));
+			return true;
+		};
+		try {
+			clearEnv();
+			mockWsl();
+			process.env.PLANNOTATOR_BROWSER = missing;
+
+			expect(await openBrowser(URL)).toEqual({ opened: false });
+			const warning = chunks.join("");
+			expect(warning).toContain(missing);
+			expect(warning).toContain("PLANNOTATOR_BROWSER");
+		} finally {
+			(process.stderr as { write: unknown }).write = originalWrite;
+		}
+	});
+
+	test("Windows targets are excluded from POSIX routing", () => {
+		expect(isPosixBrowserTarget("/usr/bin/firefox")).toBe(true);
+		expect(isPosixBrowserTarget("chrome.exe")).toBe(false);
+		expect(isPosixBrowserTarget("/mnt/c/Program Files/Chrome/chrome.exe")).toBe(false);
 	});
 });

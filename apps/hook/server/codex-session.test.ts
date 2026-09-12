@@ -7,10 +7,16 @@
  */
 
 import { describe, expect, test, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findCodexRolloutByThreadId, getLastCodexMessage, getLatestCodexPlan } from "./codex-session";
+import {
+  findCodexRolloutByThreadId,
+  findCodexRolloutsByThreadId,
+  getLastCodexMessage,
+  getLatestCodexPlan,
+  getRecentCodexMessages,
+} from "./codex-session";
 
 // --- Fixture Helpers ---
 
@@ -180,6 +186,282 @@ describe("findCodexRolloutByThreadId", () => {
       if (prev === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = prev;
     }
+  });
+});
+
+// --- Multi-rollout threads (#1367) ---
+
+/**
+ * One Codex thread can span several rollout files. Fallback semantics differ
+ * by consumer: annotate-last asks a THREAD-level question and walks the
+ * candidates newest-first until one yields a message (the newest segment may
+ * be empty or aborted), while the Stop hook asks a TURN-level question and
+ * takes only the first existing candidate — the current turn cannot live in
+ * an older segment, so a fallback file's plan is stale by construction.
+ * These tests pin both contracts.
+ */
+describe("multi-rollout threads (#1367)", () => {
+  const THREAD_ID = "0196f8a2-1111-2222-3333-1234567890ab";
+
+  function withCodexHome<T>(home: string, fn: () => T): T {
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      return fn();
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+    }
+  }
+
+  function sessionsHome(): string {
+    const home = mkdtempSync(join(tmpdir(), "plannotator-codex-home-"));
+    tempFiles.push(home);
+    return home;
+  }
+
+  /**
+   * Write a rollout segment into <home>/sessions/<date>/ with an exact mtime.
+   * Segmented threads use issue-realistic `_<segment>`-suffixed filenames:
+   *   rollout-<timestamp>-<thread-id>_<segment>.jsonl (#1367)
+   */
+  function writeSegment(
+    home: string,
+    date: { year: string; month: string; day: string },
+    stamp: string,
+    content: string,
+    mtimeIso: string,
+    segment?: number
+  ): string {
+    const dayDir = join(home, "sessions", date.year, date.month, date.day);
+    mkdirSync(dayDir, { recursive: true });
+    const suffix = segment === undefined ? "" : `_${segment}`;
+    const path = join(dayDir, `rollout-${stamp}-${THREAD_ID}${suffix}.jsonl`);
+    writeFileSync(path, content);
+    const mtime = new Date(mtimeIso);
+    utimesSync(path, mtime, mtime);
+    return path;
+  }
+
+  /** Mirrors the annotate-last selection in index.ts. */
+  function resolveLastMessage(home: string): string | null {
+    return withCodexHome(home, () => {
+      for (const rollout of findCodexRolloutsByThreadId(THREAD_ID)) {
+        const recent = getRecentCodexMessages(rollout, 25, { beforeActiveTurn: true });
+        if (recent.length > 0) return recent[0].text;
+      }
+      return null;
+    });
+  }
+
+  /**
+   * Mirrors the Stop-hook plan selection in index.ts: the Stop hook asks a
+   * TURN-level question, and the current turn can only live in the newest
+   * segment, so only the first EXISTING candidate is consulted — never a
+   * fallback across segments (a fallback file's plan is stale by
+   * construction and would reopen already-decided plan reviews).
+   */
+  function resolvePlan(
+    home: string,
+    options: { turnId?: string; stopHookActive?: boolean } = {}
+  ): string | null {
+    return withCodexHome(home, () => {
+      const rollout =
+        findCodexRolloutsByThreadId(THREAD_ID).find((path) => existsSync(path)) ?? null;
+      if (!rollout) return null;
+      const plan = getLatestCodexPlan(rollout, {
+        turnId: options.turnId,
+        stopHookActive: !!options.stopHookActive,
+      });
+      return plan?.text ?? null;
+    });
+  }
+
+  test("same day: falls back to an older segment when the newest is empty", () => {
+    const home = sessionsHome();
+    const day = { year: "2026", month: "06", day: "04" };
+    const older = writeSegment(
+      home,
+      day,
+      "2026-06-04T10-00-00",
+      buildRollout(sessionMeta(), userMessage("Hello"), assistantMessage("Older segment answer")),
+      "2026-06-04T10:00:00Z"
+    );
+    const newer = writeSegment(
+      home,
+      day,
+      "2026-06-04T11-00-00",
+      buildRollout(sessionMeta(), userMessage("Hello")),
+      "2026-06-04T11:00:00Z",
+      1
+    );
+
+    withCodexHome(home, () => {
+      expect(findCodexRolloutsByThreadId(THREAD_ID)).toEqual([newer, older]);
+      expect(findCodexRolloutByThreadId(THREAD_ID)).toBe(newer);
+    });
+    expect(resolveLastMessage(home)).toBe("Older segment answer");
+  });
+
+  test("newest-first ordering follows mtime, not directory or filename order", () => {
+    const home = sessionsHome();
+    // The newer-mtime segment sits in the EARLIER day directory with the
+    // lexicographically SMALLER filename, so both the reverse directory walk
+    // and any filename/readdir ordering would put it LAST. Only the mtime
+    // sort ranks it first — this fixture fails if that sort is neutered.
+    const newerMtime = writeSegment(
+      home,
+      { year: "2026", month: "06", day: "04" },
+      "2026-06-04T08-00-00",
+      buildRollout(sessionMeta(), assistantMessage("Newest by mtime")),
+      "2026-06-06T12:00:00Z"
+    );
+    const olderMtime = writeSegment(
+      home,
+      { year: "2026", month: "06", day: "05" },
+      "2026-06-05T09-00-00",
+      buildRollout(sessionMeta(), assistantMessage("Older by mtime")),
+      "2026-06-05T09:00:00Z",
+      1
+    );
+
+    withCodexHome(home, () => {
+      expect(findCodexRolloutsByThreadId(THREAD_ID)).toEqual([newerMtime, olderMtime]);
+      expect(findCodexRolloutByThreadId(THREAD_ID)).toBe(newerMtime);
+    });
+    expect(resolveLastMessage(home)).toBe("Newest by mtime");
+  });
+
+  test("0-byte newest segment falls back for annotate-last", () => {
+    const home = sessionsHome();
+    const day = { year: "2026", month: "06", day: "04" };
+    writeSegment(
+      home,
+      day,
+      "2026-06-04T10-00-00",
+      buildRollout(sessionMeta(), assistantMessage("Answer before the crash")),
+      "2026-06-04T10:00:00Z"
+    );
+    // An aborted segment can be created and never written to.
+    writeSegment(home, day, "2026-06-04T11-00-00", "", "2026-06-04T11:00:00Z", 1);
+
+    expect(resolveLastMessage(home)).toBe("Answer before the crash");
+  });
+
+  test("multi day: falls back across day directories", () => {
+    const home = sessionsHome();
+    const older = writeSegment(
+      home,
+      { year: "2026", month: "06", day: "04" },
+      "2026-06-04T22-00-00",
+      buildRollout(sessionMeta(), assistantMessage("Reply from the previous day")),
+      "2026-06-04T22:00:00Z"
+    );
+    const newer = writeSegment(
+      home,
+      { year: "2026", month: "06", day: "05" },
+      "2026-06-05T09-00-00",
+      buildRollout(sessionMeta(), userMessage("Resumed")),
+      "2026-06-05T09:00:00Z",
+      1
+    );
+
+    withCodexHome(home, () => {
+      expect(findCodexRolloutsByThreadId(THREAD_ID)).toEqual([newer, older]);
+    });
+    expect(resolveLastMessage(home)).toBe("Reply from the previous day");
+  });
+
+  test("single rollout thread is unchanged", () => {
+    const home = sessionsHome();
+    const only = writeSegment(
+      home,
+      { year: "2026", month: "06", day: "04" },
+      "2026-06-04T10-00-00",
+      buildRollout(sessionMeta(), assistantMessage("Only answer")),
+      "2026-06-04T10:00:00Z"
+    );
+
+    withCodexHome(home, () => {
+      expect(findCodexRolloutsByThreadId(THREAD_ID)).toEqual([only]);
+      expect(findCodexRolloutByThreadId(THREAD_ID)).toBe(only);
+      expect(findCodexRolloutsByThreadId("no-such-thread")).toEqual([]);
+    });
+    expect(resolveLastMessage(home)).toBe("Only answer");
+  });
+
+  test("single empty rollout still reports no message", () => {
+    const home = sessionsHome();
+    writeSegment(
+      home,
+      { year: "2026", month: "06", day: "04" },
+      "2026-06-04T10-00-00",
+      buildRollout(sessionMeta(), userMessage("Hello")),
+      "2026-06-04T10:00:00Z"
+    );
+
+    expect(resolveLastMessage(home)).toBeNull();
+  });
+
+  test("Stop hook takes only the newest existing segment — never resurrects an older segment's plan", () => {
+    const home = sessionsHome();
+    const day = { year: "2026", month: "06", day: "04" };
+    // The older segment ends with an already-decided proposed plan — the
+    // normal shape after a plan is approved and the session resumes. The
+    // current turn lives in the newest segment and produced no plan, so the
+    // Stop hook must report no plan rather than fall back and reopen the
+    // settled review (getLatestCodexPlan's turn gate degrades to
+    // last-turn-in-file when the turn_id is absent from a file, which is
+    // exactly what happens in every fallback file).
+    writeSegment(
+      home,
+      day,
+      "2026-06-04T10-00-00",
+      buildRollout(
+        sessionMeta(),
+        turnStarted("turn-1"),
+        assistantMessage("<proposed_plan>\nAlready-decided plan\n</proposed_plan>")
+      ),
+      "2026-06-04T10:00:00Z"
+    );
+    writeSegment(
+      home,
+      day,
+      "2026-06-04T11-00-00",
+      buildRollout(sessionMeta(), turnStarted("turn-2"), assistantMessage("No plan here.")),
+      "2026-06-04T11:00:00Z",
+      1
+    );
+
+    expect(resolvePlan(home, { turnId: "turn-2", stopHookActive: false })).toBeNull();
+  });
+
+  test("Stop hook still reads the plan from the newest segment", () => {
+    const home = sessionsHome();
+    const day = { year: "2026", month: "06", day: "04" };
+    writeSegment(
+      home,
+      day,
+      "2026-06-04T10-00-00",
+      buildRollout(sessionMeta(), turnStarted("turn-1"), assistantMessage("Earlier work.")),
+      "2026-06-04T10:00:00Z"
+    );
+    writeSegment(
+      home,
+      day,
+      "2026-06-04T11-00-00",
+      buildRollout(
+        sessionMeta(),
+        turnStarted("turn-2"),
+        assistantMessage("<proposed_plan>\nCurrent turn plan\n</proposed_plan>")
+      ),
+      "2026-06-04T11:00:00Z",
+      1
+    );
+
+    expect(resolvePlan(home, { turnId: "turn-2", stopHookActive: false })).toBe(
+      "Current turn plan"
+    );
   });
 });
 

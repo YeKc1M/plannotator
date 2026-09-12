@@ -11,7 +11,7 @@
 
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
 import type { Origin } from "@plannotator/shared/agents";
-import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, getVcsDiffFingerprint, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext, detectRemoteDefaultCompareTarget, vcsOwnsDiffType, vcsSupportsSnapshot, materializeVcsSnapshot, gitRuntime } from "./vcs";
+import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, getVcsDiffFingerprint, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext, detectRemoteDefaultCompareTarget, resolveAvailableDiffType, vcsOwnsDiffType, vcsSupportsSnapshot, materializeVcsSnapshot, gitRuntime } from "./vcs";
 import { basename } from "node:path";
 import { existsSync } from "node:fs";
 import { SingleFlight } from "@plannotator/shared/single-flight";
@@ -177,6 +177,23 @@ export interface ReviewServerOptions {
    * prompts stay consistent with the patch that's already on screen.
    */
   initialBase?: string;
+  /**
+   * The caller pinned `initialBase` deliberately (a `--base` flag / an
+   * explicit programmatic choice), not merely as the base its initial patch
+   * happened to use. Seeds `baseExplicitlyChosen`: canonicalization off,
+   * startup upgrade suppressed. Additive and opt-in — Pi's plain
+   * forward-the-local-name-and-let-it-upgrade behavior is unchanged without
+   * it.
+   */
+  initialBaseExplicit?: boolean;
+  /**
+   * The caller pinned this session's opening diff type and/or base (CLI
+   * flags). Echoed on `/api/diff` so the client must not auto-switch the diff
+   * on mount, and must not consume the one-time review-setup cookie: the
+   * caller already answered that question for this session, and the answer is
+   * deliberately not persisted.
+   */
+  openStatePinned?: boolean;
   /** Freshness token captured atomically with the initial provider patch. */
   initialFingerprint?: string;
   /** Whether URL sharing is enabled (default: true) */
@@ -401,8 +418,9 @@ export async function startReviewServer(
   // switch body). Disables the bare-local-name → origin/* canonicalization:
   // the picker offers local and remote refs as distinct choices, so an
   // explicit local pick must be honored even when the two point at
-  // different commits.
-  let baseExplicitlyChosen = false;
+  // different commits. A caller-pinned base (`--base` via
+  // initialBaseExplicit) seeds it for the same reason.
+  let baseExplicitlyChosen = options.initialBaseExplicit === true;
 
   // --- PR local checkout resolution -----------------------------------------
   // The pool's initial entry may still be warming up: the checkout is built in
@@ -679,7 +697,10 @@ export async function startReviewServer(
       async (remote) => {
         if (remote && !baseEverSwitched && currentBase !== remote) {
           const localName = remote.replace(/^origin\//, "");
-          if (!options.initialBase || currentBase === localName) {
+          // An explicitly-pinned base (`--base main`) means the LOCAL ref on
+          // purpose — never upgrade it, even when it is the default's bare
+          // local name. Unpinned forwarded local names keep upgrading.
+          if (!options.initialBaseExplicit && (!options.initialBase || currentBase === localName)) {
             // Rebuild the diff for the upgraded base BEFORE swapping it in, and
             // commit base+patch+ref+fingerprint together — otherwise the initial
             // patch (built against the old base by the caller) would be served
@@ -2059,6 +2080,9 @@ export async function startReviewServer(
               gitContext: hasLocalAccess ? servedGitContext : undefined,
               sharingEnabled,
               approvalNotesSupported,
+              // Mount is the only place the pin matters, so it rides /api/diff
+              // alone (not the switch endpoints).
+              ...(options.openStatePinned && { openStatePinned: true }),
               shareBaseUrl,
               repoInfo,
               isWSL: wslFlag,
@@ -2443,6 +2467,11 @@ export async function startReviewServer(
               // (diff-type switches, refreshes) must not re-canonicalize it.
               const nextBaseExplicitlyChosen = baseExplicitlyChosen ||
                 (body.explicitBase === true && !!requestedBase);
+              const requestedDiffType = newDiffType as DiffType;
+              const availability = clientGitContext
+                ? resolveAvailableDiffType(clientGitContext, requestedDiffType, nextBaseExplicitlyChosen)
+                : { diffType: requestedDiffType };
+              newDiffType = availability.diffType;
               const base = resolveReviewBase(
                 requestedBase,
                 nextBaseExplicitlyChosen,
@@ -2532,8 +2561,34 @@ export async function startReviewServer(
               baseBehindRemote = nextBaseBehindRemote;
               currentError = result.error;
               draftKey = contentHash(currentPatch);
+              // Session-context adoption is provider-scoped: gitbutler (as
+              // before this change) because its stack topology is the
+              // context, and jj so the jj-line availability/fallback stays
+              // fresh across reloads. Plain git keeps the launch-frozen
+              // session context — currentBranch labels the launch cwd in
+              // WorktreePicker and the feedback branch label, and adopting a
+              // switched worktree's recomputed context here would repoint
+              // those on the next reload.
+              const adoptContext =
+                updatedContext !== undefined &&
+                (sessionVcsType === "gitbutler" || sessionVcsType === "jj");
+              const nextClientContext = adoptContext
+                ? updatedContext
+                : clientGitContext;
+              if (nextClientContext) {
+                clientGitContext = {
+                  ...nextClientContext,
+                  diffFallback: availability.fallback
+                    ? {
+                        requestedDiffType,
+                        effectiveDiffType: newDiffType,
+                        message: availability.fallback.message,
+                        candidates: availability.fallback.candidates,
+                      }
+                    : undefined,
+                };
+              }
               if (updatedContext && sessionVcsType === "gitbutler") {
-                clientGitContext = updatedContext;
                 currentContextRevision = updatedContextRevision ?? "";
               }
               captureDiffFingerprint(result.fingerprint);
@@ -2556,7 +2611,22 @@ export async function startReviewServer(
                 ...(commitInfo && { commitInfo }),
                 ...(generatedFiles && { generatedFiles }),
                 ...(baseBehindRemote && { baseBehindRemote: true }),
-                ...(updatedContext && { gitContext: updatedContext }),
+                // The response still carries a transiently recomputed context
+                // (worktree switches on plain git) even when the session did
+                // not adopt it — matching the pre-jj-line behavior.
+                // Emitted only when a context was actually recomputed: on a
+                // same-cwd commit:<sha> switch (recompute skipped) the client
+                // keeps what it has. Echoing the launch-frozen session context
+                // here would revert the base picker and commit-baseline list
+                // on every Commits-rail click.
+                ...(updatedContext
+                  ? {
+                      gitContext: {
+                        ...updatedContext,
+                        diffFallback: clientGitContext?.diffFallback,
+                      },
+                    }
+                  : {}),
                 ...(currentError && { error: currentError }),
                 semanticDiff: switchSemanticDiff,
                 callFlow: switchCallFlow,

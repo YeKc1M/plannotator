@@ -2,8 +2,8 @@ name: Sync upstream into feature branch
 
 on:
   schedule:
-    # 23:22 UTC = 07:22 Beijing time (UTC+8), daily
-    - cron: '22 23 * * *'
+    # 21:22 UTC = 05:22 Beijing time (UTC+8), daily
+    - cron: '22 21 * * *'
   workflow_dispatch:
 
 permissions:

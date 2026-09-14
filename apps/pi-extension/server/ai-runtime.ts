@@ -105,7 +105,19 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 					cwd,
 					kimiExecutablePath: kimiPath,
 				} as any);
-				registry.register(provider);
+				const providerId = registry.register(provider);
+				// Deferred like Codex: fetchModels spawns `kimi acp`, so it must
+				// NOT run eagerly at startup. The initializer runs on first explicit
+				// activation (?activate= from the model picker) or first kimi
+				// session.
+				if (provider && "fetchModels" in provider) {
+					providerInitializers.set(
+						providerId,
+						ai.createBestEffortOnce(
+							() => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
+						),
+					);
+				}
 			}
 		} catch {
 			// Kimi CLI not available.

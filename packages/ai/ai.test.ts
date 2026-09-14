@@ -1871,116 +1871,214 @@ describe("mapOpenCodeEvent", () => {
 });
 
 // ---------------------------------------------------------------------------
-// mapKimiStreamJsonLine
+// Kimi ACP update mapping (pure)
 // ---------------------------------------------------------------------------
 
-import { KimiCliProvider, mapKimiStreamJsonLine } from "./providers/kimi-cli.ts";
+import {
+  AcpRpcError,
+  KimiCliProvider,
+  describeAcpError,
+  mapAcpPermissionRequest,
+  mapAcpSessionUpdate,
+} from "./providers/kimi-cli.ts";
 
-describe("mapKimiStreamJsonLine", () => {
-  test("assistant content maps to text_delta", () => {
-    const result = mapKimiStreamJsonLine(
-      JSON.stringify({ role: "assistant", content: "Hello from Kimi" }),
-    );
-    expect(result).toEqual([{ type: "text_delta", delta: "Hello from Kimi" }]);
+describe("mapAcpSessionUpdate", () => {
+  const SESSION_ID = "acp-session-1";
+
+  test("agent_message_chunk maps to text_delta", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } },
+        SESSION_ID,
+      ),
+    ).toEqual([{ type: "text_delta", delta: "Hello" }]);
   });
 
-  test("assistant tool_calls map to tool_use with parsed arguments", () => {
-    const result = mapKimiStreamJsonLine(
-      JSON.stringify({
-        role: "assistant",
-        tool_calls: [
-          {
-            type: "function",
-            id: "call_1",
-            function: { name: "read_file", arguments: '{"path":"/foo.ts"}' },
-          },
-        ],
-      }),
+  test("agent_message_chunk with empty text is ignored", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "" } },
+        SESSION_ID,
+      ),
+    ).toEqual([]);
+  });
+
+  test("agent_thought_chunk maps to thinking_delta", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hmm" } },
+        SESSION_ID,
+      ),
+    ).toEqual([{ type: "thinking_delta", delta: "hmm" }]);
+  });
+
+  test("tool_call maps to tool_use with rawInput", () => {
+    expect(
+      mapAcpSessionUpdate(
+        {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-1",
+          title: "Run command",
+          kind: "execute",
+          status: "pending",
+          rawInput: { command: "ls -la" },
+        },
+        SESSION_ID,
+      ),
+    ).toEqual([{
+      type: "tool_use",
+      toolName: "Run command",
+      toolInput: { command: "ls -la" },
+      toolUseId: "tc-1",
+    }]);
+  });
+
+  test("tool_call without a title falls back to kind", () => {
+    const result = mapAcpSessionUpdate(
+      { sessionUpdate: "tool_call", toolCallId: "tc-2", kind: "read" },
+      SESSION_ID,
     );
     expect(result).toEqual([{
       type: "tool_use",
-      toolName: "read_file",
-      toolInput: { path: "/foo.ts" },
-      toolUseId: "call_1",
+      toolName: "read",
+      toolInput: {},
+      toolUseId: "tc-2",
     }]);
   });
 
-  test("assistant message with both content and tool_calls maps to both", () => {
-    const result = mapKimiStreamJsonLine(
-      JSON.stringify({
-        role: "assistant",
-        content: "Let me check.",
-        tool_calls: [
-          { type: "function", id: "call_2", function: { name: "bash", arguments: '{"cmd":"ls"}' } },
-        ],
-      }),
-    );
-    expect(result).toEqual([
-      { type: "text_delta", delta: "Let me check." },
-      { type: "tool_use", toolName: "bash", toolInput: { cmd: "ls" }, toolUseId: "call_2" },
-    ]);
+  test("tool_call_update in progress is ignored", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "in_progress" },
+        SESSION_ID,
+      ),
+    ).toEqual([]);
   });
 
-  test("malformed tool arguments JSON passes through as raw string", () => {
-    const result = mapKimiStreamJsonLine(
-      JSON.stringify({
-        role: "assistant",
-        tool_calls: [
-          { type: "function", id: "call_3", function: { name: "bash", arguments: "{not json" } },
-        ],
-      }),
-    );
-    expect(result).toEqual([{
-      type: "tool_use",
-      toolName: "bash",
-      toolInput: { arguments: "{not json" },
-      toolUseId: "call_3",
-    }]);
+  test("tool_call_update completed maps to tool_result", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: "file.txt\n" },
+        SESSION_ID,
+      ),
+    ).toEqual([{ type: "tool_result", toolUseId: "tc-1", result: "file.txt\n" }]);
   });
 
-  test("tool line maps to tool_result", () => {
-    const result = mapKimiStreamJsonLine(
-      JSON.stringify({ role: "tool", tool_call_id: "call_1", content: "file contents" }),
-    );
-    expect(result).toEqual([{
+  test("tool_call_update failed prefixes the result with [Error]", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "failed", rawOutput: "denied" },
+        SESSION_ID,
+      ),
+    ).toEqual([{ type: "tool_result", toolUseId: "tc-1", result: "[Error] denied" }]);
+  });
+
+  test("tool_call_update with non-string rawOutput stringifies it", () => {
+    expect(
+      mapAcpSessionUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: { files: ["a.ts"] } },
+        SESSION_ID,
+      ),
+    ).toEqual([{
       type: "tool_result",
-      toolUseId: "call_1",
-      result: "file contents",
-    }]);
-  });
-
-  test("tool line with non-string content stringifies it", () => {
-    const result = mapKimiStreamJsonLine(
-      JSON.stringify({ role: "tool", tool_call_id: "call_4", content: { files: ["a.ts"] } }),
-    );
-    expect(result).toEqual([{
-      type: "tool_result",
-      toolUseId: "call_4",
+      toolUseId: "tc-1",
       result: JSON.stringify({ files: ["a.ts"] }),
     }]);
   });
 
-  test("meta lines are ignored (including session.resume_hint)", () => {
-    expect(mapKimiStreamJsonLine(
-      JSON.stringify({ role: "meta", type: "system.version", version: "0.36.1" }),
-    )).toEqual([]);
-    expect(mapKimiStreamJsonLine(
-      JSON.stringify({ role: "meta", type: "turn.step.retrying" }),
-    )).toEqual([]);
-    expect(mapKimiStreamJsonLine(
-      JSON.stringify({ role: "meta", type: "session.resume_hint", session_id: "session_x" }),
-    )).toEqual([]);
+  test("usage_update maps to a usage message", () => {
+    expect(
+      mapAcpSessionUpdate({ sessionUpdate: "usage_update", used: 1200, size: 256000 }, SESSION_ID),
+    ).toEqual([{ type: "usage", usedTokens: 1200, contextSize: 256000 }]);
   });
 
-  test("non-JSON lines and junk are skipped", () => {
-    expect(mapKimiStreamJsonLine("not json at all")).toEqual([]);
-    expect(mapKimiStreamJsonLine("")).toEqual([]);
-    expect(mapKimiStreamJsonLine(JSON.stringify({ role: "user", content: "hi" }))).toEqual([]);
+  test("informational variants are ignored", () => {
+    for (const variant of [
+      "plan",
+      "available_commands_update",
+      "config_option_update",
+      "current_mode_update",
+      "session_info_update",
+      "user_message_chunk",
+    ]) {
+      expect(mapAcpSessionUpdate({ sessionUpdate: variant }, SESSION_ID)).toEqual([]);
+    }
+  });
+
+  test("unknown variants pass through as unknown", () => {
+    const update = { sessionUpdate: "some_future_variant", extra: 1 };
+    expect(mapAcpSessionUpdate(update, SESSION_ID)).toEqual([{ type: "unknown", raw: update }]);
+  });
+
+  test("non-object updates are ignored", () => {
+    expect(mapAcpSessionUpdate(null, SESSION_ID)).toEqual([]);
+    expect(mapAcpSessionUpdate("agent_message_chunk", SESSION_ID)).toEqual([]);
+  });
+});
+
+describe("mapAcpPermissionRequest", () => {
+  test("maps the toolCall into a permission_request", () => {
+    const msg = mapAcpPermissionRequest(
+      {
+        sessionId: "acp-session-1",
+        toolCall: {
+          toolCallId: "tc-1",
+          title: "Run command",
+          kind: "execute",
+          rawInput: { command: "rm -rf build" },
+        },
+        options: [
+          { optionId: "approve_once", name: "Approve", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+      "42",
+    );
+    expect(msg).toEqual({
+      type: "permission_request",
+      requestId: "42",
+      toolName: "Run command",
+      toolInput: { command: "rm -rf build" },
+      title: "Run command",
+      toolUseId: "tc-1",
+    });
+  });
+
+  test("missing toolCall falls back to the request id and a generic name", () => {
+    const msg = mapAcpPermissionRequest({ sessionId: "acp-session-1" }, "43");
+    expect(msg.type).toBe("permission_request");
+    expect(msg.toolName).toBe("Tool");
+    expect(msg.toolInput).toEqual({});
+    expect(msg.toolUseId).toBe("43");
+  });
+});
+
+describe("describeAcpError", () => {
+  test("-32000 maps to a kimi login hint", () => {
+    expect(describeAcpError(new AcpRpcError("auth_required", -32000))).toContain("kimi login");
+  });
+
+  test("-32600 turn.agent_busy maps to a busy message", () => {
+    expect(
+      describeAcpError(new AcpRpcError("busy", -32600, { code: "turn.agent_busy" })),
+    ).toContain("previous turn");
+  });
+
+  test("-32602 maps to an unknown-session message", () => {
+    expect(describeAcpError(new AcpRpcError("unknown session", -32602))).toContain(
+      "no longer recognizes this session",
+    );
+  });
+
+  test("other RPC errors and plain errors pass their message through", () => {
+    expect(describeAcpError(new AcpRpcError("boom", -32603))).toBe("boom");
+    expect(describeAcpError(new Error("plain"))).toBe("plain");
+    expect(describeAcpError("weird")).toBe("weird");
   });
 });
 
 // ---------------------------------------------------------------------------
-// KimiCliProvider — driven by a fake `kimi` shell script
+// KimiCliProvider — driven by a fake `kimi acp` node script
 // ---------------------------------------------------------------------------
 
 import { afterEach } from "bun:test";
@@ -2000,7 +2098,148 @@ async function collectMessages(stream: AsyncIterable<AIMessage>): Promise<AIMess
   return out;
 }
 
-describe("KimiCliProvider", () => {
+/**
+ * A stand-in for `kimi acp`: newline-delimited JSON-RPC 2.0 on stdio. Logs
+ * every inbound message (plus permission answers) to __CAPTURE__ as JSONL;
+ * reads its behavior mode from __MODEFILE__ at startup so one executable can
+ * be healthy or broken across successive spawns. Prompts containing
+ * "PERMISSION" gate the turn on a session/request_permission round-trip;
+ * "SELF_DESTRUCT" exits mid-turn.
+ */
+const FAKE_KIMI_ACP = `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+
+const CAPTURE = "__CAPTURE__";
+const mode = readFileSync("__MODEFILE__", "utf8").trim();
+const record = (obj) => appendFileSync(CAPTURE, JSON.stringify(obj) + "\\n");
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const pending = new Map();
+
+const MODEL_OPTION = {
+  type: "select",
+  id: "model",
+  name: "Model",
+  category: "model",
+  currentValue: "k2",
+  options: [
+    { value: "k2", name: "K2" },
+    { value: "k2-thinking", name: "K2 Thinking", description: "Reasoning" },
+  ],
+};
+
+function handle(msg) {
+  record(msg);
+  if (msg.method === undefined) {
+    // The real ACP SDK schema-validates responses and requires jsonrpc "2.0";
+    // without it the permission request fails and the tool is rejected.
+    if (msg.jsonrpc !== "2.0") {
+      const finishBad = pending.get(msg.id);
+      if (finishBad) {
+        pending.delete(msg.id);
+        record({ permissionOutcome: "PROTOCOL_ERROR" });
+        finishBad();
+      }
+      return;
+    }
+    const finish = pending.get(msg.id);
+    if (finish) {
+      pending.delete(msg.id);
+      record({ permissionOutcome: msg.result });
+      finish();
+    }
+    return;
+  }
+  const reply = (result) => send({ id: msg.id, result });
+  const notify = (update) =>
+    send({ method: "session/update", params: { sessionId: msg.params?.sessionId, update } });
+  switch (msg.method) {
+    case "initialize":
+      if (mode === "auth-fail") {
+        send({ id: msg.id, error: { code: -32000, message: "auth_required" } });
+      } else {
+        reply({ protocolVersion: 1, agentCapabilities: {} });
+      }
+      return;
+    case "session/new":
+      // The real server schema-requires mcpServers (verified against kimi 0.42.0).
+      if (!Array.isArray(msg.params?.mcpServers)) {
+        send({ id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        return;
+      }
+      reply({ sessionId: "acp-session-1", configOptions: [MODEL_OPTION], modes: {} });
+      return;
+    case "session/fork":
+      // The real server schema-requires cwd on fork and resume.
+      if (typeof msg.params?.cwd !== "string") {
+        send({ id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        return;
+      }
+      reply({ sessionId: "acp-session-forked", configOptions: [MODEL_OPTION], modes: {} });
+      return;
+    case "session/resume":
+      if (typeof msg.params?.cwd !== "string") {
+        send({ id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        return;
+      }
+      reply({});
+      return;
+    case "session/set_config_option":
+      reply({});
+      return;
+    case "session/cancel":
+      return;
+    case "session/prompt": {
+      const text = msg.params.prompt[0].text;
+      if (text.includes("SELF_DESTRUCT")) {
+        notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial" } });
+        process.exit(1);
+      }
+      if (text.includes("PERMISSION")) {
+        pending.set(9001, () => reply({ stopReason: "end_turn" }));
+        send({
+          id: 9001,
+          method: "session/request_permission",
+          params: {
+            sessionId: msg.params.sessionId,
+            toolCall: {
+              toolCallId: "tc-1",
+              title: "Run command",
+              kind: "execute",
+              rawInput: { command: "ls" },
+            },
+            options: [
+              { optionId: "approve_once", name: "Approve", kind: "allow_once" },
+              { optionId: "reject", name: "Reject", kind: "reject_once" },
+            ],
+          },
+        });
+        return;
+      }
+      notify({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking hard" } });
+      notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "fake " } });
+      notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } });
+      notify({ sessionUpdate: "usage_update", used: 1200, size: 256000 });
+      reply({ stopReason: "end_turn" });
+      return;
+    }
+    default:
+      if (msg.id !== undefined) reply({});
+  }
+}
+
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString();
+  const lines = buf.split("\\n");
+  buf = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    handle(JSON.parse(line));
+  }
+});
+`;
+
+describe("KimiCliProvider (ACP)", () => {
   const kimiTempDirs: string[] = [];
 
   afterEach(() => {
@@ -2009,62 +2248,73 @@ describe("KimiCliProvider", () => {
     }
   });
 
-  function makeFakeKimi(script: string): { dir: string; bin: string; capture: string } {
+  function makeFakeKimi(): { dir: string; bin: string; capture: string; modeFile: string } {
     const dir = mkdtempSync(join(tmpdir(), "plannotator-fake-kimi-"));
     kimiTempDirs.push(dir);
     const bin = join(dir, "kimi");
-    const capture = join(dir, "args.txt");
-    writeFileSync(bin, script.replaceAll("__CAPTURE__", capture));
+    const capture = join(dir, "capture.jsonl");
+    const modeFile = join(dir, "mode.txt");
+    writeFileSync(modeFile, "ok");
+    writeFileSync(
+      bin,
+      FAKE_KIMI_ACP.replaceAll("__CAPTURE__", capture).replaceAll("__MODEFILE__", modeFile),
+    );
     chmodSync(bin, 0o755);
-    return { dir, bin, capture };
+    return { dir, bin, capture, modeFile };
   }
 
-  const SUCCESS_SCRIPT = `#!/bin/sh
-printf '%s\\n' "$@" > '__CAPTURE__'
-echo '{"role":"meta","type":"system.version","version":"0.0.0"}'
-echo '{"role":"assistant","content":"fake answer"}'
-echo '{"role":"meta","type":"session.resume_hint","session_id":"session_fake_1","command":"kimi -r session_fake_1"}'
-`;
+  function readCaptured(capture: string): Record<string, any>[] {
+    return readFileSync(capture, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  }
 
-  test("first query prepends preamble, resolves session id, streams messages", async () => {
+  function makeProvider(bin: string, dir: string): KimiCliProvider {
+    return new KimiCliProvider({ type: "kimi-cli", cwd: dir, kimiExecutablePath: bin });
+  }
+
+  test("streams a full turn over ACP, applies the model, resolves the session id", async () => {
     if (process.platform === "win32") return;
-    const { dir, bin, capture } = makeFakeKimi(SUCCESS_SCRIPT);
-    const provider = new KimiCliProvider({
-      type: "kimi-cli",
-      cwd: dir,
-      kimiExecutablePath: bin,
-    });
+    const { dir, bin, capture } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
     const session = await provider.createSession({
       context: { mode: "plan-review", plan: { plan: "# PREAMBLE_MARKER plan" } },
+      model: "k2-thinking",
     });
 
     const messages = await collectMessages(session.query("first question"));
 
-    expect(messages).toContainEqual({ type: "text_delta", delta: "fake answer" });
+    expect(messages).toContainEqual({ type: "thinking_delta", delta: "thinking hard" });
+    expect(messages).toContainEqual({ type: "text_delta", delta: "fake " });
+    expect(messages).toContainEqual({ type: "text_delta", delta: "answer" });
+    expect(messages).toContainEqual({ type: "usage", usedTokens: 1200, contextSize: 256000 });
     expect(messages.at(-1)).toEqual({
       type: "result",
-      sessionId: "session_fake_1",
+      sessionId: "acp-session-1",
       success: true,
     });
-    // resume_hint resolved the real session id
-    expect(session.id).toBe("session_fake_1");
+    expect(session.id).toBe("acp-session-1");
 
-    const args = readFileSync(capture, "utf8");
-    expect(args).toContain("# PREAMBLE_MARKER plan");
-    expect(args).toContain("User question: first question");
-    expect(args).toContain("--output-format\nstream-json");
-    expect(args).not.toContain("--session");
+    const captured = readCaptured(capture);
+    expect(captured.some((m) => m.method === "initialize")).toBe(true);
+    const promptReq = captured.find((m) => m.method === "session/prompt");
+    expect(promptReq.params.prompt[0].text).toContain("# PREAMBLE_MARKER plan");
+    expect(promptReq.params.prompt[0].text).toContain("User question: first question");
+    const setModel = captured.find((m) => m.method === "session/set_config_option");
+    expect(setModel.params).toMatchObject({
+      sessionId: "acp-session-1",
+      configId: "model",
+      value: "k2-thinking",
+    });
     provider.dispose();
   });
 
-  test("second query continues via --session with a bare prompt", async () => {
+  test("second query sends a bare prompt on the same wire session", async () => {
     if (process.platform === "win32") return;
-    const { dir, bin, capture } = makeFakeKimi(SUCCESS_SCRIPT);
-    const provider = new KimiCliProvider({
-      type: "kimi-cli",
-      cwd: dir,
-      kimiExecutablePath: bin,
-    });
+    const { dir, bin, capture } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
     const session = await provider.createSession({
       context: { mode: "plan-review", plan: { plan: "# PREAMBLE_MARKER plan" } },
     });
@@ -2074,63 +2324,173 @@ echo '{"role":"meta","type":"session.resume_hint","session_id":"session_fake_1",
 
     expect(messages.at(-1)).toEqual({
       type: "result",
-      sessionId: "session_fake_1",
+      sessionId: "acp-session-1",
       success: true,
     });
 
-    // The fake script overwrites the capture file on each run, so this shows
-    // only the second invocation's arguments.
-    const args = readFileSync(capture, "utf8");
-    expect(args).toContain("--session\nsession_fake_1");
-    expect(args).toContain("follow-up");
-    expect(args).not.toContain("User question:");
-    expect(args).not.toContain("PREAMBLE_MARKER");
+    const captured = readCaptured(capture);
+    const prompts = captured.filter((m) => m.method === "session/prompt");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].params.prompt[0].text).toBe("follow-up");
+    expect(captured.filter((m) => m.method === "session/new")).toHaveLength(1);
     provider.dispose();
   });
 
-  test("resumeSession binds the given id and skips the preamble", async () => {
+  test("permission requests round-trip through respondToPermission (approve and reject)", async () => {
     if (process.platform === "win32") return;
-    const { dir, bin, capture } = makeFakeKimi(SUCCESS_SCRIPT);
-    const provider = new KimiCliProvider({
-      type: "kimi-cli",
-      cwd: dir,
-      kimiExecutablePath: bin,
+    const { dir, bin, capture } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
+    const session = await provider.createSession({
+      context: { mode: "plan-review", plan: { plan: "# Plan" } },
     });
-    const session = await provider.resumeSession("session_previous_9");
-    expect(session.id).toBe("session_previous_9");
+
+    for (const allow of [true, false]) {
+      const seen: AIMessage[] = [];
+      let answered = false;
+      for await (const msg of session.query("PERMISSION please")) {
+        seen.push(msg);
+        if (msg.type === "permission_request" && !answered) {
+          answered = true;
+          session.respondToPermission(msg.requestId, allow);
+        }
+      }
+      expect(answered).toBe(true);
+      const request = seen.find((m) => m.type === "permission_request");
+      expect(request).toMatchObject({
+        type: "permission_request",
+        toolName: "Run command",
+        toolInput: { command: "ls" },
+        title: "Run command",
+        toolUseId: "tc-1",
+      });
+      expect(seen.at(-1)).toEqual({
+        type: "result",
+        sessionId: "acp-session-1",
+        success: true,
+      });
+    }
+
+    const outcomes = readCaptured(capture)
+      .filter((m) => m.permissionOutcome)
+      .map((m) => m.permissionOutcome);
+    expect(outcomes).toEqual([
+      { outcome: { outcome: "selected", optionId: "approve_once" } },
+      { outcome: { outcome: "selected", optionId: "reject" } },
+    ]);
+    provider.dispose();
+  });
+
+  test("resumeSession reattaches via session/resume without a preamble", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, capture } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
+    const session = await provider.resumeSession("acp-session-old");
+    expect(session.id).toBe("acp-session-old");
 
     await collectMessages(session.query("hi again"));
 
-    const args = readFileSync(capture, "utf8");
-    expect(args).toContain("--session\nsession_previous_9");
-    expect(args).not.toContain("User question:");
+    const captured = readCaptured(capture);
+    expect(
+      captured.some((m) => m.method === "session/resume" && m.params?.sessionId === "acp-session-old"),
+    ).toBe(true);
+    expect(captured.some((m) => m.method === "session/new")).toBe(false);
+    const promptReq = captured.find((m) => m.method === "session/prompt");
+    expect(promptReq.params.prompt[0].text).toBe("hi again");
     provider.dispose();
   });
 
-  test("non-zero exit yields an error with the stderr tail", async () => {
+  test("forkSession forks the parent session over ACP", async () => {
     if (process.platform === "win32") return;
-    const { dir, bin } = makeFakeKimi(`#!/bin/sh
-echo 'not logged in: run kimi auth login' >&2
-exit 1
-`);
-    const provider = new KimiCliProvider({
-      type: "kimi-cli",
-      cwd: dir,
-      kimiExecutablePath: bin,
+    const { dir, bin, capture } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
+    const session = await provider.forkSession({
+      context: {
+        mode: "plan-review",
+        plan: { plan: "# Plan" },
+        parent: { sessionId: "acp-parent-1", cwd: dir },
+      },
     });
+    expect(session.parentSessionId).toBe("acp-parent-1");
+
+    const messages = await collectMessages(session.query("question"));
+
+    expect(session.id).toBe("acp-session-forked");
+    expect(messages.at(-1)).toEqual({
+      type: "result",
+      sessionId: "acp-session-forked",
+      success: true,
+    });
+    const captured = readCaptured(capture);
+    expect(
+      captured.some((m) => m.method === "session/fork" && m.params?.sessionId === "acp-parent-1"),
+    ).toBe(true);
+    provider.dispose();
+  });
+
+  test("a mid-turn process exit is a clean provider failure and the next query re-spawns", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, capture } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
+    const session = await provider.createSession({
+      context: { mode: "plan-review", plan: { plan: "# Plan" } },
+    });
+
+    const failed = await collectMessages(session.query("SELF_DESTRUCT now"));
+    expect(failed).toContainEqual({ type: "text_delta", delta: "partial" });
+    expect(failed.some((m) => m.type === "error" && m.code === "provider_error")).toBe(true);
+    expect(failed.some((m) => m.type === "result")).toBe(false);
+
+    // The process is dead; the next query re-spawns and resumes the wire session.
+    const recovered = await collectMessages(session.query("recovered?"));
+    expect(recovered.at(-1)).toEqual({
+      type: "result",
+      sessionId: "acp-session-1",
+      success: true,
+    });
+    const captured = readCaptured(capture);
+    expect(
+      captured.some((m) => m.method === "session/resume" && m.params?.sessionId === "acp-session-1"),
+    ).toBe(true);
+    provider.dispose();
+  });
+
+  test("an auth failure during the handshake maps to a kimi login hint", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, modeFile } = makeFakeKimi();
+    writeFileSync(modeFile, "auth-fail");
+    const provider = makeProvider(bin, dir);
     const session = await provider.createSession({
       context: { mode: "plan-review", plan: { plan: "# Plan" } },
     });
 
     const messages = await collectMessages(session.query("hello"));
 
-    const error = messages.find((m) => m.type === "error");
-    expect(error).toMatchObject({
-      type: "error",
-      code: "kimi_exit_error",
-    });
-    expect(error && "error" in error && error.error).toContain("not logged in");
+    expect(
+      messages.some((m) => m.type === "error" && m.error.includes("kimi login")),
+    ).toBe(true);
     expect(messages.some((m) => m.type === "result")).toBe(false);
     provider.dispose();
+  });
+
+  test("fetchModels populates models from session/new configOptions, keeps fallback on failure", async () => {
+    if (process.platform === "win32") return;
+    const { dir, bin, modeFile } = makeFakeKimi();
+    const provider = makeProvider(bin, dir);
+    expect(provider.models).toEqual([]);
+
+    await provider.fetchModels();
+    expect(provider.models).toEqual([
+      { id: "k2", label: "K2", default: true },
+      { id: "k2-thinking", label: "K2 Thinking" },
+    ]);
+
+    // A failing agent leaves the previously loaded list alone.
+    writeFileSync(modeFile, "auth-fail");
+    const failing = makeProvider(bin, dir);
+    await failing.fetchModels();
+    expect(failing.models).toEqual([]);
+
+    provider.dispose();
+    failing.dispose();
   });
 });

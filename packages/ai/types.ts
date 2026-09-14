@@ -27,6 +27,19 @@ export interface AITextDeltaMessage {
   delta: string;
 }
 
+export interface AIThinkingDeltaMessage {
+  type: "thinking_delta";
+  delta: string;
+}
+
+export interface AIUsageMessage {
+  type: "usage";
+  /** Tokens of the context window currently in use. */
+  usedTokens: number;
+  /** Total context window size in tokens. */
+  contextSize: number;
+}
+
 export interface AIToolUseMessage {
   type: "tool_use";
   toolName: string;
@@ -78,6 +91,8 @@ export interface AIUnknownMessage {
 export type AIMessage =
   | AITextMessage
   | AITextDeltaMessage
+  | AIThinkingDeltaMessage
+  | AIUsageMessage
   | AIToolUseMessage
   | AIToolResultMessage
   | AIErrorMessage

@@ -690,6 +690,13 @@ export const BRIDGE_SCRIPT = `(function() {
       scrollToAnnotation(e.data.id, e.data.behavior === 'auto' ? 'auto' : 'smooth');
     }
 
+    else if (type === PREFIX + 'scroll-to-fragment') {
+      // A linked document opened from an in-page link carried a #fragment.
+      // The srcdoc document has no URL of its own, so the parent cannot set
+      // one: it replays the fragment here once the new document is ready.
+      scrollToLocalFragment(typeof e.data.fragment === 'string' ? e.data.fragment : '');
+    }
+
     else if (type === PREFIX + 'focus-mark') {
       focusAnnotationRecord(typeof e.data.id === 'string' ? e.data.id : null, false);
     }
@@ -2741,8 +2748,9 @@ export const BRIDGE_SCRIPT = `(function() {
   // Constraints (the "smart" part is that they adapt to the element):
   // - attributes are an ALLOWLIST (a page cannot add a key); no form values,
   //   no on* handlers, no style, no script/style/template contents ever;
-  // - absolute http(s) URLs lose their query and fragment (tokens live
-  //   there), data: URIs keep only their media-type prefix;
+  // - href/src URLs lose their query and fragment (tokens live there),
+  //   relative ones included, and data: URIs keep only their media-type
+  //   prefix;
   // - the outline tries two levels of children, falls back to one, then to a
   //   per-tag count, whichever first fits CTX_MAX_OUTLINE, so a click on a
   //   whole <main> costs the same bytes as a click on a chip;
@@ -2792,7 +2800,10 @@ export const BRIDGE_SCRIPT = `(function() {
   }
 
   // URL attribute values: keep what locates the element in source, drop
-  // what identifies the user. Relative URLs are route state and stay whole.
+  // what identifies the user. The path survives in every form; the query and
+  // the fragment never do — a relative URL carries the same per-visit state an
+  // absolute one does (session ids, and the implicit-flow tokens that live in
+  // the fragment specifically), so it is scrubbed the same way.
   function ctxScrubUrl(value) {
     var v = String(value).trim();
     if (/^javascript:/i.test(v)) return null;
@@ -2806,6 +2817,8 @@ export const BRIDGE_SCRIPT = `(function() {
         return u.origin + u.pathname + (u.search || u.hash ? '?…' : '');
       } catch (ex) { return ctxTruncate(v, CTX_MAX_ATTR_VALUE); }
     }
+    var mark = v.search(/[?#]/);
+    if (mark >= 0) return v.slice(0, mark) + '?…';
     return v;
   }
 
@@ -3504,6 +3517,74 @@ export const BRIDGE_SCRIPT = `(function() {
     return true;
   }
 
+  // --- Local-site link navigation (srcdoc sessions only) ---
+  // A srcdoc document has no URL of its own: its base URL is the PARENT page's,
+  // which is the Plannotator server. So a plain link to 02-detail.html resolves
+  // to http://localhost:<port>/02-detail.html, the server's catch-all answers
+  // with the app itself, and the whole editor renders inside the annotated
+  // frame. An in-page #section link is a cross-document navigation for the
+  // same reason.
+  //
+  // The frame therefore never navigates itself. In-page fragments scroll here;
+  // everything else is handed to the parent, which owns resolution against the
+  // current document's directory and is the trust boundary for the href.
+  // Registered BEFORE the pinpoint handler and never stopping propagation, so
+  // an armed click still pins the link element exactly as it always did.
+  //
+  // Live app sessions are excluded outright: they navigate a real origin
+  // through the proxy, which is the whole point of that surface.
+  function scrollToLocalFragment(rawId) {
+    var id = typeof rawId === 'string' ? rawId : '';
+    try { id = decodeURIComponent(id); } catch (ex) {}
+    if (!id) {
+      try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (ex) { window.scrollTo(0, 0); }
+      return true;
+    }
+    var target = null;
+    try { target = document.getElementById(id); } catch (ex) {}
+    if (!target) {
+      var named = document.getElementsByName(id);
+      if (named && named.length) target = named[0];
+    }
+    if (!target) return false;
+    try { target.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    catch (ex) { target.scrollIntoView(); }
+    return true;
+  }
+
+  function navigableLinkHref(node) {
+    var el = node && node.nodeType === 1 ? node : node && node.parentElement;
+    if (!el || !el.closest) return '';
+    var link = el.closest('a,area');
+    if (!link) return '';
+    var raw = link.getAttribute('href');
+    // SVG anchors may only carry xlink:href.
+    if (typeof raw !== 'string') raw = link.getAttribute('xlink:href');
+    return typeof raw === 'string' ? raw.trim() : '';
+  }
+
+  if (!LIVE) {
+    document.addEventListener('click', function(e) {
+      if (e.defaultPrevented || e.button !== 0) return;
+      if (isViewerOverlayNode(e.target)) return; // markers own their clicks
+      var raw = navigableLinkHref(e.target);
+      if (!raw) return;
+      // The page's own scripting, not a navigation: leave it alone.
+      if (/^javascript:/i.test(raw)) return;
+      if (raw.charAt(0) === '#') {
+        e.preventDefault();
+        scrollToLocalFragment(raw.slice(1));
+        return;
+      }
+      e.preventDefault();
+      // Armed pinpoint: the click belongs to annotation, and the capture-phase
+      // pinpoint handler below is about to pin this element. Navigation is
+      // already suppressed above, which is all this surface owes the click.
+      if (annotateModeActive && currentInputMethod === 'pinpoint') return;
+      postToParent({ type: PREFIX + 'link-click', href: raw.slice(0, 2048) });
+    }, true);
+  }
+
   document.addEventListener('click', function(e) {
     if (!annotateModeActive || currentInputMethod !== 'pinpoint') return;
     // Real placed markers (and any other viewer overlay) own their clicks —
@@ -3579,15 +3660,21 @@ export const BRIDGE_SCRIPT = `(function() {
     }
   });
 
-  // Mod+Shift+A toggles Interact/Annotate from inside the iframe (the parent
-  // registers the same chord, but focus usually lives in here on live apps).
-  // Capture phase so the page cannot swallow the reserved chord; the parent
-  // answers with set-annotate-mode.
+  // The two reserved header chords, mirrored from inside the iframe (the
+  // parent registers both, but focus usually lives in here on live apps):
+  // Mod+Shift+A toggles Interact/Annotate, Mod+Shift+X shows/hides the
+  // floating tools over the page. Capture phase so the page cannot swallow
+  // them; the parent owns both states and answers annotate with
+  // set-annotate-mode. Disarming tears down any pending draft through that
+  // same set-annotate-mode(false) handler, exactly as Esc does.
   document.addEventListener('keydown', function(e) {
     if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.altKey) return;
-    if (e.key !== 'a' && e.key !== 'A') return;
+    var message = null;
+    if (e.key === 'a' || e.key === 'A') message = 'annotate-toggle';
+    else if (e.key === 'x' || e.key === 'X') message = 'tools-toggle';
+    if (!message) return;
     e.preventDefault();
-    postToParent({ type: PREFIX + 'annotate-toggle' });
+    postToParent({ type: PREFIX + message });
   }, true);
 
   // Author opt-in: a plain click on any element tagged [data-annotate] pops the

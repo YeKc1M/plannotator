@@ -12,6 +12,8 @@ steps to ensure your changes work correctly.
 5. [Decision Control Manual Checklist](#decision-control-manual-checklist)
 6. [WebMCP Manual Checklist](#webmcp-manual-checklist)
 7. [Terminal-Tools Announcement Manual Checklist](#terminal-tools-announcement-manual-checklist)
+8. [HTML Sibling-Link Manual Checklist](#html-sibling-link-manual-checklist)
+9. [Cross-File Annotations Manual Checklist](#cross-file-annotations-manual-checklist)
 
 ---
 
@@ -420,6 +422,34 @@ which is the regression class this control exists to fix).
    (empty state) and from the General section header; creating one flips the header control to
    `Send Feedback`.
 
+## HTML Surface Header Manual Checklist
+
+Not CI. Run `plannotator annotate <file>.html` in a browser profile with no
+`plannotator-html-chrome` cookie (a fresh profile, or clear that cookie).
+
+1. **Opens with the tools hidden.** The page fills the viewport: no sidebar
+   tongue tabs on the left, no comment/attachments cluster top-right, and no
+   flash of either during load. The header eye shows its "hidden" (eye-off)
+   icon and reports `aria-pressed="true"`.
+2. **The eye is the way back.** Click it: the tongue tabs and the cluster
+   appear, the icon flips, and the version-diff "Show changes" control (when
+   the file has a previous version) is in that cluster. Reload: the tools are
+   still showing — a fresh cookie beats the hidden default. Hide them again
+   and reload: still hidden.
+3. **Toggle chords.** `Mod+Shift+A` drops the surface to Interact (pen
+   unpressed, clicks reach the page) and pressing it again re-arms — including
+   with focus inside the framed page, which is the case Esc cannot undo.
+   `Mod+Shift+X` flips the tools from either document. Open a comment draft,
+   then press `Mod+Shift+A`: the draft closes with the disarm, like Esc.
+4. **Tooltips.** Hover the eye, the pen and Refresh: each shows its
+   description over its shortcut as keycaps (⌘⇧X / Ctrl+Shift+X for the eye,
+   ⌘⇧A / Ctrl+Shift+A for the pen, no key row for Refresh), positioned below
+   the button, in both light and dark. Tab to each control: the same tooltip
+   opens on keyboard focus. No native `title` box appears on top of it.
+5. **Compact/touch** (DevTools device mode). No header eye or pen; the Options
+   menu reads "Show tools" on a fresh session and flips to "Hide tools" after
+   it is used.
+
 ## WebMCP Manual Checklist
 
 Not CI. Run this in Chrome or Edge with the API on: `chrome://flags/#enable-webmcp-testing`, or launch with `--enable-features=WebMCPTesting`. Use a fresh profile so the first-run dialogs and a recovered draft do not get in the way. The Model Context Tool Inspector extension can call tools too, but the page console is enough: `const tools = await document.modelContext.getTools()` lists them, and `JSON.parse(await document.modelContext.executeTool(tools.find((t) => t.name === 'plannotator.read_document'), {}))` calls one.
@@ -479,6 +509,90 @@ not hand the turn to an earlier dialog.
 8. **Theme and width.** Toggle light/dark: the panel chrome follows the active palette around
    the dark footage. At ~400px wide the video spans the panel, the headline, switch and actions
    wrap without horizontal overflow, and "Got it" stays reachable.
+
+## HTML Sibling-Link Manual Checklist
+
+Not CI. Build a small local site in a scratch folder: `index.html` linking to a sibling
+`01-entry-point.html`, a nested `./sub/02-detail.html` (which links back with `../index.html`),
+an in-page `#section` anchor far enough down the page to need scrolling, an external
+`https://example.com`, a sibling `notes.md`, a `report.pdf`, and an absolute
+`/01-entry-point.html`. Give `index.html` a relative `style.css` and `img.png` so assets are in
+play. Run `plannotator annotate <site>/index.html`.
+
+1. **Nothing loads the app into the frame.** Press `Esc` (or the header pen) to reach Interact,
+   then click each link in turn. At no point does the framed document turn into a second copy of
+   Plannotator, and the browser URL never changes.
+2. **Relative links open as linked documents, and never open the sidebar.** With the sidebar
+   CLOSED, click `01-entry-point.html`: it renders in place and the sidebar stays closed. A
+   **Back to index.html** control appears at the left of the header controls; clicking it
+   returns to `index.html`. Repeat with the sidebar OPEN on the Files tab: after the click it is
+   still open, still on Files — never switched to Contents. Then open `./sub/02-detail.html` and
+   use `../index.html` from it: that also returns to the root (the same document, so it is a
+   Back, not a third level). Hover the Back control: the tooltip names the root file and shows
+   no keycaps.
+   A `notes.md` link is the exception and keeps the markdown convention: it opens the sidebar on
+   the Contents tab, where its "Viewing / Back to file" header lives.
+3. **Annotations stay per document.** Comment on `index.html`, open
+   `01-entry-point.html`, comment there, and go Back. Each document shows only its own comments,
+   and Send Feedback exports both under their own file headings.
+4. **In-page anchors scroll.** Click `#section`: the framed page scrolls to the heading and no
+   document is opened. A link that carries a fragment (`sub/02-detail.html#part`) opens the
+   document AND lands on the fragment.
+5. **External links open a new tab.** `https://example.com` opens in a new tab; the framed
+   document is unchanged and the original tab keeps its annotations.
+6. **Unsupported and absolute forms.** `report.pdf` raises a toast and opens nothing.
+   `/01-entry-point.html` opens the same document the relative link did. `notes.md` opens as
+   markdown.
+7. **The chrome survives navigation.** Show the tools (the eye), then follow two HTML links.
+   The tools stay shown and the sidebar keeps whatever state you left it in — neither is reset
+   to the session defaults mid-session.
+8. **Armed mode still annotates links.** Re-arm with the pen (or `Mod+Shift+A`) and click a
+   link: the comment composer opens on the `<a>` element and no navigation happens.
+9. **Live app sessions are untouched.** Run `plannotator annotate http://localhost:<dev port>`
+   against any app and click its own in-app links, armed and in Interact: they navigate the app
+   through the proxy exactly as before.
+
+Known limitation to expect in step 2: a document in a subfolder loads assets that sit below it,
+but `../style.css` and `../img.png` do not resolve (`/api/html-assets` mints one token per HTML
+file's own directory and refuses `..`), so `sub/02-detail.html` renders unstyled.
+
+## Cross-File Annotations Manual Checklist
+
+Not CI. Start a folder session over three documents with `plannotator annotate <folder>/`. The
+scope preference lives in the `plannotator-annotation-scope` cookie; clear it between runs.
+
+1. **The toggle only exists where it answers something.** With feedback on the open file and
+   nowhere else, the annotations panel header shows no `This file | All files` toggle. Add a
+   comment in a second file: the toggle appears in both files, and the header shows
+   `+N elsewhere` while This file is selected.
+2. **All files shows everything.** Switch to **All files**: one collapsible group per annotated
+   document, the open one first (marked `open`) and the rest by path, each with its own count.
+   The header count is the session total; the cards are the same cards as the single-file view.
+   Collapse a group: only that group's cards leave.
+3. **The empty file is never a dead end.** Open the third document, which has no feedback. The
+   panel opens on **All files** rather than "No annotations yet", without your having chosen it.
+   Switch to This file there: the empty state offers "View all N in M other files", and clicking
+   it returns to the grouped view.
+4. **The choice sticks.** Pick All files explicitly, then walk through all three documents: the
+   panel stays on All files. Reload the tab: still All files. Pick This file and repeat: it stays
+   This file, except on a document with no feedback of its own (rule 3).
+5. **Jump.** From All files, click a card belonging to another document. The file browser's
+   selection, the header filename and the document all move to that file, the panel stays on All
+   files, and that comment is selected and scrolled into view (a highlight flash in markdown, the
+   placed marker on an HTML file). Clicking a card in the open document still just selects it.
+6. **Cross-file edit and delete.** In All files, edit a comment in another document and save;
+   delete another one. Navigate to that document: both changes are there. Press `Mod+Z` — these
+   are deliberately NOT undoable, so nothing is restored and the open document's own history is
+   undisturbed.
+7. **The toggle never changes what is sent.** Note the count on the toolbar badge and the header
+   primary (`Send Feedback`). Toggle scope back and forth: both are unchanged. Submit from All
+   files and confirm the agent receives every document's feedback, including a cross-file edit
+   made in step 6 and excluding a cross-file delete.
+8. **HTML folder files.** Repeat steps 2, 5 and 6 with a folder containing `.html` documents.
+   Jumping must select the placed marker on the target page, and — with the sidebar closed —
+   must leave it closed, the same way following a link between HTML documents does.
+9. **Read-only.** Run `plannotator archive` and open a `#share` link: no cross-file mutation
+   affordances appear on any card.
 
 ## Need Help?
 

@@ -6,6 +6,9 @@ set -euo pipefail
 : "${UPSTREAM_REPO:?must be set, e.g. backnotprop/plannotator}"
 : "${UPSTREAM_BRANCH:?must be set, e.g. main}"
 : "${REPO:?must be set, e.g. YeKc1M/plannotator (use github.repository in the workflow)}"
+# Step outputs are written here when running under GitHub Actions; fall back to
+# /dev/null so the script still runs standalone.
+: "${GITHUB_OUTPUT:=/dev/null}"
 OWNER="${REPO%%/*}"
 UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
 
@@ -50,6 +53,7 @@ fi
 
 if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
   echo "Already up to date with ${UPSTREAM_REF}; nothing to do."
+  echo "pushed=false" >> "$GITHUB_OUTPUT"
   exit 0
 fi
 
@@ -124,6 +128,7 @@ else
   git push -u origin "$SYNC_BRANCH"
 fi
 echo "::endgroup::"
+echo "pushed=true" >> "$GITHUB_OUTPUT"
 
 PR_BODY_FILE="$(mktemp)"
 {
@@ -153,14 +158,17 @@ if [ -n "$open_pr_number" ]; then
     || fail "Failed to comment on PR #${open_pr_number}. Check the token (GH_TOKEN) has pull-requests write access to ${REPO}."
 else
   echo "::group::Create PR"
-  gh api -X POST "repos/${REPO}/pulls" \
+  open_pr_number="$(gh api -X POST "repos/${REPO}/pulls" \
     -f title="chore: merge upstream ${UPSTREAM_BRANCH} into ${FEATURE_BRANCH} ($(date -u +%Y-%m-%d))" \
     -f head="$SYNC_BRANCH" \
     -f base="$FEATURE_BRANCH" \
     -F body=@"$PR_BODY_FILE" \
-    --jq '.html_url' \
+    --jq '.number')" \
     || fail "Failed to create PR. Check the token (GH_TOKEN) has pull-requests write access to ${REPO}, and that 'Allow GitHub Actions to create and approve pull requests' is enabled in Settings > Actions."
+  echo "Created PR #${open_pr_number}: https://github.com/${REPO}/pull/${open_pr_number}"
   echo "::endgroup::"
 fi
+
+echo "pr_number=${open_pr_number}" >> "$GITHUB_OUTPUT"
 
 echo "Done."

@@ -8,6 +8,12 @@ on:
   push:
     branches:
       - main
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch/ref to check out (empty = event default)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -19,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -248,6 +255,9 @@ jobs:
 
   opencode-v2:
     name: OpenCode 2 installed package
+    # Skipped when called from another workflow (e.g. the upstream sync runs
+    # only the unit-test job).
+    if: github.event_name != 'workflow_call'
     runs-on: ubuntu-latest
     # The smoke's own budgets (health 120s, plugin activation 300s) are the real assertion;
     # this is only a backstop so a genuinely wedged runner cannot idle for hours.
@@ -294,6 +304,7 @@ jobs:
 
   guides-show:
     name: guides.show viewer (budgets + pinned manifest)
+    if: github.event_name != 'workflow_call'
     runs-on: ubuntu-latest
 
     steps:
@@ -378,6 +389,7 @@ jobs:
     # The tests inject temporary homes and process boundaries, so this job
     # never touches the runner's actual agent installations or user data.
     name: Uninstall lifecycle (Windows)
+    if: github.event_name != 'workflow_call'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -400,6 +412,7 @@ jobs:
     # resolves the extensionless shim before pi.cmd and the Ask AI provider
     # crashes before the plan review UI opens.
     name: Pi extension AI runtime (Windows)
+    if: github.event_name != 'workflow_call'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -439,6 +452,7 @@ jobs:
     # settings.json fixture so the Gemini merge path actually executes and
     # any regression of #506 (or similar cmd-parser bugs) fails CI.
     name: install.cmd (Windows integration)
+    if: github.event_name != 'workflow_call'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -696,6 +710,7 @@ jobs:
     # This specifically covers PLANNOTATOR_DATA_DIR tilde expansion because
     # installer config lookup happens before any shared runtime code is loaded.
     name: install.ps1 (Windows integration)
+    if: github.event_name != 'workflow_call'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  statuses: write
 
 concurrency:
   group: sync-feature-upstream
@@ -17,6 +18,9 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      pushed: ${{ steps.sync.outputs.pushed }}
+      pr_number: ${{ steps.sync.outputs.pr_number }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +45,7 @@ jobs:
         run: npm install -g @moonshot-ai/kimi-code
 
       - name: Sync upstream into feature branch
+        id: sync
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
@@ -50,3 +55,50 @@ jobs:
           UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
           REPO: ${{ github.repository }}
         run: bash .github/scripts/sync-feature-upstream.sh
+
+  # GITHUB_TOKEN pushes and PRs never trigger pull_request/push workflows, so
+  # the sync PR gets no CI of its own — run the unit tests here instead, on the
+  # sync branch we just pushed. Only the `test` job of test.yml runs when
+  # called this way; the heavier jobs are gated on the event name there.
+  test:
+    name: Unit tests on sync branch
+    needs: sync
+    if: needs.sync.outputs.pushed == 'true'
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ vars.SYNC_BRANCH }}
+    permissions:
+      contents: read
+
+  # Surface the test outcome where the reviewer looks: a commit status on the
+  # sync branch head shows up in the PR's checks section, and a failure also
+  # drops a comment on the PR (success stays quiet — the daily sync already
+  # comments on every run).
+  report:
+    name: Report test status to sync PR
+    needs: [sync, test]
+    if: always() && needs.sync.outputs.pushed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post commit status and failure comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SYNC_BRANCH: ${{ vars.SYNC_BRANCH }}
+          PR_NUMBER: ${{ needs.sync.outputs.pr_number }}
+          TEST_RESULT: ${{ needs.test.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          state=success
+          [ "$TEST_RESULT" = "success" ] || state=failure
+          head_sha="$(gh api "repos/${REPO}/commits/${SYNC_BRANCH}" --jq '.sha')"
+          gh api "repos/${REPO}/statuses/${head_sha}" \
+            -f state="$state" \
+            -f context="sync-upstream / tests" \
+            -f target_url="$RUN_URL" \
+            -f description="Unit tests on the synced branch: ${TEST_RESULT}"
+          if [ "$state" = failure ] && [ -n "$PR_NUMBER" ]; then
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -F body="Unit tests on the latest sync failed — see the [workflow run](${RUN_URL}) before merging."
+          fi

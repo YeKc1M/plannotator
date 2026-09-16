@@ -19,6 +19,7 @@ import { annotateFileFeedback, annotateMessageFeedback, wrapFeedbackForClipboard
 import { parseMarkdownToBlocks, exportAnnotations, exportLinkedDocAnnotations, exportEditorAnnotations, exportCodeFileAnnotations, exportMessageAnnotations, extractFrontmatter, wrapFeedbackForAgent, Frontmatter, type LinkedDocAnnotationEntry, type MessageAnnotationEntry } from '@plannotator/ui/utils/parser';
 import { primeSkillCatalog, primeSkillContentsForExport } from '@plannotator/ui/utils/skillCatalog';
 import { Viewer, ViewerHandle } from '@plannotator/ui/components/Viewer';
+import type { AnnotationRestoreReport } from '@plannotator/ui/hooks/useAnnotationHighlighter';
 import { HtmlViewer } from '@plannotator/ui/components/html-viewer';
 import { MarkdownEditor, type MarkdownEditorHandle } from '@plannotator/ui/components/MarkdownEditor';
 import { AnnotationPanel } from '@plannotator/ui/components/AnnotationPanel';
@@ -669,7 +670,7 @@ const App: React.FC = () => {
 
   const [initialExportTab, setInitialExportTab] = useState<'share' | 'annotations' | 'notes'>();
   const [isPlanDiffActive, setIsPlanDiffActive] = useState(false);
-  const [planDiffMode, setPlanDiffMode] = useState<PlanDiffMode>('clean');
+  const [planDiffMode, setPlanDiffMode] = useState<PlanDiffMode>('classic');
   const [previousPlan, setPreviousPlan] = useState<string | null>(null);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [aiSessionEnabled, setAISessionEnabled] = useState(false);
@@ -1435,6 +1436,25 @@ const App: React.FC = () => {
   useEffect(() => {
     setHtmlUnanchoredIds((prev) => (prev.size === 0 ? prev : new Set()));
   }, [activeHtmlPath]);
+  // The markdown half of the same chip. A restore that fails closed leaves the
+  // comment in the panel with nothing highlighted in the document and, until
+  // now, nothing on screen saying so — only a console warning. The Viewer
+  // reports each restore pass, so an annotation the pass re-anchored clears its
+  // own chip and one it could not adds it.
+  const [markdownUnanchoredIds, setMarkdownUnanchoredIds] = useState<ReadonlySet<string>>(() => new Set());
+  const handleRestoreReport = useCallback(({ attempted, unanchored }: AnnotationRestoreReport) => {
+    setMarkdownUnanchoredIds((prev) => {
+      if (prev.size === 0 && unanchored.length === 0) return prev;
+      const next = new Set(prev);
+      for (const id of attempted) next.delete(id);
+      for (const id of unanchored) next.add(id);
+      if (next.size === prev.size && [...next].every((id) => prev.has(id))) return prev;
+      return next;
+    });
+  }, []);
+  useEffect(() => {
+    setMarkdownUnanchoredIds((prev) => (prev.size === 0 ? prev : new Set()));
+  }, [activeDocFilepath, selectedMessageId]);
   const htmlRefresh = useHtmlRefresh({
     enabled: isApiMode && annotateMode && isHtmlSurface && !liveApp && !documentReadOnly,
     activePath: activeHtmlPath,
@@ -2324,6 +2344,19 @@ const App: React.FC = () => {
     wideModeType,
   ]);
 
+  // The ONLY writer of the HTML chrome record. Every write goes through
+  // mergeHtmlChromeState, so a session whose sidebar it does not own (a folder
+  // session, whose file browser owns it for the whole session) can never
+  // record its own sidebar/panel state over what ordinary HTML sessions left
+  // — which a second, raw write did until it was routed through here.
+  const saveChrome = useCallback(() => {
+    saveHtmlChromeState(mergeHtmlChromeState({
+      persisted: getHtmlChromeState(),
+      live: { sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen, toolsHidden: htmlToolsHidden },
+      sideSurfacesOwned: htmlChromeSideSurfacesOwned,
+    }));
+  }, [sidebar.isOpen, isPanelOpen, htmlToolsHidden, htmlChromeSideSurfacesOwned]);
+
   // Persist the chrome the user leaves an HTML session in (sidebar + panel
   // open state), so the next raw-HTML session opens exactly as they left this
   // one. Gated on the restore having run — a pre-restore render must not save
@@ -2342,12 +2375,8 @@ const App: React.FC = () => {
       skipNextHtmlChromeSaveRef.current = false;
       return;
     }
-    saveHtmlChromeState(mergeHtmlChromeState({
-      persisted: getHtmlChromeState(),
-      live: { sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen, toolsHidden: htmlToolsHidden },
-      sideSurfacesOwned: htmlChromeSideSurfacesOwned,
-    }));
-  }, [isHtmlSurface, sidebar.isOpen, isPanelOpen, htmlToolsHidden, htmlChromeSideSurfacesOwned]);
+    saveChrome();
+  }, [isHtmlSurface, saveChrome]);
 
   const ensureShareLink = useCallback(async (): Promise<string | null> => {
     const existing = shortShareUrl || shareUrl;
@@ -4196,7 +4225,7 @@ const App: React.FC = () => {
     if (isHtmlSurface) {
       refreshInputMethodStamp(inputMethod);
       if (htmlChromeRestoredRef.current) {
-        saveHtmlChromeState({ sidebarOpen: sidebar.isOpen, panelOpen: isPanelOpen, toolsHidden: htmlToolsHidden });
+        saveChrome();
       }
     }
   };
@@ -6055,7 +6084,9 @@ const App: React.FC = () => {
       width={presentation === 'panel' ? `var(--rpanel-w, ${panelResize.width}px)` : undefined}
       editorAnnotations={editorAnnotations}
       onDeleteEditorAnnotation={deleteEditorAnnotation}
-      unanchoredIds={isHtmlSurface && htmlUnanchoredIds.size > 0 ? htmlUnanchoredIds : undefined}
+      unanchoredIds={(isHtmlSurface ? htmlUnanchoredIds : markdownUnanchoredIds).size > 0
+        ? (isHtmlSurface ? htmlUnanchoredIds : markdownUnanchoredIds)
+        : undefined}
       onClose={presentation === 'panel' ? () => setIsPanelOpen(false) : closeCompactPlanSurface}
       onQuickCopy={async () => {
         const output = getCurrentFeedbackPayload();
@@ -6665,6 +6696,7 @@ const App: React.FC = () => {
                   <Viewer
                     key={viewerContentKey}
                     ref={viewerRef}
+                    onRestoreReport={handleRestoreReport}
                     blocks={blocks}
                     markdown={displayedMarkdown}
                     frontmatter={frontmatter}

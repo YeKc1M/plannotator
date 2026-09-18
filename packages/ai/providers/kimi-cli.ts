@@ -13,7 +13,10 @@
  *
  * The initialize handshake advertises NO client capabilities (no fs, no
  * terminal): the agent then does its own IO and routes every approval through
- * permission requests, which is exactly what the Ask AI UI wants.
+ * permission requests. Sessions are switched to `auto` mode at start
+ * (`session/set_config_option` configId `mode`) so read-only tools don't
+ * prompt; kimi's own permission policies still gate dangerous operations,
+ * and any approval that does surface renders through the PermissionCard.
  *
  * Implemented with node:child_process so a single file works under both the
  * Bun server and the Node (Pi) extension, which vendors this file. Requires a
@@ -971,6 +974,22 @@ class KimiSession extends BaseSession {
 						sessionId: this.liveSessionId,
 						configId: "model",
 						value: this.config.model,
+					},
+				})
+				.catch(() => {});
+		}
+		// Ask AI is a read-oriented surface: run the session in auto mode so
+		// read-only tools don't prompt. Dangerous operations are still gated by
+		// kimi's own permission policies. Best-effort: a kimi too old to know
+		// the `mode` config option stays in manual mode.
+		if (this.liveSessionId) {
+			await this.process
+				.sendAndWait({
+					method: "session/set_config_option",
+					params: {
+						sessionId: this.liveSessionId,
+						configId: "mode",
+						value: "auto",
 					},
 				})
 				.catch(() => {});

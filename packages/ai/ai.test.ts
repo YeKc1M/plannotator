@@ -2302,11 +2302,22 @@ describe("KimiCliProvider (ACP)", () => {
     const promptReq = captured.find((m) => m.method === "session/prompt");
     expect(promptReq.params.prompt[0].text).toContain("# PREAMBLE_MARKER plan");
     expect(promptReq.params.prompt[0].text).toContain("User question: first question");
-    const setModel = captured.find((m) => m.method === "session/set_config_option");
+    const setModel = captured.find(
+      (m) => m.method === "session/set_config_option" && m.params?.configId === "model",
+    );
     expect(setModel.params).toMatchObject({
       sessionId: "acp-session-1",
       configId: "model",
       value: "k2-thinking",
+    });
+    // Sessions run in auto mode so read-only tools don't prompt.
+    const setMode = captured.find(
+      (m) => m.method === "session/set_config_option" && m.params?.configId === "mode",
+    );
+    expect(setMode.params).toMatchObject({
+      sessionId: "acp-session-1",
+      configId: "mode",
+      value: "auto",
     });
     provider.dispose();
   });

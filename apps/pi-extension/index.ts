@@ -691,6 +691,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 				}
 				const session = await startCodeReviewBrowserSession(ctx, {
 					prUrl: reviewArgs.prUrl,
+					patchFile: reviewArgs.patchFile,
 					vcsType: reviewArgs.vcsType,
 					useLocal: reviewArgs.useLocal,
 					// --base / --diff-type: session-only open state from user flags.

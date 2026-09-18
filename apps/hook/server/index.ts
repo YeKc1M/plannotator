@@ -461,6 +461,25 @@ if (helpSubcommand) {
 
 exitOnUnknownSubcommand(args);
 
+// Read a caller-supplied unified diff for static patch mode (`--patch-file`).
+// "-" means stdin; file paths resolve against the given cwd. A read failure
+// is a startup failure: exit 1 like every other review startup failure.
+async function readStaticPatch(patchFile: string, cwd: string): Promise<{ rawPatch: string; gitRef: string }> {
+  try {
+    const rawPatch = patchFile === "-"
+      ? await Bun.stdin.text()
+      : await Bun.file(path.resolve(cwd, patchFile)).text();
+    if (!rawPatch.trim()) {
+      console.error("Static patch review requires non-empty unified-diff content.");
+      process.exit(1);
+    }
+    return { rawPatch, gitRef: patchFile === "-" ? "stdin patch" : patchFile };
+  } catch (err) {
+    console.error(`Failed to read patch file: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
 if (args[0] === "uninstall") {
   let options: ReturnType<typeof parseUninstallOptions>;
   try {
@@ -842,7 +861,12 @@ if (args[0] === "sessions") {
   let worktreeCleanup: (() => void | Promise<void>) | undefined;
   let workspace: Awaited<ReturnType<typeof buildLocalWorkspaceReview>> | undefined;
 
-  if (isPRMode) {
+  if (reviewArgs.patchFile) {
+    const patch = await readStaticPatch(reviewArgs.patchFile, process.env.PLANNOTATOR_CWD || process.cwd());
+    rawPatch = patch.rawPatch;
+    gitRef = patch.gitRef;
+    initialDiffType = "static-patch";
+  } else if (isPRMode) {
     // --- PR Review Mode ---
     // The base comes from the pull request — the open-state flags always
     // error here (validated before any auth check or platform fetch).
@@ -1160,7 +1184,7 @@ if (args[0] === "sessions") {
     error: diffError,
     origin: detectedOrigin,
     project: reviewProject,
-    diffType: workspace ? (initialDiffType ?? workspace.diffType) : gitContext ? (initialDiffType ?? "unstaged") : undefined,
+    diffType: workspace ? (initialDiffType ?? workspace.diffType) : gitContext ? (initialDiffType ?? "unstaged") : initialDiffType,
     gitContext,
     initialBase: initialBaseFromFlags,
     initialBaseExplicit: initialBaseFromFlags !== undefined,
@@ -1869,7 +1893,18 @@ if (args[0] === "sessions") {
   let workspace: Awaited<ReturnType<typeof buildLocalWorkspaceReview>> | undefined;
   let agentCwd: string | undefined;
 
-  if (isPRMode) {
+  if (reviewArgs.patchFile) {
+    if (reviewArgs.patchFile === "-") {
+      // The bridge's stdin carries the input JSON; a stdin patch has no
+      // channel. Direct `plannotator review --patch-file -` remains the way.
+      console.error("--patch-file - (stdin) is not available through the OpenCode bridge; pass a file path");
+      process.exit(1);
+    }
+    const patch = await readStaticPatch(reviewArgs.patchFile, process.env.PLANNOTATOR_CWD || process.cwd());
+    rawPatch = patch.rawPatch;
+    gitRef = patch.gitRef;
+    userDiffType = "static-patch";
+  } else if (isPRMode) {
     await resolveCliReviewOpenState(reviewArgs, {
       isPRMode: true,
       isWorkspace: false,

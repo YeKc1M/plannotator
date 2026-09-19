@@ -2,7 +2,9 @@ import React, { lazy, Suspense, useCallback, useContext, useEffect, useMemo, use
 import { diagramTargetText, type DiagramKind } from '@plannotator/core/diagram-anchor';
 import type { AnnotationRestoreReport } from '../hooks/useAnnotationHighlighter';
 import { AnnotationType, type Annotation, type Block } from '../types';
+import { useConfigValue } from '../config';
 import type { DiagramTheme } from '../utils/diagram-render';
+import { diagramShadowAmount } from '../utils/diagramShadow';
 import { getIdentity } from '../utils/identity';
 import { createRuntimeRetryEpoch } from '../utils/runtimeRetry';
 import { DiagramAnchorClaims, DiagramAnchorClaimsContext } from './diagram/anchorClaims';
@@ -103,9 +105,17 @@ export const DiagramBlock: React.FC<DiagramBlockProps & { kind: DiagramKind }> =
   // provider renders exactly as before. A key change re-runs the render,
   // which is what re-themes an already rendered diagram.
   const { colorTheme, resolvedMode } = useTheme();
+  // The node shadow reaches the renderer the same way the palette does: as
+  // part of the theme key, so changing it re-initializes Mermaid and re-renders
+  // every mounted diagram.
+  const diagramShadow = useConfigValue('diagramShadow');
   const theme = useMemo<DiagramTheme>(
-    () => ({ colorTheme, mode: resolvedMode === 'light' ? 'light' : 'dark' }),
-    [colorTheme, resolvedMode],
+    () => ({
+      colorTheme,
+      mode: resolvedMode === 'light' ? 'light' : 'dark',
+      shadowAmount: diagramShadowAmount(diagramShadow),
+    }),
+    [colorTheme, resolvedMode, diagramShadow],
   );
 
   // A sibling's Retry re-attempts this block too, but only while its own
@@ -134,19 +144,23 @@ export const DiagramBlock: React.FC<DiagramBlockProps & { kind: DiagramKind }> =
   const claims = sharedClaims ?? ownClaims;
   const claimsVersion = useSyncExternalStore(claims.subscribe, claims.getVersion, claims.getVersion);
 
+  // `diagramAnchor` is read defensively everywhere: a row can reach the
+  // renderer from any local ingest (the external-annotations API, a draft, a
+  // share link), so a nullish or malformed anchor must list as unanchored,
+  // never take the page down with a property read (`null.family`).
   const ownAnnotations = useMemo(
-    () => annotations.filter((ann) => ann.diagramAnchor !== undefined && ann.blockId === block.id),
+    () => annotations.filter((ann) => ann.diagramAnchor != null && ann.blockId === block.id),
     [annotations, block.id],
   );
   const unownedAnnotations = useMemo(
     () =>
       annotations.filter(
         (ann) =>
-          ann.diagramAnchor !== undefined &&
+          ann.diagramAnchor != null &&
           ann.blockId !== block.id &&
           !claims.blockIds.includes(ann.blockId) &&
           // A Graphviz anchor names a DOT part; it is never a Mermaid one.
-          (ann.diagramAnchor.family === 'graphviz') === (kind === 'graphviz'),
+          (ann.diagramAnchor?.family === 'graphviz') === (kind === 'graphviz'),
       ),
     [annotations, block.id, claims, kind],
   );

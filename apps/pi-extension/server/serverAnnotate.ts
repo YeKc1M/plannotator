@@ -1,3 +1,4 @@
+import { annotateDiagramRenderKind } from "../generated/annotatable.ts";
 import { createServer } from "node:http";
 import type { IncomingMessage } from "node:http";
 import { dirname, resolve as resolvePath } from "node:path";
@@ -325,6 +326,17 @@ export async function startAnnotateServer(options: {
 	// (vendored to generated/annotate-client-lease.ts by vendor.sh).
 	const clientLeaseGraceMs = options.clientLeaseTestOverrides?.graceMs ?? ANNOTATE_CLIENT_LEASE_GRACE_MS;
 	const clientLeaseHeartbeatMs = options.clientLeaseTestOverrides?.heartbeatMs ?? ANNOTATE_CLIENT_LEASE_HEARTBEAT_MS;
+
+	// Diagram sources (.mmd/.mermaid/.dot/.gv) render through the diagram
+	// engine rather than the markdown pipeline: the document body stays the
+	// raw file text and /api/plan names the engine in `renderAs`. Mirrors
+	// packages/server/annotate.ts; the decision itself is shared and pure.
+	const diagramRenderKind = annotateDiagramRenderKind({
+		filePath: options.filePath,
+		mode: options.mode || "annotate",
+		renderHtml: options.renderHtml,
+		sourceConverted: options.sourceConverted,
+	});
 	const clientLease = createAnnotateClientLeaseTracker(
 		() => decision.settle({ feedback: "", annotations: [], exit: true }),
 		{ graceMs: clientLeaseGraceMs },
@@ -811,7 +823,7 @@ export async function startAnnotateServer(options: {
 				clientLease: options.clientLeaseSupported
 					? { enabled: true as const, reconnectGraceMs: clientLeaseGraceMs }
 					: { enabled: false as const },
-				renderAs: displayRawHtml ? 'html' : 'markdown',
+				renderAs: displayRawHtml ? 'html' : diagramRenderKind ?? 'markdown',
 				...(displayRawHtml ? { rawHtml: displayRawHtml } : {}),
 				...(diffHtml ? { diffHtml } : {}),
 				convertHtml: options.convertHtml ?? false,

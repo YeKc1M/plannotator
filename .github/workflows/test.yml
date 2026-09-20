@@ -117,6 +117,7 @@ jobs:
           packages/ui/components/Viewer.diagramLazyRestore.test.tsx
           packages/ui/components/Viewer.diagramAnchorHostile.test.tsx
           packages/ui/components/CommentPopover.skillReferences.test.tsx
+          packages/ui/components/CommentPopover.mentionChips.test.tsx
           packages/ui/components/SkillReferenceMenu.placement.test.tsx
           packages/ui/components/sidebar/FileBrowser.test.ts
           packages/editor/editableDocumentsHook.test.tsx
@@ -153,6 +154,8 @@ jobs:
           packages/review-editor/components/FileTreeNode.controls.test.tsx
           packages/ui/components/Settings.analysis.test.tsx
           packages/ui/components/AnnotationPanel.props.test.tsx
+          packages/ui/components/AnnotationPanel.cardHeader.test.tsx
+          packages/ui/components/AnnotationPanel.editMentions.test.tsx
           packages/ui/components/Viewer.consumer.test.tsx
           packages/ui/components/Viewer.documentHeader.test.tsx
           packages/ui/components/Viewer.codeBlockHighlightSwap.test.tsx
@@ -184,6 +187,10 @@ jobs:
           packages/ui/hooks/useSharing.contentRevision.test.tsx
           packages/ui/hooks/useSharing.shortUrlLifecycle.test.tsx
           packages/ui/components/AnnotationToolbar.commentOnly.test.tsx
+          packages/ui/components/AnnotationToolbar.selectionActions.test.tsx
+          packages/ui/components/CommentPopover.mentionSource.test.tsx
+          packages/ui/components/Viewer.mentionSource.test.tsx
+          packages/ui/components/html-viewer/HtmlViewer.mentionSource.test.tsx
           packages/ui/components/AnnotationToolstrip.test.tsx
           packages/ui/components/StickyHeaderLane.test.tsx
           packages/ui/components/CommentPopover.quickLookGood.test.tsx

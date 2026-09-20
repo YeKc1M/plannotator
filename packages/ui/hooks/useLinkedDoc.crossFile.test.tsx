@@ -22,7 +22,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { useLinkedDoc, type UseLinkedDocReturn } from './useLinkedDoc';
 import { AnnotationPanel } from '../components/AnnotationPanel';
 import { groupAnnotationsByDocument, type AnnotationScope } from '../utils/annotationScope';
-import { AnnotationType, type Annotation, type ImageAttachment } from '../types';
+import { AnnotationType, type Annotation, type DocumentRenderAs, type ImageAttachment } from '../types';
 import type { ViewerHandle } from '../components/Viewer';
 
 const hasDom = typeof document !== 'undefined';
@@ -57,7 +57,7 @@ const Harness: React.FC = () => {
   const [annotations, setAnnotations] = useState<Annotation[]>([row('a1')]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [globalAttachments, setGlobalAttachments] = useState<ImageAttachment[]>([]);
-  const [renderAs, setRenderAs] = useState<'markdown' | 'html'>('markdown');
+  const [renderAs, setRenderAs] = useState<DocumentRenderAs>('markdown');
   const [rawHtml, setRawHtml] = useState('');
   const [shareHtml, setShareHtml] = useState('');
   const [scope, setScope] = useState<AnnotationScope>('current');

@@ -8,7 +8,8 @@
 
 import { useState, useCallback, useRef } from "react";
 import { normalizeBrowserPath } from "@plannotator/core/browser-paths";
-import type { Annotation, ImageAttachment } from "../types";
+import { isDiagramRenderKind } from "@plannotator/core/annotatable";
+import type { Annotation, DocumentRenderAs, ImageAttachment } from "../types";
 import type { ViewerHandle } from "../components/Viewer";
 import type { SidebarTab } from "./useSidebar";
 import type { SourceSaveCapability } from "@plannotator/core/source-save";
@@ -18,7 +19,7 @@ export interface LinkedDocLoadData {
   markdown?: string;
   filepath?: string;
   isConverted?: boolean;
-  renderAs?: 'markdown' | 'html';
+  renderAs?: DocumentRenderAs;
   rawHtml?: string;
   shareHtml?: string;
   sourceSave?: SourceSaveCapability;
@@ -72,10 +73,10 @@ export interface UseLinkedDocOptions {
   setGlobalAttachments: (att: ImageAttachment[]) => void;
   /** Current render mode + raw HTML of the base document. An HTML linked/folder file
    *  swaps these to render raw; back() restores the base values from this snapshot. */
-  renderAs: 'markdown' | 'html';
+  renderAs: DocumentRenderAs;
   rawHtml: string;
   shareHtml: string;
-  setRenderAs: (r: 'markdown' | 'html') => void;
+  setRenderAs: (r: DocumentRenderAs) => void;
   setRawHtml: (html: string) => void;
   setShareHtml: (html: string) => void;
   viewerRef: React.RefObject<ViewerHandle | null>;
@@ -105,7 +106,7 @@ interface SavedPlanState {
   annotations: Annotation[];
   selectedAnnotationId: string | null;
   globalAttachments: ImageAttachment[];
-  renderAs: 'markdown' | 'html';
+  renderAs: DocumentRenderAs;
   rawHtml: string;
   shareHtml: string;
 }
@@ -382,7 +383,11 @@ export function useLinkedDoc(options: UseLinkedDocOptions): UseLinkedDocReturn {
     // Swap to linked doc — an .html file renders raw (HtmlViewer), a markdown
     // file parses to blocks (Viewer). Drive renderAs/rawHtml per file so the
     // App's renderAs === 'html' ? HtmlViewer : Viewer switch flips automatically.
-    const docRenderAs = data.renderAs === 'html' ? 'html' : 'markdown';
+    // A diagram source (.mmd/.dot) keeps the markdown state path — the raw
+    // text is the document body — but names its engine so the App renders it
+    // as one diagram instead of parsing it as markdown.
+    const docRenderAs: DocumentRenderAs =
+      data.renderAs === 'html' ? 'html' : isDiagramRenderKind(data.renderAs) ? data.renderAs : 'markdown';
     const hostMarkdown = docRenderAs === 'html' || !notifyDocumentLoaded ? undefined : onDocumentLoaded?.(data);
     const nextMarkdown = notifyDocumentLoaded
       ? hostMarkdown ?? cached?.markdown ?? data.markdown ?? ''

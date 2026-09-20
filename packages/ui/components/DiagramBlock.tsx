@@ -292,7 +292,9 @@ export const DiagramBlock: React.FC<DiagramBlockProps & { kind: DiagramKind }> =
     onCreateComment: handleCreate,
     selectedCommentId,
     onSelectComment: onSelectAnnotation,
-    sourceLineOffset: block.startLine,
+    // A fence's offset is its own opening line; a whole-file diagram source
+    // overrides it with 0 (see Block.diagramSourceLineOffset).
+    sourceLineOffset: block.diagramSourceLineOffset ?? block.startLine,
     retryToken,
   };
 

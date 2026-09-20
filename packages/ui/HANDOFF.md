@@ -213,6 +213,9 @@ We deliberately did **not** restructure the exports map in this PR (move-don't-r
 | `components/HtmlSurfaceControls` | The eye / refresh / pen header controls for an HTML surface, with per-string `labels` overrides. Presentation only. See "HTML annotation parity seams". |
 | `hooks/useHtmlRefresh` | Re-fetch a rendered HTML document through a host-supplied `fetchSnapshot`, remount the viewer on a reload generation, acknowledge the restore report once. See "HTML annotation parity seams". |
 | `shortcuts` (`useHtmlAnnotateShortcuts`, `defineShortcutScope`, the scope registry) | The declarative keyboard-shortcut engine and the per-surface scopes, including the HTML annotate scope (Mod+Shift+A toggles annotate mode, Mod+Shift+X shows/hides the tools). Pure: React plus `utils/platform`; no backend. |
+| `utils/selectionActions` + `components/SelectionActionsDropdown` | The host selection-actions seam: `SelectionAction`, `SelectionActionContext`, the pure `buildSelectionActionContext`, and the dropdown `AnnotationToolbar` opens. Pure React; no backend. *(Blessed in 0.43.0.)* |
+| `utils/mentions` + `components/MentionPicker` + `hooks/useMentionAutocomplete` | The `@` mention seam behind `CommentPopover`'s `mentionSource` (and, since 0.43.1, `Viewer`'s and `HtmlViewer`'s): the pure grammar (`mentionTrigger`, `mentionMatches`, `applyMentionPick`, `survivingMentions`), the portaled picker, and the keyboard state machine. Pure React; no backend. *(Blessed in 0.43.0.)* |
+| `utils/composerTokens` | The comment composer's token highlight ranges: `skillTokenRanges`, `mentionTokenRanges`, `mergeTokenRanges` and `ComposerTokenRange`. Pure (no DOM, no styling) — the one place that decides which bytes of a composer's text are a token and which source wins when two claim the same ones. *(Blessed in 0.44.0.)* |
 | `utils/inputMethod` (`getInputMethod`, `saveInputMethod`, `refreshInputMethodStamp`) | The per-surface pinpoint/drag input-method preference with its TTL. Persists through the `storageBackend` seam; no backend of its own. |
 | `utils/codeHighlight` / `utils/codeBlockMark` / `utils/syntaxTheme` | The Shiki-based fence highlighter, swap-surviving annotation marks, and palette→Shiki theme mapping. Replaces all `.hljs` styling. *(Blessed in 0.29.0.)* |
 | `utils/math` (`loadMathRenderer`, `getMathRenderer`, `getMathRendererSource`, `setMathRenderer`, `setMathRendererLoader`, `getMathRendererLoader`, `resetMathRenderer`) and `utils/math-eager` | The math renderer slot and its eager KaTeX registration. Import `utils/math-eager` for synchronous typesetting on the first commit; call `loadMathRenderer()` to pre-warm the lazy path. `resetMathRenderer()` empties the slot and keeps the registered loader; `setMathRendererLoader(null)` drops it. See "Lazy renderers and eager entries". |
@@ -873,8 +876,629 @@ to fall back on:
 
 ---
 
+## Host toolbar seams (0.43.0)
+
+Two additive props, ruled in together by Plannotator's owner **on one
+condition: each is an opt-in host capability that changes nothing for
+Plannotator's own users when it is not supplied.** Plannotator is the provider
+of these capabilities; it is not a product that uses them. It passes neither
+prop anywhere, and `packages/editor` / `packages/review-editor` are untouched
+by this release. Core is UNCHANGED at `0.25.5`, so **ui 0.43.0 publishes
+alone**.
+
+### 1. `AnnotationToolbar` `selectionActions` — the host's own commands on a selection
+
+```ts
+import type { SelectionAction, SelectionActionContext } from "@plannotator/ui/types";
+// (also @plannotator/ui/utils/selectionActions)
+
+interface SelectionActionContext {
+  text: string;          // the toolbar's copy text, else the element's text
+  blockId: string;       // the enclosing [data-block-id], '' on raw-HTML surfaces
+  startOffset: number;   // offset of the selection inside that block's text
+  endOffset: number;     // startOffset + text.length
+  element: HTMLElement;  // the element the toolbar is anchored to
+}
+
+interface SelectionAction {
+  id: string;
+  label: string;
+  detail?: string;         // dimmed second line
+  icon?: React.ReactNode;  // a colored accent bar is drawn when absent
+  onSelect(ctx: SelectionActionContext): void;
+}
+```
+
+One toolbar button (a wand, `data-selection-actions`) opens the package's own
+dropdown directly below it, in the quick-label picker's placement and chrome
+(`components/SelectionActionsDropdown`: `SelectionActionsDropdown` is the list,
+`FloatingSelectionActionsPicker` the portaled, viewport-clamped, flip-above
+picker; rows carry `data-selection-action="<id>"` under `role="listbox"`).
+Selecting an item calls `onSelect(ctx)` and closes the toolbar exactly as a
+quick label does — **the package creates no annotation**; what an action means
+is entirely the host's business.
+
+- **Keyboard:** ArrowDown / ArrowUp move, Enter invokes, Escape closes the
+  dropdown (and only the dropdown — the toolbar stays open). Nothing is
+  preselected until the first arrow, the package-wide rule, so a stray Enter
+  over an open dropdown never fires a host command. Pointer hover highlights a
+  row and a click invokes it directly. While the dropdown is open, the
+  toolbar's own type-to-comment and Alt+digit listeners stand down, the same
+  way they do for `FloatingQuickLabelPicker`.
+- **Where it sits:** the wand takes the slot the quick-labels Zap occupied and
+  the Zap moves one place right (`Copy | Delete | Comment | Actions | Quick
+  label | 👍 | Cancel`). Chosen over "actions to the right of the Zap" so that
+  ONE geometry rule covers both host configurations: with `quickLabels: false`
+  — the expected host setup — the wand sits exactly where the Zap sat, and a
+  host that keeps both gets its own actions in the primary slot it opted into.
+- `undefined` or `[]` renders no button at all, and the empty array is pinned
+  by a test because "the host has no actions right now" is a real state.
+- **The context is derived, not threaded.** `buildSelectionActionContext`
+  (`utils/selectionActions`, pure) walks up from the anchor element for
+  `[data-block-id]` and computes the offset by splitting the block's text on
+  the selection — deliberately the same arithmetic
+  `createAnnotationFromSource` uses, so an action sees the coordinates an
+  annotation created from that same selection would carry. On a surface with
+  no blocks (raw HTML) it degrades to `blockId: ''` and `startOffset: 0`
+  (`endOffset` is then the selection's length; an HTML annotation itself
+  stores `0`/`0`). The one deliberate deviation from the annotation path is
+  a selection the block does not contain — one spanning two blocks — where
+  the annotation path reports `blockText.length` and a host gets `0`.
+
+### 2. `AnnotationToolbar` `quickLabels` — the opt-out switch
+
+`quickLabels?: boolean`, default `true`. `false` hides the Zap picker button
+**and** makes the Alt+digit label shortcuts inert on that toolbar (hiding the
+button while leaving the keys live was the obvious bug; a test pins both). It
+does not touch the one-click 👍, which is a separate affordance, and it does
+not clamp editor mode — a host that persists `'quickLabel'` mode still keeps
+that state out of `Viewer`, exactly as with `AnnotationToolstrip`'s
+`hideQuickLabel` (0.35.0).
+
+### 3. `CommentPopover` `mentionSource` — an `@` mention source for the composer
+
+> **0.43.2 additions (opt-in, byte-identical when absent):** `MentionSource.heading?: string | null` draws one non-selectable heading row (`data-mention-heading`, e.g. "People in this workspace") above the list; `MentionPerson.avatar?: { url?, initials?, tint? }` draws an avatar (`data-mention-avatar="image" | "initials"`) before the label — an `<img>` when `url` is set, else `initials` (defaulting to the label's first letter) on a disc tinted with `tint` (any CSS color; absent means the muted surface). Neither the grammar, the keyboard state machine, `onMentionsChange`, `onPickBlocked` nor `Annotation.mentions` changes.
+
+```ts
+import type { MentionPerson, MentionSource } from "@plannotator/ui/types";
+// (also @plannotator/ui/utils/mentions)
+
+interface MentionPerson {
+  readonly id: string;                    // opaque host id, reported back verbatim
+  readonly kind: "user" | "agent";        // agents are never taggable in a comment
+  readonly label: string;
+  readonly detail: string | null;         // right-aligned hint (an email, "Agent")
+  readonly canOpen: boolean;              // host access data; see onPickBlocked
+}
+
+interface MentionSource {
+  readonly people: readonly MentionPerson[];
+  readonly emptyNotice?: string | null;                     // honest-empty row
+  readonly heading?: string | null;                         // 0.43.2: heading row above the list, absent → none
+  readonly onMentionsChange?: (ids: readonly string[]) => void;
+  readonly onPickBlocked?: (person: MentionPerson) => void;
+}
+```
+
+This is the shape the host's own reply box already uses (`MentionPerson` is
+copied field for field from its `plannotator/mention-extension.ts`), so the
+host fills `people` from its existing candidate hook and nothing has to be
+mapped. The **package owns the typing rules and the picker**; the host owns
+the people and what a mention means.
+
+- **The grammar is ported, not reinvented** (`utils/mentions`, pure, unit
+  tested): the same `MENTION_QUERY_RE = /@[\w .-]*$/`, the same word-boundary
+  guard that makes `a@b.com` never open a menu, the same users-only /
+  not-already-tagged filtering on label OR detail, the same `@Label ` insertion
+  with the caret after it, the same `sanitizeMentionLabel`, and the same
+  surviving-token rule — deleting a token untags that person, so the body and
+  the reported ids can never disagree about who was named.
+- **The picker** (`components/MentionPicker`) is portaled and `position:
+  fixed`, measured from the textarea's rect, above it by default and below
+  when there is not 196px of headroom — the composer card clips its own box,
+  so a menu positioned inside the textarea's wrapper is cut off. `role=
+  "listbox"` with `data-mention-picker`, rows `data-mention-option="<id>"`, the
+  empty notice `data-mention-empty` (one non-selectable row; with `people: []`
+  and no notice the menu simply stays closed).
+- **Keyboard** (`hooks/useMentionAutocomplete`, modelled on
+  `useSkillReferenceAutocomplete` and living in the same textarea beside it —
+  `handleKeyDown` offers the event to the skill hook first, then this one):
+  nothing is preselected, so Enter is a newline and Tab leaves the field until
+  an arrow engages a row; ArrowDown from none lands on the first row, ArrowUp
+  on the last; a mouse pick uses `mousedown` + `preventDefault` so it beats the
+  blur. **One deliberate difference from the `/` and `$` trigger:** the arrows
+  engage this menu even on a bare `@`, and Escape closes it whenever it is
+  visible. `$` and `/` are ordinary prose characters whose menu must yield the
+  arrows back to caret navigation; `@` at a word boundary is an unambiguous tag
+  gesture, and typing `@` then ArrowDown is how the host's own reply box
+  behaves.
+- **`onPickBlocked` is the no-access rule.** When a `canOpen: false` person is
+  picked AND the host supplied `onPickBlocked`, the handler fires and
+  **nothing is inserted** (the host shows its own no-access dialog). Without
+  the handler such a person inserts like anyone else — the package never
+  renders a disabled row it cannot explain. Both branches are pinned by tests.
+- **The ids reach the host two ways.** `onMentionsChange(ids)` fires on every
+  text change with the surviving ids, and `onSubmit` gained an optional THIRD
+  argument: `onSubmit(text, images?, mentions?)`. The third argument is passed
+  **only when `mentionSource` is supplied** — without one the call is the
+  two-argument call it has always been (`arguments.length === 2`, pinned).
+  Hosts can use either; `onMentionsChange` alone is enough for a host that
+  keeps its draft state outside the popover.
+- Nothing is wired to Plannotator data: there is no mention provider in this
+  repo, and `configurePlannotatorUI` gains no seam for one. A host passes the
+  prop where it renders the composer, the `HtmlViewer` / `Viewer` pattern.
+
+### Threading points
+
+- `AnnotationToolbar` (`selectionActions`, `selectionActionsIcon`, `quickLabels`) — the props live here. `selectionActionsIcon?: React.ReactNode` (0.43.1) is the glyph on the wand button, forwarded by `Viewer` (both toolbars) and `HtmlViewer`; absent → the package's own wand, which 0.43.1 also simplified to one thick diagonal with a single star (the six-spark glyph read as noise at 16px). Name, `data-selection-actions`, size and behavior of the button are untouched either way.
+- `Viewer` forwards both to BOTH of its toolbars (the text-selection toolbar
+  and the code-block hover toolbar).
+- `HtmlViewer` forwards `selectionActions` to its selection toolbar. It does
+  not take `quickLabels`: that surface is already `commentOnly`, which hides
+  the Zap and the Alt+digit keys outright.
+- `plan-diff/PlanCleanDiffView` mounts a toolbar too and is deliberately NOT
+  threaded: it is a Plannotator-only surface (the plan-version diff) and is not
+  on the supported-import list. Ask if a host needs it.
+- `CommentPopover` (`mentionSource`). `Viewer` does NOT forward it: the viewer
+  owns several composers and a per-composer decision belongs to the host that
+  renders them. Ask if you would rather pass it once on `Viewer`.
+  **Answered in 0.43.1 — both viewers now forward it; see the next section.**
+
+### The no-op guarantee, and how it is pinned
+
+With neither prop supplied, the rendered DOM of both components is **byte-for-byte
+what `origin/main` renders**: the same components were mounted on the base commit
+and on this branch in the same harness and their `outerHTML` diffed to zero
+(`.annotation-toolbar` + `[data-comment-popover]`, 6376 bytes each, identical).
+On top of that, committed tests pin the structure rather than a snapshot:
+the default toolbar's button set and order (`Copy, Delete, Comment, Quick
+label, Looks good, Cancel`), the absence of `[data-selection-actions]` and of
+the picker, the exact attribute list on the Zap button, and — for the composer —
+that typing `@` opens nothing and that submit stays a two-argument call.
+`useMentionAutocomplete` with no source registers no listener, opens no menu
+state and returns one frozen empty id array; `AnnotationToolbar` renders no
+extra element and spreads no extra attributes.
+
+Tests: `utils/mentions.test.ts` (11, DOM-free),
+`components/AnnotationToolbar.selectionActions.test.tsx` (8, DOM-gated),
+`components/CommentPopover.mentionSource.test.tsx` (11, DOM-gated).
+
+## `mentionSource` on the viewers (0.43.1)
+
+0.43.0 left `mentionSource` on `CommentPopover` alone, with an open question
+("ask if you would rather pass it once on `Viewer`"). The answer is yes, so
+0.43.1 threads it one level up and gives the picked ids somewhere to land.
+Same ruling as 0.43.0: an opt-in host capability that changes nothing for
+Plannotator's own users when it is not supplied. `packages/editor` and
+`packages/review-editor` are untouched by this release; core is UNCHANGED at
+`0.25.5`, so **ui 0.43.1 publishes alone**.
+
+### 1. The prop
+
+`Viewer` and `HtmlViewer` each gain `mentionSource?: MentionSource` — the same
+type, unchanged, from `@plannotator/ui/types` (also `utils/mentions`) — and
+each forwards it to EVERY comment composer it mounts:
+
+- `Viewer` → the text-selection composer (`useAnnotationHighlighter`'s) and the
+  global / code-block one.
+- `HtmlViewer` → the pinpoint (selection) composer and the global one.
+
+A host that wants mentions on a surface passes one prop instead of reaching
+into the viewer's composers. Passing it directly to a `CommentPopover` you
+mount yourself still works and is unchanged.
+
+Deliberately NOT threaded: `plan-diff/PlanCleanDiffView`, `CodeFilePopout` and
+`goal-setup/GoalSetupSurface` mount composers too, but they are Plannotator-only
+surfaces off the supported-import list — the same line 0.43.0 drew for
+`selectionActions`. Ask if a host needs one.
+
+### 2. `Annotation.mentions` — where the ids go
+
+```ts
+interface Annotation {
+  // …
+  mentions?: readonly string[];   // opaque host ids, additive
+}
+```
+
+`onSubmit(text, images?, mentions?)` used to stop at the viewer: the third
+argument was received and dropped. It now rides onto the annotation the viewer
+hands `onAddAnnotation`, on every creation path behind those composers
+(`createAnnotationFromSource`, `createAnnotationFromMathSource`, the code-block
+path, both global comments, and the HTML pinpoint comment).
+
+**The presence rule** is the whole no-op guarantee, so it is worth stating
+exactly: the key exists only when a `mentionSource` was supplied AND at least
+one id survived to submit. No source → no third argument → no key. A source
+whose tokens the author deleted before submitting → `[]` from the composer →
+still no key, never an empty array. Every write is a conditional spread
+(`...(mentions && mentions.length > 0 ? { mentions } : {})`), not `mentions,`,
+because the bare shorthand would put the key on the object with an `undefined`
+value and `'mentions' in ann` would start answering true for Plannotator.
+
+The ids are opaque to the package. Mapping one to a person, notifying them, or
+rendering an avatar is entirely the host's business — `MentionPerson.id` is
+reported back verbatim, exactly as it was handed in.
+
+### 3. What the field does NOT touch
+
+An id from a host's directory means nothing outside that host, so the field
+stays out of everything Plannotator produces:
+
+- **Export.** `exportAnnotations`, `exportAnnotationEntry` and
+  `exportLinkedDocAnnotations` never print it: an annotation carrying
+  `mentions` exports byte-identically to the same annotation without it
+  (`utils/parser.mentions.test.ts`). The readable `@Label` token is in the
+  comment body, which is what the coding agent reads.
+- **Share links.** Dropped exactly like `htmlAnchor`, `elementContext` and
+  `diagramAnchor` — the compact tuple format never carried extra fields, and a
+  round trip restores `mentions: undefined` (pinned in
+  `utils/sharing.multiTarget.test.ts`).
+- **External annotations.** `POST /api/external-annotations` builds its rows
+  from an explicit field list and `PATCH` from an allowlist, so a `mentions`
+  key on the wire is dropped as any unknown key is. No change was needed in
+  `@plannotator/core/external-annotation`, in either runtime.
+- **The feedback archive.** `packages/shared/feedback-archive.ts` copies named
+  fields into its record; `mentions` is not one of them and never reaches
+  `index.jsonl` or a sidecar. No change needed.
+- **Drafts** carry it for free (annotations are opaque JSON to the draft
+  transport), which is the behavior a host wants: a restored draft still knows
+  who was named.
+
+### 4. Edit and reply paths
+
+There is none to thread in these two viewers: both `Viewer` composers and both
+`HtmlViewer` composers are CREATION composers. Editing an existing comment
+happens in `AnnotationPanel`'s card, a plain textarea that has never had an
+`@` picker and takes no `mentionSource`; replies (`inReplyTo`) are created by
+the WebMCP catalog, not by a composer. So no annotation's `mentions` is
+rewritten after creation by this package — a host that edits a comment owns
+the field from then on. If you want the panel editor to pick people too, that
+is a separate prop on `AnnotationPanel` and worth asking for.
+
+### No-op guarantee, and how it is pinned
+
+With no `mentionSource`, both viewers mount the composers they always did, no
+`@` listener is registered, no picker DOM exists, and the annotation object
+handed to `onAddAnnotation` has no `mentions` key at all (`'mentions' in ann`
+is false, asserted rather than `toBeUndefined()` — the difference between the
+conditional spread and the bare shorthand is invisible to the latter).
+
+Tests (both DOM-gated, both in the workflow's DOM_TESTS step):
+`components/Viewer.mentionSource.test.tsx` (5) drives the real Viewer — the
+selection composer through the Vim toolbar's type-to-comment gesture and the
+global composer through its button — and
+`components/html-viewer/HtmlViewer.mentionSource.test.tsx` (3) drives the real
+HtmlViewer through a bridge pinpoint message and its global button. Plus the two DOM-free pins in
+§3 above.
+
+## Mention token chips in the composer (0.44.0)
+
+0.43.0-0.43.2 gave the composer an `@` picker; the token it inserted was
+then plain text in the textarea. 0.44.0 paints it as a **chip**, so a tag
+looks the same in the picker row, in the input, and in the comment the host
+posts. Same ruling as the three releases before it: an opt-in host
+capability that changes nothing for Plannotator's own users when it is not
+supplied. `packages/editor` and `packages/review-editor` are untouched; core
+is UNCHANGED at `0.25.5`, so **ui 0.44.0 publishes alone**.
+
+### One overlay, two sources (the refactor)
+
+`ComposerTextarea` already used exactly the right technique for skill
+references: a mirrored, aria-hidden overlay rendered BEHIND a
+transparent-text textarea (a textarea cannot style substrings), sharing the
+font/padding/wrapping metrics and mirroring scroll, with `.pn-ref-composing`
+hiding it during IME composition. Chips do not add a second overlay — two
+mirrored layers could never stay pixel-aligned with each other, and only one
+of them could own the scroll sync. Instead the overlay became a TOKEN
+HIGHLIGHT LAYER fed by a merged list of ranges, and it turns on when EITHER
+source is active.
+
+The range computation moved out of the render loop into
+`utils/composerTokens` (pure — no DOM, no styling, no React):
+
+- `skillTokenRanges(tokens)` — today's positioned occurrences, unchanged.
+- `mentionTokenRanges(text, people)` — every occurrence of each surviving
+  person's readable `@Label` token.
+- `mergeTokenRanges(text, groups)` — `groups` in priority order; drops
+  ranges outside `[0, text.length)` and empty/inverted ones, then keeps
+  earlier `start`, longer at the same start, earlier group at the same start
+  and length, and drops anything beginning inside a range already kept.
+  Nothing nests, so the overlay stays a flat sequence of spans.
+
+With a single skill source this reproduces the pre-refactor loop exactly
+(which dropped a token whose `start` fell behind the cursor or whose `end`
+ran past the text). The component keeps the Tailwind classes and the `data-*`
+attributes in `renderTokenSpan`, both so the class scanner still sees them
+and so the metric rule below is read with the classes it governs.
+
+### The chip
+
+A chip is painted only for a person the author PICKED whose token still
+survives — `useMentionAutocomplete` now also returns those survivors as
+`mentions` (frozen-empty with no source, the same treatment `mentionIds`
+gets), so the ranges come from the mention id model and never from a regex
+over arbitrary `@words`. Editing one byte of a token un-chips it in the same
+render that drops the id from `onMentionsChange`, so a chip follows the body
+rather than a stale pick. The one case where the chips and the reported IDS
+can still part company is the prefix case in the limitations below, which
+the chips inherit rather than introduce.
+
+```
+<span data-mention-token="user_1" data-mention-kind="user" class="…">@Marcus Chen</span>
+```
+
+- `data-mention-token` is the opaque host id; `data-mention-kind` carries
+  `MentionPerson.kind` verbatim — the host's styling hook. Know what that
+  means today: the picker offers USERS ONLY (`mentionMatches` drops every
+  person whose `kind !== 'user'`), so only a user can be picked, only a user
+  can be tagged, and the attribute only ever reads `user`. `agent` is the
+  reserved value for the day agents become taggable — a host rule for
+  `[data-mention-kind="agent"]` matches nothing until then.
+- `MentionSource.tokenClassName?: string` (new, optional) is appended to the
+  span verbatim for a host that wants its own look.
+- The package default is `text-primary bg-primary/15` and a 3px radius —
+  the skill-reference treatment one shade stronger, so the two token kinds in
+  one overlay read as siblings. Deliberately no ring: every class it uses is
+  one the package already emitted, so a host's generated CSS is unchanged
+  (and so is the portable guide viewer's bundle — `guide-viewer-manifest.ts`
+  needed no regeneration, which is why core is untouched).
+
+**THE METRIC RULE (and it is the host's too).** A chip may change COLOR,
+BACKGROUND, BORDER-RADIUS, BOX-SHADOW and TEXT-DECORATION only. Padding,
+margin, border width, font-weight, letter-spacing and font-size all move a
+glyph, and the overlay's glyphs must coincide with the textarea's own layout
+or the caret drifts away from the text it is painting. A pill's horizontal
+breathing room is faked with `box-shadow: 0 0 0 Npx <background>`, which
+paints without occupying space — that is the way to a pill look through
+`tokenClassName`, and the reason the rule bans padding rather than the
+appearance.
+
+### What did NOT change
+
+The overlay exists for the whole life of a mention composer, not only once
+somebody is tagged, so the first pick never swaps the textarea element under
+the caret. IME composition, scroll sync, the resize gutter, the placeholder,
+the `/` + `$` skill autocomplete and its menu, the Alt-typing path, drafts
+(`initialDraft` / `draftKey`), image attachments and `Mod+Enter` submit are
+all untouched, and `onSubmit(text, images?, mentions?)` is the same call.
+`Viewer` and `HtmlViewer` needed no change at all: they already forward
+`mentionSource` (0.43.1), and the chips are inside the composer it reaches.
+
+Three inherited limitations are worth stating rather than fixing here:
+
+- **Two people whose labels sanitize to the same token** are
+  indistinguishable in a plain-text body, so the FIRST of them listed owns
+  every occurrence of it. That is the same first-match rule
+  `survivingMentions` already applies to the ids; it renders and never
+  throws.
+- **A restored draft has no chips** until the author picks again, because
+  the survivors come from the picks made in THIS composer — exactly the same
+  reason `onMentionsChange` reports `[]` for a restored draft today (0.43.x
+  behavior, unchanged). It reports no STALE ids either: a reopened draft
+  starts with nobody tagged, so the chips and the ids agree on "none".
+- **A label that is a prefix of another label** (`Ann` and `Anna Lee`, both
+  picked): the CHIPS are right — longest-wins means `@Anna Lee` is painted
+  whole and is never half-covered by an `@Ann` chip. The IDS are the loose
+  end: delete `@Ann` from a body that still reads `@Anna Lee` and
+  `survivingMentions` keeps reporting Ann, because it asks
+  `text.includes('@Ann')`. So the id list can outlive the chip. That is
+  0.43.x behavior in `survivingMentions`, unchanged here — the chips only
+  make it visible.
+
+### The no-op guarantee, and how it is pinned
+
+The same components were mounted on `origin/main` and on this branch in one
+harness and their `outerHTML` diffed:
+
+- **No `mentionSource`, no `skillReferences`:** the composer is
+  byte-identical — 3192 bytes, and the same `addEventListener` and
+  `setTimeout` counts (287 / 1 in that harness). No overlay element exists
+  at all.
+- **`skillReferences` only:** the popover (4821 bytes) and the overlay
+  itself (634 bytes) are byte-identical, same listener and timer counts
+  (150 / 1). `data-skill-ref-overlay="true"` is written only when
+  `skillReferences` is on, so a skill composer's overlay keeps the exact
+  attribute list it had; a mentions-only overlay is found by its
+  `data-pn-mobile-editable-mirror` attribute instead.
+- A mention composer's overlay costs exactly one extra listener (the
+  textarea's `scroll`, which is what mirrors the layer) — the same one a
+  skill composer has always paid.
+- **The portable guide viewer's build is byte-identical** (`viewer.*.js` and
+  `viewer.*.css` hashes and their SRI unchanged against `origin/main`), so
+  `packages/core/guide-viewer-manifest.ts` is in sync and core is untouched.
+  That is also why the default chip reuses classes the package already
+  emitted instead of introducing one.
+
+**Real-browser metric proof** (headless Chromium, throwaway Vite harness):
+typing `Nice catch @ma`, picking Marcus and continuing to type, the chip's
+bounding rect and the textarea's own text run for that token agree to
+**0.000px** on both axes and in width — at 420px and 1200px, on a wrapped
+line (3 lines above it) and with the textarea scrolled (`scrollTop` 40) —
+and the caret x after the token is **0.016px** from the span's end.
+
+Tests: `utils/composerTokens.test.ts` (16, DOM-free) and
+`components/CommentPopover.mentionChips.test.tsx` (11, DOM-gated, in the
+workflow's DOM_TESTS step).
+
+## Annotation card header slot and mentions on the edit box (0.45.0)
+
+0.43.1 closed with an open question: "Editing an existing comment happens in
+`AnnotationPanel`'s card, a plain textarea that has never had an `@` picker…
+If you want the panel editor to pick people too, that is a separate prop on
+`AnnotationPanel` and worth asking for." It was asked for, so 0.45.0 adds it —
+together with the header twin of the panel's existing `renderCardFooter`.
+Same ruling as the four releases before it: opt-in host capabilities that
+change nothing for Plannotator's own users when they are not supplied.
+`packages/editor` and `packages/review-editor` have ZERO source diff in this
+release; core is UNCHANGED at `0.25.5`, so **ui 0.45.0 publishes alone**.
+
+### 1. `renderCardHeader` — the twin of `renderCardFooter`
+
+```ts
+renderCardHeader?: (annotation: Annotation) => React.ReactNode;
+```
+
+Rendered inside each plan-annotation card's HEADER row — the row carrying the
+type word, the `diff` / page / `Unanchored` chips and `author · time` — after
+the timestamp and before the built-in edit/delete cluster, which keeps the
+right edge on its `ml-auto`. That is the slot for a status stamp (resolved,
+needs reply, a reviewer badge); the footer remains the slot for reply and
+resolve UI.
+
+It follows the footer's contract line for line:
+
+- The wrapper is `[data-annotation-card-header="true"]` (the footer's
+  `[data-annotation-card-footer="true"]` spelled for the header — the attribute
+  the host queries and styles), and it stops `click` and `keydown`
+  propagation, so interacting with your stamp never selects the card.
+- **It renders under `readOnly`**, exactly as the footer does and for the same
+  reason: the contents are host-owned and a stamp is a read affordance. The
+  built-in mutation affordances stay hidden.
+- In the All-files grouped view it rides the OPEN document's cards only
+  (`group.isCurrent`), the footer's rule — a slot built from the open
+  document's state has nothing to say about another document's card.
+- Returning `null` / `undefined` / `false` for a card renders no wrapper for
+  that card. Omitting the prop renders no wrapper anywhere: there is no empty
+  container to lay out or style around.
+- The header row is ONE non-wrapping flex line shared with the type word, the
+  `diff` / page / `Unanchored` chips and the timestamp. The wrapper is
+  `min-w-0` and shrinks, but a host node that cannot shrink will overflow
+  toward the built-in actions rather than wrap — keep the stamp compact, or
+  give it its own truncation.
+
+**Not on `CodeAnnotation` cards.** `CodeAnnotationCard` (the review-editor
+shape) takes no `renderCardFooter` either, so neither new prop was threaded
+into it; mirroring the footer is the rule. Ask if a host needs both there.
+
+### 2. `mentionSource` — the `@` picker on the card's edit box
+
+```ts
+mentionSource?: MentionSource;   // the same type, unchanged, from 0.43.0
+```
+
+Supplied on the panel and threaded to every plan-annotation card, it gives the
+card's EDIT textarea the same `@` machinery `CommentPopover` has:
+`useMentionAutocomplete` over the host's `people`, the portaled `MentionPicker`,
+the same grammar (`@` at a word boundary, never inside `a@b.com`), the same
+no-preselection keyboard rule (Enter is a newline until an arrow engages a
+row), the same `onMentionsChange`, and the same `onPickBlocked` no-access
+behavior (a blocked pick inserts NOTHING and the host shows its own dialog).
+
+**Key order at the textarea.** The menu is offered the key FIRST, then the
+card's own handlers run only if it did not consume the event:
+
+- `Escape` while the menu is open closes the MENU (the hook consumes it and
+  stops propagation). A second `Escape` cancels the edit, as it always did.
+- `Enter` with a row arrowed to inserts that person. `Enter` with nothing
+  active is untouched — still a newline.
+- `Mod+Enter` is never consumed by the menu (the hook declines any event
+  carrying a modifier), so save still saves.
+
+ARIA follows `CommentPopover`: `aria-autocomplete="list"` and
+`aria-haspopup="listbox"` exist only when a source is supplied,
+`aria-controls` / `aria-owns` only while the menu is open, and
+`aria-activedescendant` only while a row is active. With no source all five
+resolve to `undefined`, so the rendered attribute list is the one the edit box
+has always had.
+
+### 3. The save rule
+
+`handleSaveEdit` called `onEdit({ text })`. It now calls:
+
+```ts
+if (mentionSource && mentions.length > 0) onEdit({ text: editText, mentions });
+else onEdit({ text: editText });
+```
+
+which is the presence rule the creation composers already keep, one level
+down: **the key exists only when a source was supplied AND at least one id
+survived to save.** Never `mentions: []`, never the key with an `undefined`
+value — an untouched or pick-less edit calls `onEdit({ text })` byte for byte
+as it did in 0.44.0, so it can never wipe tags the annotation already carries.
+`source.onMentionsChange` fires from the hook exactly as it does in the
+composer, which on this surface means it reports `[]` once when the editor
+OPENS, before any pick: it is the live state of this edit session, not the
+annotation's stored `mentions`. Only `onEdit` is authoritative — a host that
+mirrors `onMentionsChange` into its own record must not treat that opening
+`[]` as a clear. The Save BUTTON and `Mod+Enter` go through the same call.
+
+**"This edit session" is literal.** The edit box was extracted into
+`AnnotationEditComposer`, mounted only while a card is in edit mode, so the
+hook's tagged-people state lives and dies with one session: reopen the editor
+and nobody is picked, and a save with no new pick is `{ text }` again — even
+if the previous session's `@Label` token is still sitting in the body. That is
+the conservative direction (the host owns `mentions` from then on, 0.43.1 §4),
+and it is the same reason a restored draft starts with nobody tagged.
+
+### 4. No chips in the edit box (known difference, and the follow-up)
+
+A picked token renders as a CHIP in `CommentPopover` (0.44.0) and as plain
+text here. The chip layer is `ComposerTextarea`'s mirrored, aria-hidden
+overlay behind a transparent-text textarea, with scroll mirroring and IME
+handling; the card's edit box is a plain `<textarea>` with its own sizing and
+classes. Duplicating that overlay for one more textarea is exactly the "two
+mirrored layers" mistake 0.44.0 avoided.
+
+**Named follow-up: move the card's edit box onto `ComposerTextarea`.** That is
+the one change that gets chips here without a second overlay, and it is a
+visible change to a surface Plannotator itself renders — a separate PR with
+its own no-op argument, not a rider on a seam release.
+
+Everything else about mentions is inherited unchanged and documented in the
+0.43.x / 0.44.0 sections above, including the three limits: two labels that
+sanitize to the same token, a restored draft reporting no ids, and a label
+that is a prefix of another label.
+
+### 5. One internal module, not a new seam
+
+`components/MentionAutocomplete.tsx` (`MentionAutocompleteMenu` +
+`mentionActiveOptionId`) is the glue between a `useMentionAutocomplete` result
+and `MentionPicker` — the id→index lookup, the no-op hover and the
+`aria-activedescendant` string. It exists so the third mount did not become a
+third verbatim copy of the same fifteen lines; `CommentPopover`'s two mounts
+were moved onto it in the same change, with no DOM difference (proven below).
+It is **internal**: it is not on the supported-import list and hosts never
+touch it — they pass `mentionSource`.
+
+### The no-op guarantee, and how it is pinned
+
+The same components were mounted on `origin/main` and on this branch in one
+harness and their `outerHTML` diffed, with `addEventListener` and `setTimeout`
+counts taken across each mount. With NEITHER new prop supplied, all six are
+byte-identical with identical counts:
+
+| scenario | bytes | listeners | timers |
+| --- | --- | --- | --- |
+| empty panel | 733 | 140 | 0 |
+| nine cards (comment, deletion, global, quick label, external `source`, unanchored, `inReplyTo` reply, a card with `renderCardFooter`, a `diffContext` card) | 17543 | 141 | 0 |
+| the same panel `readOnly` | 7854 | 141 | 0 |
+| a card in EDIT mode | 18586 | 142 | 0 |
+| the All-files grouped view (two document groups) | 19629 | 141 | 0 |
+| `CommentPopover` (the module the glue refactor touched) | 3130 | 286 | 1 |
+
+The edit-mode row is the one that matters for the hook: mounted with
+`source: undefined`, `useMentionAutocomplete` registers no listener, opens no
+menu state, returns the frozen empty id array, and the picker renders nothing —
+one extra listener would have shown up as 143.
+
+On top of the diff, committed tests pin the structure rather than a snapshot:
+with neither prop there is no `[data-annotation-card-header]` on any card, the
+edit textarea carries none of the five mention ARIA attributes, typing `@`
+opens nothing, and `onEdit` is called with an updates object whose key list is
+exactly `['text']`.
+
+Tests (both DOM-gated, both added to the workflow's DOM_TESTS step):
+`components/AnnotationPanel.cardHeader.test.tsx` (6) and
+`components/AnnotationPanel.editMentions.test.tsx` (10).
+
 ## Publishing & versioning
 
+- **ui 0.45.0 (annotation card header slot + mentions on the card's edit box): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.44.0, both props on `AnnotationPanel`: `renderCardHeader` (the header-row twin of `renderCardFooter`, wrapper `[data-annotation-card-header]`, renders under `readOnly`, open-document cards only in the All-files view) and `mentionSource` (the 0.43.0 type, applied to the card's EDIT box, saving `onEdit(id, { text, mentions })` only when a source was supplied and a pick survived). Nothing is removed, no new supported imports (`components/MentionAutocomplete` is internal glue), no export-, share- or archive-visible change, and Plannotator passes neither — `packages/editor` and `packages/review-editor` have zero source diff, and the panel is byte-identical to 0.44.0. Known difference from `CommentPopover`: no chips in the card's edit box (follow-up named in the section). See "Annotation card header slot and mentions on the edit box (0.45.0)".
+- **ui 0.44.0 (mention token chips in the composer): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.43.2: the `@Label` tokens a `mentionSource` composer inserted render as chips in the composer's existing highlight overlay, `MentionSource.tokenClassName?` lets a host restyle them (under the metric rule), `useMentionAutocomplete` also returns the surviving `mentions`, and `utils/composerTokens` joins the supported-import list. Nothing is removed, no export-, share- or archive-visible change, and Plannotator passes none of it — with neither `mentionSource` nor `skillReferences` the composer is byte-identical to 0.43.2. See "Mention token chips in the composer (0.44.0)".
+- **ui 0.43.1 (`mentionSource` on the viewers): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.43.0: `mentionSource` on `Viewer` and `HtmlViewer` (forwarded to every comment composer each mounts) and the optional `Annotation.mentions` field the picked ids land on, set only when a source was supplied and a token survived. Nothing is removed, no new modules, no export-, share- or archive-visible change, and Plannotator passes none of it. See "`mentionSource` on the viewers (0.43.1)".
+- **ui 0.43.0 (host toolbar seams): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive: `selectionActions` + `quickLabels` on `AnnotationToolbar` (forwarded by `Viewer`; `selectionActions` also by `HtmlViewer`), `mentionSource` on `CommentPopover`, an optional third `mentions` argument on that component's `onSubmit`, and the new supported modules `utils/selectionActions`, `utils/mentions`, `components/SelectionActionsDropdown`, `components/MentionPicker`, `hooks/useMentionAutocomplete`. Nothing is removed and Plannotator passes none of it. See "Host toolbar seams (0.43.0)".
+- **core 0.25.5 / ui 0.42.0 (diagram FILES, `.mmd`/`.mermaid`/`.dot`/`.gv`): additive on both packages, so the next publish is core-first.** `@plannotator/core/annotatable` gains `DiagramRenderKind`, `diagramRenderKindForPath`, `isDiagramRenderKind` and `annotateDiagramRenderKind`, and its built-in annotatable sets now include the four diagram extensions (`shouldStripFrontmatter` returns false for them — Mermaid's `--- … ---` config block is content — and they can no longer be registered through `markdownExtensions`). `@plannotator/ui` gains `diagramDocumentBlocks(text, kind)` on `utils/parser` (the ONE `code` block a whole-file diagram source renders as), `shareableDocumentMarkdown(markdown, renderAs)` on `utils/sharing`, the `DocumentRenderAs` type on `types` (`'markdown' | 'html' | DiagramRenderKind`, re-exporting core's kind), and an optional `Block.diagramSourceLineOffset` that `DiagramBlock` prefers over `Block.startLine` when resolving a diagram comment's `sourceLine` (unset on every parser-produced fence, so fences are byte-identical). `useLinkedDoc`'s `renderAs`/`setRenderAs`/`LinkedDocLoadData.renderAs` widen from `'markdown' | 'html'` to `DocumentRenderAs` — source-compatible for a host that only ever passes the old two, but a host whose own state is typed `'markdown' | 'html'` must widen its setter. Since core changes, **publish `core` first** and update UI's exact core dependency before packing ui.
 - **The current pair is `@plannotator/ui` `0.41.2` on `@plannotator/core` `0.25.4`.** Core is UNCHANGED from 0.41.1, so 0.41.2 publishes alone (`ui` only; core 0.25.4 must already be published). 0.41.2 ships the palette-derived Mermaid node shadow at a default of 70% (`DEFAULT_MERMAID_SHADOW_AMOUNT`) and the Settings → Display "Diagram Shadow" control (0 / 40 / 70 / 100); see "Node shadow (the one thing that is not a colour)" under "Theme-aware Mermaid diagrams (0.40.0)" for the mapping — no API removal, only additive exports (`buildMermaidShadow`, `DEFAULT_MERMAID_SHADOW_AMOUNT`, `utils/diagramShadow`).
 - The pair 0.41.1 shipped as was `@plannotator/ui` `0.41.1` on `@plannotator/core` `0.25.4`. Core is UNCHANGED from 0.41.0, so 0.41.1 published alone (`ui` only; core 0.25.4 must already be published). 0.41.1 is two fixes over 0.41.0 with no API change — the diagram engine is loaded lazily by the first diagram fence instead of riding every document read, and a press on the canvas's own controls no longer comments on the part behind them; see "0.41.1 — the engine is lazy, and the controls are not part of the diagram". The 0.41.0 notes below still describe the engine itself.
 - **The pair 0.41.0 shipped as was `@plannotator/ui` `0.41.0` on `@plannotator/core` `0.25.4`. Publish `core` 0.25.4 first, then `ui` 0.41.0** (both by hand from `main` after merge; CI never publishes these packages). 0.41.0 is the diagram engine (see "Diagram engine (0.41.0)"): one renderer slot and one canvas behind `MermaidBlock` / `GraphvizBlock`, the `components/diagram` surface, the Graphviz runtime slot with `@viz-js/viz` pinned `3.30.0`, and `Annotation.diagramAnchor`; core 0.25.4 adds the `diagram-anchor` subpath ui imports, so a ui 0.41.0 on a published core 0.25.3 would fail to compile in a consumer.

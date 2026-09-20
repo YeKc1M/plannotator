@@ -911,7 +911,7 @@ export function useHtmlAnnotation({
   );
 
   const handleCommentSubmit = useCallback(
-    (comment: string, images?: ImageAttachment[]) => {
+    (comment: string, images?: ImageAttachment[], mentions?: readonly string[]) => {
       if (!enabledRef.current) return;
       // Prefer the text captured when the popover opened — it can't be clobbered by
       // a later selection change or clear while the user is composing the comment.
@@ -944,6 +944,9 @@ export function useHtmlAnnotation({
         author: getIdentity(),
         createdA: Date.now(),
         images,
+        // Host capability: present only when a mentionSource was supplied AND
+        // a token survived, so a comment without one is unchanged.
+        ...(mentions && mentions.length > 0 ? { mentions } : {}),
         htmlAnchor: pendingAnchorRef.current ?? undefined,
         elementContext: pendingContextRef.current ?? undefined,
         htmlAdditionalTargets: additionalTargets,

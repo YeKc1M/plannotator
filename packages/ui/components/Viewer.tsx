@@ -59,6 +59,8 @@ import { DiagramBlockPending } from './diagram/DiagramPending';
 import { isGraphvizLanguage, isMermaidLanguage } from './diagramLanguages';
 import { getIdentity } from '../utils/identity';
 import { type QuickLabel } from '../utils/quickLabels';
+import type { SelectionAction } from '../utils/selectionActions';
+import type { MentionSource } from '../utils/mentions';
 import { DocBadges, type DocBadgesProps, type LinkedDocBadgeInfo } from './DocBadges';
 import { PinpointOverlay } from './PinpointOverlay';
 import { usePinpoint } from '../hooks/usePinpoint';
@@ -91,6 +93,28 @@ export interface ViewerAnnotationHeaderConfig {
 
 /** Public properties for the Markdown document Viewer. */
 export interface ViewerProps {
+  /**
+   * Opt-in host capability, passed straight through to the selection
+   * toolbars: the host's own commands for the current selection, rendered as
+   * one wand button that opens the package's dropdown. Absent → unchanged.
+   */
+  selectionActions?: SelectionAction[];
+  /** Opt-in host capability: the glyph on the `selectionActions` button on
+   *  both toolbars. Absent → the package's own wand. */
+  selectionActionsIcon?: React.ReactNode;
+  /**
+   * Whether the package's quick labels are offered on the selection toolbars
+   * (default true). `false` hides the Zap picker and the Alt+digit label
+   * shortcuts; the 👍 button is unaffected.
+   */
+  quickLabels?: boolean;
+  /**
+   * Opt-in host capability, forwarded to BOTH comment composers this viewer
+   * mounts (the text-selection composer and the global / code-block one): the
+   * `@` mention source for the composer's picker. The picked ids ride onto the
+   * created annotation as `Annotation.mentions`. Absent → unchanged.
+   */
+  mentionSource?: MentionSource;
   blocks: Block[];
   markdown: string;
   frontmatter?: Frontmatter | null;
@@ -360,6 +384,10 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   mode,
   inputMethod = 'drag',
   taterMode,
+  selectionActions,
+  selectionActionsIcon,
+  quickLabels,
+  mentionSource,
   globalAttachments = [],
   onAddGlobalAttachment,
   onRemoveGlobalAttachment,
@@ -543,6 +571,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     images?: ImageAttachment[],
     isQuickLabel?: boolean,
     quickLabelTip?: string,
+    mentions?: readonly string[],
   ) => {
     if (readOnlyRef.current) return;
 
@@ -562,6 +591,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
       createdA: Date.now(),
       author: getIdentity(),
       images,
+      // Host capability: present only when a mentionSource was supplied AND a
+      // token survived, so a code-block comment without one is unchanged.
+      ...(mentions && mentions.length > 0 ? { mentions } : {}),
       ...(isQuickLabel ? { isQuickLabel: true } : {}),
       ...(quickLabelTip ? { quickLabelTip } : {}),
     };
@@ -942,7 +974,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     setCodeBlockToolbar(null);
   };
 
-  const handleViewerCommentSubmit = (text: string, images?: ImageAttachment[]) => {
+  const handleViewerCommentSubmit = (
+    text: string,
+    images?: ImageAttachment[],
+    mentions?: readonly string[],
+  ) => {
     if (readOnlyRef.current || !viewerCommentPopover) return;
 
     if (viewerCommentPopover.isGlobal) {
@@ -960,12 +996,22 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         createdA: Date.now(),
         author: getIdentity(),
         images,
+        ...(mentions && mentions.length > 0 ? { mentions } : {}),
       };
       onAddAnnotation(newAnnotation);
     } else if (viewerCommentPopover.codeBlock) {
       const codeEl = viewerCommentPopover.codeBlock.element.querySelector('code');
       if (codeEl) {
-        applyCodeBlockAnnotation(viewerCommentPopover.codeBlock.block.id, codeEl, AnnotationType.COMMENT, text, images);
+        applyCodeBlockAnnotation(
+          viewerCommentPopover.codeBlock.block.id,
+          codeEl,
+          AnnotationType.COMMENT,
+          text,
+          images,
+          undefined,
+          undefined,
+          mentions,
+        );
       }
     }
 
@@ -1296,6 +1342,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               onClose={handleToolbarClose}
               onRequestComment={handleRequestComment}
               onQuickLabel={handleQuickLabel}
+              selectionActions={selectionActions}
+              selectionActionsIcon={selectionActionsIcon}
+              quickLabels={quickLabels}
               copyText={toolbarState.selectionText}
               hideCopyButton={!isTouchDevice}
               closeOnScrollOut
@@ -1351,6 +1400,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                 onClose={handleCodeBlockToolbarClose}
                 onRequestComment={handleCodeBlockRequestComment}
                 onQuickLabel={handleCodeBlockQuickLabel}
+                selectionActions={selectionActions}
+                selectionActionsIcon={selectionActionsIcon}
+                quickLabels={quickLabels}
                 isExiting={isCodeBlockToolbarExiting}
                 onMouseEnter={() => {
                   if (hoverTimeoutRef.current) {
@@ -1428,6 +1480,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               draftKey={`plan:${commentDraftScope}:${hookCommentPopover.draftKey}`}
               onSubmit={hookCommentSubmit}
               onClose={hookCommentClose}
+              mentionSource={mentionSource}
               allowImages={allowImages}
               skillReferences
               onAskAI={onAskAI}
@@ -1452,6 +1505,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
             }`}
             onSubmit={handleViewerCommentSubmit}
             onClose={handleViewerCommentClose}
+            mentionSource={mentionSource}
             allowImages={allowImages}
             skillReferences
             onAskAI={onAskAI}

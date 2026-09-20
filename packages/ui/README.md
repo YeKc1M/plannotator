@@ -220,6 +220,118 @@ the in-flow host integration.
 
 One renderer slot and one canvas render every Mermaid and Graphviz diagram — the fences in `Viewer` (`MermaidBlock`, `GraphvizBlock`), their popout, and whatever a host renders itself. `DiagramViewer` from `@plannotator/ui/components/diagram` takes `kind`, `source`, `theme` (`{ colorTheme, mode, shadowAmount? }`), `comments: DiagramComment[]` and `onCreateComment(anchor, text, additionalTargets)`; pass `onSave(source) => Promise<{ status: 'ok' } | { status: 'stale', currentSource }>` to get the Source pane (left of the canvas on desktop, under it on the phone; `readOnlySource` shows it without Save), and `sourceOpen` to toggle it. Zoom, pan and fit are the canvas's (wheel, drag, `+` `-` `0`, arrow keys); a click opens the composer at the part beneath while a drag pans (4 px threshold, 10 px for a finger), nothing highlights on a plain mouse-over (the ring under the pointer needs the platform modifier held), every edge carries an invisible 14 px hit path in one top layer and a click is resolved by priority over everything under the pointer (node, then edge, then cluster; an edge label is its edge), a click on no part comments on the whole diagram (kind `diagram`), sequence diagrams are addressable (actors, messages, notes, frames), a saved comment paints a ring and a numbered badge from the array order, and every comment re-resolves against each render through the engine's finder (id, then label, then unanchored — reported through `onUnanchoredChange`). The anchor is `DiagramAnchor` from `@plannotator/core/diagram-anchor` (`{ v: 1, family, kind, id | from + to, label, sourceLine }`, document lines), and Plannotator stores it as `Annotation.diagramAnchor`. Runtime slots: `utils/mermaid` (as before) and `utils/graphviz` (new, same shape, `@viz-js/viz` pinned `3.30.0`), each lazy on first use or filled by the host. `DiagramPopout` is the full-size viewer in the `PopoutDialog` chrome. See HANDOFF.md § "Diagram engine (0.41.0)" for every export, the adapter, the sanitizer and the migration notes.
 
+### Host toolbar seams (0.43.0)
+
+Two opt-in props for hosts that want their own commands and their own people
+inside the annotation UI. Both default to today's behavior — pass neither and
+the toolbar and the comment composer render byte-for-byte what they rendered
+in 0.42.0 (proven by diffing the mounted `outerHTML` against the base commit).
+
+- **`AnnotationToolbar` `selectionActions`** (forwarded by `Viewer` to both its
+  toolbars, and by `HtmlViewer` to the HTML selection toolbar): an array of
+  `{ id, label, detail?, icon?, onSelect(ctx) }`. They render as ONE wand
+  button (`data-selection-actions`) in the slot the quick-labels Zap occupied,
+  opening the package's dropdown below it (arrows + Enter + Escape, nothing
+  preselected until the first arrow). `onSelect` receives
+  `{ text, blockId, startOffset, endOffset, element }` — the same coordinates
+  an annotation created from that selection would carry (`blockId: ''` and
+  `startOffset: 0` on a surface with no blocks, such as raw HTML) — and the
+  toolbar closes. **The package creates no annotation:** what an action does is yours.
+  An empty array renders no button.
+- **`AnnotationToolbar` `selectionActionsIcon`** (forwarded by `Viewer` and
+  `HtmlViewer`): the glyph on the `selectionActions` button, so a host can match
+  the wand it draws elsewhere. Absent means the package's own wand; nothing else
+  about the button changes.
+- **`AnnotationToolbar` `quickLabels`** (default `true`): `false` hides the Zap
+  picker and makes the Alt+digit label shortcuts inert on that toolbar. The
+  one-click 👍 is unaffected, and mode state is still yours to clamp.
+- **`CommentPopover` `mentionSource`** (0.43.2 adds `heading?` above the list
+  and an optional `avatar?: { url?, initials?, tint? }` per person, drawn before
+  the label; both absent → the 0.43.1 rows): `{ people, emptyNotice?,
+  onMentionsChange?, onPickBlocked? }` over `MentionPerson`
+  (`{ id, kind, label, detail, canOpen }`). Typing `@` at a word boundary opens
+  a portaled picker measured from the textarea; picking inserts the readable
+  `@Label ` token, and the ids ride `onMentionsChange(ids)` plus an optional
+  third `onSubmit(text, images?, mentions?)` argument that is passed **only**
+  when a source is supplied. Deleting a token untags that person. A
+  `canOpen: false` person inserts nothing when you supply `onPickBlocked` (your
+  no-access dialog) and inserts normally when you do not. Not wired to any
+  Plannotator data and not a `configurePlannotatorUI` seam — pass it where you
+  render the composer.
+- **`CommentPopover` mention chips** (0.44.0): with a `mentionSource`, the
+  `@Label` tokens the picker inserted render as chips in the composer's text —
+  the same mirrored overlay skill references use, never a second layer. Each
+  chip span carries `data-mention-token="<person id>"` and
+  `data-mention-kind`, which is `MentionPerson.kind` verbatim — today that is
+  always `user`, because the picker offers users only; `agent` is reserved
+  and matches nothing yet. `MentionSource.tokenClassName?` is appended to the
+  span for your own look. **Metric rule, yours to keep too:** a chip
+  may change color, background, border-radius, box-shadow and text-decoration
+  ONLY — padding, margin, border width, weight, tracking or size move a glyph
+  and drift the caret off the painted text (want a pill? add
+  `box-shadow: 0 0 0 Npx <background>`, which paints without taking space).
+  Only a person you supplied and the author picked is a chip, and editing a
+  byte of the token un-chips it in the same render that drops the id. Two
+  inherited limits: two labels that sanitize to the same token are one token
+  in a plain-text body, so the first person you list owns every occurrence of
+  it; and a restored draft has no chips (and reports no ids) until the author
+  picks again. No source → no overlay element at all.
+- **`Viewer` / `HtmlViewer` `mentionSource`** (0.43.1): the same prop on the two
+  viewers, forwarded to every comment composer each of them mounts, so a host
+  wires mentions once per surface instead of per composer. The ids the author
+  kept ride onto the created annotation as `Annotation.mentions`
+  (`readonly string[]`, present only when a source was supplied and at least
+  one token survived). It is host data: the package never renders, exports,
+  shares or archives it.
+
+See HANDOFF.md § "Host toolbar seams (0.43.0)" for the grammar, the keyboard
+rules and the threading points, and § "mentionSource on the viewers (0.43.1)"
+for the two viewer props and the annotation field. § "Mention token chips in
+the composer (0.44.0)" covers the chips, the metric rule, the merged-range
+refactor behind them, and the three inherited limits (duplicate labels,
+restored drafts, and a label that is a prefix of another label).
+
+### Annotation card seams (`AnnotationPanel`; 0.45.0)
+
+Two more opt-in props, both on the panel and both defaulting to today's
+behavior — pass neither and the panel renders byte-for-byte what it rendered
+in 0.44.0 (proven by diffing mounted `outerHTML` against the base commit for
+an empty panel, every card kind, a card in edit mode, `readOnly` and the
+All-files view).
+
+- **`renderCardHeader?: (annotation) => ReactNode`** — the twin of
+  `renderCardFooter`, rendered inside each plan-annotation card's header row
+  after `author · time` and before the built-in edit/delete actions: the place
+  for a status stamp (resolved, needs reply, a reviewer badge). Its wrapper is
+  `[data-annotation-card-header]` and swallows clicks and keydowns, so
+  interacting with your stamp never selects the card. It renders under
+  `readOnly` for the same reason the footer does — a stamp is a read
+  affordance — and, like the footer, only on the OPEN document's cards in the
+  All-files grouped view. Return `null` for a card and no wrapper exists for
+  it; omit the prop and no wrapper exists at all. The header row is one
+  non-wrapping flex line, so keep the stamp compact: the wrapper shrinks but
+  a node that cannot will overflow toward the built-in actions.
+- **`mentionSource?: MentionSource`** — the same source `Viewer` and
+  `HtmlViewer` take (0.43.1), applied to the card's EDIT box, so a comment can
+  be re-tagged after it was written. The grammar, the picker, the keyboard
+  rules and `onPickBlocked` are the ones documented above. Saving an edit
+  calls `onEdit(id, { text, mentions })` **only** when a source is supplied
+  AND at least one person was picked in that edit session whose token
+  survives; otherwise it is the `onEdit(id, { text })` it always was, so an
+  untouched or pick-less edit can never wipe tags the annotation already
+  carries. Reopening the editor starts a fresh session with nobody picked, and
+  `onMentionsChange` follows that session — it reports `[]` once when the
+  editor opens, so treat it as the live picker state, never as the
+  annotation's stored tags.
+  **One difference from `CommentPopover`: no chips** — the token stays plain
+  text, because the chip layer lives in the composer's mirrored overlay and is
+  not worth duplicating; the follow-up is to move the card's edit box onto
+  `ComposerTextarea`.
+
+Neither prop reaches `CodeAnnotation` cards (the review-editor shape), which
+take no `renderCardFooter` either. See HANDOFF.md § "Annotation card header
+slot and mentions on the edit box (0.45.0)".
+
 ### WebMCP provider (`@plannotator/ui/webmcp`; 0.32.0)
 
 The engine that lets a browser-integrated agent (Chrome/Edge WebMCP, `document.modelContext`) call in-page tools on a document surface. Feature-detected once; a browser without the API sees no registration, no DOM, no network, no timers. Seam: `configurePlannotatorUI({ webmcp: { enabled, namePrefix } })`, default enabled with the `plannotator.` prefix; pass `enabled: false` to keep a host page tool-free, or your own prefix to namespace the tools beside your own. There is deliberately no confirmation seam: the catalog is read-and-comment only (no approve / submit / close tools), and the agent may only edit or remove comments stamped `source: "browser-agent"`.
@@ -255,7 +367,7 @@ npm install @plannotator/ui @plannotator/core
 - `@plannotator/core` — pure utils + types, zero deps, browser-safe (CI enforces no `node:` imports). Published.
 - `@plannotator/ui` — React components/hooks + theme + `configure()`. Depends on an exact published `@plannotator/core` version. Published.
 - `@plannotator/shared`, `@plannotator/ai` — stay private to the monorepo; `shared` re-exports `core`'s modules via shims so Plannotator's internals are untouched.
-- Currently `@plannotator/ui` 0.41.0 depends exactly on `@plannotator/core` 0.25.4. `core` is bumped only when something under `packages/core` changes, so `ui` can advance alone. Keep the published core version exact in `packages/ui/package.json`; do not use a `workspace:` protocol there, because a directly published manifest must remain installable outside this monorepo. Bun still links the matching local workspace during development. When both packages change, publish `core` first, then build and publish the UI tarball. See HANDOFF.md "Publishing & versioning" for the verification command.
+- Currently `@plannotator/ui` 0.43.0 depends exactly on `@plannotator/core` 0.25.5. `core` is bumped only when something under `packages/core` changes, so `ui` can advance alone. Keep the published core version exact in `packages/ui/package.json`; do not use a `workspace:` protocol there, because a directly published manifest must remain installable outside this monorepo. Bun still links the matching local workspace during development. When both packages change, publish `core` first, then build and publish the UI tarball. See HANDOFF.md "Publishing & versioning" for the verification command.
 
 ## The one rule
 

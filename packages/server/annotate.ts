@@ -64,6 +64,7 @@ import {
 } from "@plannotator/shared/live-proxy-core";
 import { randomBytes } from "node:crypto";
 import { isAgentTerminalWsRoute, supportsAnnotateAgentTerminalMode } from "@plannotator/shared/agent-terminal";
+import { annotateDiagramRenderKind } from "@plannotator/shared/annotatable";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -279,6 +280,18 @@ export async function startAnnotateServer(
   const isRemote = isRemoteSession();
   const wslFlag = await isWSL();
   const gitUser = detectGitUser();
+
+  // Diagram sources (.mmd/.mermaid/.dot/.gv) render through the diagram
+  // engine rather than the markdown pipeline: the document body stays the raw
+  // file text and /api/plan names the engine in `renderAs`. Session-level and
+  // path-only (see annotateDiagramRenderKind), so raw-HTML, converted, URL,
+  // folder, message and live-app sessions are untouched.
+  const diagramRenderKind = annotateDiagramRenderKind({
+    filePath,
+    mode,
+    renderHtml,
+    sourceConverted,
+  });
 
   // Per-file version history → powers the native version diff in annotate mode.
   // Unlike the plan flow (slug = first-heading + date), annotate keys history by
@@ -770,7 +783,7 @@ export async function startAnnotateServer(
               clientLease: clientLeaseSupported
                 ? { enabled: true as const, reconnectGraceMs: clientLeaseGraceMs }
                 : { enabled: false as const },
-              renderAs: displayRawHtml ? 'html' as const : 'markdown' as const,
+              renderAs: displayRawHtml ? 'html' as const : diagramRenderKind ?? ('markdown' as const),
               ...(displayRawHtml ? { rawHtml: displayRawHtml } : {}),
               ...(diffHtml ? { diffHtml } : {}),
               convertHtml,

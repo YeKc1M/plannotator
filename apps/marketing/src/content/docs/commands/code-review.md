@@ -103,9 +103,11 @@ By default the review opens showing **all changes since your base branch** — e
 - **Last commit** - the diff introduced by the most recent commit
 - **vs main** (or your default branch) - all committed changes on your branch compared to the base branch. Only appears when you're on a branch other than the default.
 
-The first time you open a review, a setup dialog lets you choose your default view and diff type; you can change both later in **Settings → Git** or reopen the dialog from the review header menu. On repos where the base branch can't be resolved, the review falls back to uncommitted changes.
+Your default view and diff type live in **Settings → Git**. On repos where the base branch can't be resolved, the review falls back to uncommitted changes.
 
 If the base branch has moved on GitHub since your last fetch, a "Baseline is behind" banner offers a one-click fetch so you're reviewing against the real base.
+
+Answering that question needs one network call, `git ls-remote --symref origin HEAD`. It runs when the review opens, when the diff loads, when you switch diff type or base (the "Diff out of date · Refresh" button counts), and when you press Fetch — at most once a minute, and never on a timer, so a review page you leave open makes no further requests. If a remote probe is expensive or intrusive on your setup — most sharply when SSH authentication is backed by a hardware token, where each probe is a physical touch prompt — turn it off entirely with `plannotator review --no-git-remote-check`, `PLANNOTATOR_GIT_REMOTE_CHECK=0`, or `{ "gitRemoteCheck": false }` in `~/.plannotator/config.json`. The compare target then comes from your local refs only and the banner never appears — and with it the one-click Fetch, since that button lives in the banner. Fetching from your own terminal is unaffected. The trade-off: a push that lands mid-review is noticed on your next refresh, switch, or reload rather than within the minute.
 
 You can also pick a specific commit as the diff base from the base branch picker. This lets you compare against any of the last 20 commits on your branch rather than just the branch tip.
 
@@ -128,7 +130,7 @@ plannotator review --base HEAD~3
 
 `--base` accepts anything git resolves: a local branch, a remote-tracking ref, a tag, or a commit SHA. `--diff-type` accepts the nine git diff modes (`since-base`, `local-vs-remote`, `uncommitted`, `staged`, `unstaged`, `last-commit`, `branch`, `merge-base`, `all`).
 
-Both flags are **session-only**: they seed how the session opens, the base picker and diff type dropdown stay fully usable, and nothing is written to your saved defaults — your next plain `plannotator review` opens exactly as before. A flagged session also skips the one-time first-run setup dialog without consuming it, so it still greets your next ordinary review.
+Both flags are **session-only**: they seed how the session opens, the base picker and diff type dropdown stay fully usable, and nothing is written to your saved defaults — your next plain `plannotator review` opens exactly as before.
 
 Notes:
 
@@ -175,7 +177,7 @@ The standalone GitButler CLI installer supports macOS and Linux. On Windows, ins
 
 The review UI shows your changes in a familiar diff format:
 
-- **Left panel views** — a `Git status | Tree | Commits` toggle in the header (see below)
+- **Left panel views** — a `Tree | Git status | Commits` toggle in the header (see below)
 - **Viewed tracking** to mark files as reviewed and track your progress
 - **Unified diff** showing additions and deletions in context
 - **Annotation tools** with the same annotation types as plan review (delete, comment, quick label, "looks good")
@@ -219,10 +221,10 @@ Call Flow is syntactic and does not resolve types, imports, runtime dispatch, or
 
 ### Panel views
 
-The left panel has three views. The header toggle is session-scoped — glancing at another view never changes your saved default (that's a Settings / setup-dialog decision).
+The left panel has three views. **Tree** is the default. The header toggle is session-scoped — glancing at another view never changes your saved default (change that in Settings → Git).
 
-- **Git status** (default) — your changes grouped the way `git status` groups them: **Committed / Changes / Untracked**. Each row shows viewed state, a stage/unstage button, the change-type letter, and +/- counts. Only available with the "All changes" diff.
-- **Tree** — the classic file tree over whichever diff type you've selected.
+- **Git status** — your changes grouped the way `git status` groups them: **Committed / Changes / Untracked**. Each row shows viewed state, a stage/unstage button, the change-type letter, and +/- counts. Only available with the "All changes" diff.
+- **Tree** (default) — the classic file tree over whichever diff type you've selected.
 - **Commits** — a linear history rail of your branch, newest first, with an "In origin/main" divider where your work meets the base. Clicking a commit opens that commit's own diff (vs its parent), headed by the full commit message. Local git sessions only; a commit is never saved as your opening view.
 
 ## Annotating code

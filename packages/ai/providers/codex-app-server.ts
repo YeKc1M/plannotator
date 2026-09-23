@@ -44,6 +44,7 @@ import {
   resolveWindowsCommandShim,
 } from "./command-path.ts";
 import { guardChildStreams, writeChildLine } from "./child-io.ts";
+import { CODEX_FALLBACK_MODELS, effortList, type CatalogModel } from "@plannotator/core/model-catalog";
 
 const PROVIDER_NAME = "codex-sdk";
 const CODEX_PROCESS_LABEL = "Codex app-server";
@@ -66,32 +67,38 @@ const FILE_APPROVAL_METHOD = "item/fileChange/requestApproval";
 // response shape from the two above ({permissions} grant, not {decision}).
 const PERMISSIONS_APPROVAL_METHOD = "item/permissions/requestApproval";
 
-/** Display labels for Codex's reasoning-effort ids. `xhigh` is shown verbatim
- *  (Codex's own term), not "Max" or "Extra High". */
-const REASONING_EFFORT_LABELS: Record<string, string> = {
-  none: "None",
-  minimal: "Minimal",
-  low: "Low",
-  medium: "Medium",
-  high: "High",
-  xhigh: "xhigh",
-  max: "Max",
-  ultra: "Ultra",
-};
-
-type ProviderModel = {
-  id: string;
-  label: string;
-  default?: boolean;
-  reasoningEfforts?: { id: string; label: string }[];
-  defaultReasoningEffort?: string;
-};
-
 // ---------------------------------------------------------------------------
 // Pure helpers (exported for testing)
 // ---------------------------------------------------------------------------
 
 export type RpcMessage = Record<string, unknown>;
+
+/** Map Codex `model/list` entries to the shared catalog shape. */
+export function codexCatalogFromModelList(data: readonly RpcMessage[]): CatalogModel[] {
+  return data
+    .filter((m) => !m.hidden && typeof m.id === "string" && m.id)
+    .map((m) => {
+      const efforts = ((m.supportedReasoningEfforts as RpcMessage[] | undefined) ?? [])
+        .map((e) => e.reasoningEffort)
+        .filter((e): e is string => typeof e === "string" && !!e);
+      // Codex's own ModelPreset::supports_fast_mode: a `serviceTiers` entry whose
+      // id is the fast tier's request value ("priority"; "fast" is its alias),
+      // or the deprecated `additionalSpeedTiers` containing "fast".
+      const serviceTiers = Array.isArray(m.serviceTiers) ? (m.serviceTiers as RpcMessage[]) : [];
+      const speedTiers = Array.isArray(m.additionalSpeedTiers) ? m.additionalSpeedTiers : [];
+      const fast = serviceTiers.some((t) => t?.id === "priority" || t?.id === "fast") || speedTiers.includes("fast");
+      return {
+        id: m.id as string,
+        label: (m.displayName as string) || (m.id as string),
+        ...(m.isDefault ? { default: true } : {}),
+        ...(efforts.length ? { reasoningEfforts: effortList(efforts) } : {}),
+        ...(typeof m.defaultReasoningEffort === "string" && m.defaultReasoningEffort
+          ? { defaultReasoningEffort: m.defaultReasoningEffort }
+          : {}),
+        ...(fast ? { fastMode: true } : {}),
+      };
+    });
+}
 
 export type RpcClassification =
   | { kind: "response"; id: string | number }
@@ -560,15 +567,12 @@ export class CodexAppServerProvider implements AIProvider {
     tools: true,
   };
   // Fallback used only until fetchModels() replaces it with Codex's real list
-  // (model/list). Reasoning efforts are intentionally omitted here so the UI
-  // hides the control until we have the model's actual supported set.
-  models: ProviderModel[] = [
-    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", default: true },
-  ];
+  // (model/list).
+  models: CatalogModel[] = CODEX_FALLBACK_MODELS;
+  modelsSource: "fallback" | "discovered" = "fallback";
 
   private config: CodexSDKConfig;
   private sessions = new Set<CodexAppServerSession>();
-  private modelsLoaded = false;
 
   constructor(config: CodexSDKConfig) {
     this.config = config;
@@ -577,11 +581,11 @@ export class CodexAppServerProvider implements AIProvider {
   /**
    * Populate `models` from Codex's `model/list` — the real models plus each
    * model's actual supportedReasoningEfforts + defaultReasoningEffort. Spawns a
-   * throwaway app-server (like the Pi/OpenCode providers' fetchModels). Keeps
-   * the static fallback on any failure.
+   * throwaway app-server (like the Pi/OpenCode providers' fetchModels). On
+   * failure the static fallback stays and the error propagates, so the
+   * runtime's once-wrapper may retry later.
    */
   async fetchModels(): Promise<void> {
-    if (this.modelsLoaded) return;
     const proc = new CodexAppServerProcess();
     try {
       await proc.start(
@@ -603,27 +607,10 @@ export class CodexAppServerProvider implements AIProvider {
         cursor = (res.nextCursor as string | undefined) ?? undefined;
         if (!cursor) break;
       }
-      const models: ProviderModel[] = data
-        .filter((m) => !m.hidden && typeof m.id === "string")
-        .map((m) => {
-          const efforts = ((m.supportedReasoningEfforts as RpcMessage[] | undefined) ?? [])
-            .map((e) => e.reasoningEffort as string)
-            .filter(Boolean)
-            .map((id) => ({ id, label: REASONING_EFFORT_LABELS[id] ?? id }));
-          return {
-            id: m.id as string,
-            label: (m.displayName as string) || (m.id as string),
-            ...(m.isDefault ? { default: true } : {}),
-            ...(efforts.length ? { reasoningEfforts: efforts } : {}),
-            ...(m.defaultReasoningEffort
-              ? { defaultReasoningEffort: m.defaultReasoningEffort as string }
-              : {}),
-          };
-        });
-      if (models.length) this.models = models;
-      this.modelsLoaded = true;
-    } catch {
-      // Keep the static fallback list.
+      const models = codexCatalogFromModelList(data);
+      if (models.length === 0) throw new Error("codex reported no models");
+      this.models = models;
+      this.modelsSource = "discovered";
     } finally {
       proc.kill();
     }
@@ -680,7 +667,7 @@ interface SessionConfig {
   parentSessionId: string | null;
   codexExecutablePath: string;
   model: string;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: string;
   resumeThreadId?: string;
   onClosed: (session: CodexAppServerSession) => void;
 }

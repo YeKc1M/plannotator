@@ -11,7 +11,8 @@
 // ---------------------------------------------------------------------------
 
 import type { AIContext, AIContextMode, PlanContext, CodeReviewContext, AnnotateContext, ParentSession } from '@plannotator/core/ai-context';
-export type { AIContext, AIContextMode, PlanContext, CodeReviewContext, AnnotateContext, ParentSession };
+import type { CatalogModel } from '@plannotator/core/model-catalog';
+export type { AIContext, AIContextMode, PlanContext, CodeReviewContext, AnnotateContext, ParentSession, CatalogModel };
 
 // ---------------------------------------------------------------------------
 // Messages — what streams back from the AI
@@ -187,10 +188,10 @@ export interface CreateSessionOptions {
    */
   maxBudgetUsd?: number;
   /**
-   * Reasoning effort level (Codex only).
+   * Reasoning effort level — one of the selected model's `reasoningEfforts`.
    * Controls how much thinking the model does before responding.
    */
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: string;
 }
 
 /**
@@ -212,15 +213,14 @@ export interface AIProvider {
   readonly capabilities: AIProviderCapabilities;
 
   /** Available models for this provider. */
-  readonly models?: ReadonlyArray<{
-    id: string;
-    label: string;
-    default?: boolean;
-    /** Reasoning-effort options this model supports (provider-reported). */
-    reasoningEfforts?: ReadonlyArray<{ id: string; label: string }>;
-    /** The model's default reasoning effort. */
-    defaultReasoningEffort?: string;
-  }>;
+  readonly models?: ReadonlyArray<CatalogModel>;
+
+  /**
+   * Where `models` came from, for providers that start on a static fallback:
+   * `fallback` until discovery succeeds, then `discovered`. Clients use it to
+   * retry a fallback answer on a later load instead of caching it.
+   */
+  readonly modelsSource?: 'fallback' | 'discovered';
 
   /**
    * Create a fresh session (no parent history).

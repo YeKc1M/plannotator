@@ -1,6 +1,6 @@
 import {
   createAIEndpoints,
-  createBestEffortOnce,
+  createDeferredModelDiscovery,
   createProvider,
   ProviderRegistry,
   SessionManager,
@@ -27,7 +27,11 @@ export async function createAIRuntime(options: CreateAIRuntimeOptions = {}): Pro
   const registry = new ProviderRegistry();
   const sessionManager = new SessionManager();
   const modelDiscovery: Promise<void>[] = [];
-  const providerInitializers = new Map<string, () => Promise<void>>();
+  // Model discovery spawns the provider's CLI, so it runs on first explicit
+  // activation (?activate= from a model picker) or the first session — never
+  // at startup.
+  const discovery = createDeferredModelDiscovery();
+  const deferModelDiscovery = discovery.defer;
 
   try {
     await import("@plannotator/ai/providers/claude-agent-sdk");
@@ -37,7 +41,10 @@ export async function createAIRuntime(options: CreateAIRuntimeOptions = {}): Pro
       cwd,
       ...(claudePath && { claudeExecutablePath: claudePath }),
     });
-    registry.register(provider);
+    const providerId = registry.register(provider);
+    // A Claude session spawns its own `claude`, so it never waits on discovery
+    // (~2s, up to 10s): the first Ask AI answer starts at once.
+    deferModelDiscovery(providerId, provider, { blockSession: false });
   } catch {
     // Claude SDK not available.
   }
@@ -52,14 +59,7 @@ export async function createAIRuntime(options: CreateAIRuntimeOptions = {}): Pro
         ...(codexPath ? { codexExecutablePath: codexPath } : {}),
       });
       const providerId = registry.register(provider);
-      if ("fetchModels" in provider) {
-        providerInitializers.set(
-          providerId,
-          createBestEffortOnce(
-            () => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
-          ),
-        );
-      }
+      deferModelDiscovery(providerId, provider);
     }
   } catch {
     // Codex not available.
@@ -125,14 +125,7 @@ export async function createAIRuntime(options: CreateAIRuntimeOptions = {}): Pro
       // for every user with opencode installed, and interrupted sessions
       // orphaned it. The initializer runs on first explicit activation
       // (?activate= from the model picker) or first opencode session.
-      if ("fetchModels" in provider) {
-        providerInitializers.set(
-          providerId,
-          createBestEffortOnce(
-            () => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
-          ),
-        );
-      }
+      deferModelDiscovery(providerId, provider);
     }
   } catch {
     // OpenCode not available.
@@ -145,9 +138,7 @@ export async function createAIRuntime(options: CreateAIRuntimeOptions = {}): Pro
     beforeCapabilities: async () => {
       await Promise.allSettled(modelDiscovery);
     },
-    beforeProviderSession: async (providerId) => {
-      await providerInitializers.get(providerId)?.();
-    },
+    beforeProviderSession: discovery.beforeProviderSession,
   });
 
   return {

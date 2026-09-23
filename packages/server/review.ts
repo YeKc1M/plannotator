@@ -69,8 +69,9 @@ import { type AgentJobInfo, REVIEW_OUTPUT_FAILED, getAgentJobAnnotationContext, 
 import { createCommitAvatarResolver } from "@plannotator/shared/commit-avatars";
 import { detectGeneratedFiles, detectGeneratedFilesByName } from "@plannotator/shared/generated-files";
 import { getRepoInfo } from "./repo";
-import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleApiNotFound, handleFavicon, readDraftGenerationFromBody, readDraftGenerationFromUrl, type OpencodeClient } from "./shared-handlers";
-import { contentHash, deleteDraft } from "./draft";
+import { handleImage, handleUpload, handleAgents, handleServerReady, handleApiNotFound, handleFavicon, readDraftGenerationFromBody, readDraftGenerationFromUrl, type OpencodeClient } from "./shared-handlers";
+import { contentHash } from "./draft";
+import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "@plannotator/shared/review-draft";
 import { createEditorAnnotationHandler } from "./editor-annotations";
 import { createExternalAnnotationHandler } from "./external-annotations";
 import { createAgentJobHandler } from "./agent-jobs";
@@ -222,6 +223,8 @@ export interface ReviewServerOptions {
   prMetadata?: PRMetadata;
   /** Platform review writer override used by isolated runtime tests. */
   prReviewSubmitter?: typeof submitPRReview;
+  /** In-place PR switch fetcher override used by isolated runtime tests. */
+  prFetcher?: typeof fetchPR;
   /**
    * The initial layer patch is missing per-file content (platform APIs
    * withhold patches on very large PRs). Enables the local recompute upgrade
@@ -386,6 +389,15 @@ export async function startReviewServer(
   let originalPRGitRef = options.gitRef;
   let originalPRError = options.error;
   let currentPRDiffScope: PRDiffScope = "layer";
+  // Draft keys for the diff on screen (#1590). Outside PR mode only the patch
+  // key exists and every draft call behaves exactly as before; in PR mode the
+  // draft is also reachable by the PR's stable target identity. Read late:
+  // an in-place PR switch or a scope change moves both keys.
+  const reviewDrafts = createReviewDraftSession();
+  const currentDraftKeys = (): ReviewDraftKeys => ({
+    patchKey: draftKey,
+    targetKey: isPRMode && prMetadata ? prDraftTargetKey(prMetadata, currentPRDiffScope) : null,
+  });
   // Monotonic guard for PR scope/switch state writes. Scope requests now park
   // on long awaits (checkout warmup, full recompute) — a request that resumed
   // after a NEWER scope select or pr-switch must not overwrite their state.
@@ -2751,6 +2763,7 @@ export async function startReviewServer(
                   aiReviewContext: buildCurrentAiReviewContext(),
                   gitRef: currentGitRef,
                   snapshotId: currentSnapshotId(),
+                  draftState: reviewDrafts.state(currentDraftKeys()),
                   approvalNotesSupported,
                   ...sourceKindAdvert,
                   prDiffScope: currentPRDiffScope,
@@ -2809,6 +2822,7 @@ export async function startReviewServer(
                   aiReviewContext: buildCurrentAiReviewContext(),
                   gitRef: currentGitRef,
                   snapshotId: currentSnapshotId(),
+                  draftState: reviewDrafts.state(currentDraftKeys()),
                   approvalNotesSupported,
                   ...sourceKindAdvert,
                   prDiffScope: currentPRDiffScope,
@@ -2858,6 +2872,7 @@ export async function startReviewServer(
                 aiReviewContext: buildCurrentAiReviewContext(),
                 gitRef: currentGitRef,
                 snapshotId: currentSnapshotId(),
+                draftState: reviewDrafts.state(currentDraftKeys()),
                 approvalNotesSupported,
                 ...sourceKindAdvert,
                 prDiffScope: currentPRDiffScope,
@@ -2911,7 +2926,7 @@ export async function startReviewServer(
               }
 
               const cached = prSwitchCache.get(body.url);
-              const pr = cached ?? await fetchPR(newRef);
+              const pr = cached ?? await (options.prFetcher ?? fetchPR)(newRef);
               if (!cached) prSwitchCache.set(body.url, pr);
 
               // Update mutable server state. Bump the scope epoch so a scope
@@ -2988,6 +3003,7 @@ export async function startReviewServer(
                 aiReviewContext: buildCurrentAiReviewContext(),
                 gitRef: currentGitRef,
                 snapshotId: currentSnapshotId(),
+                draftState: reviewDrafts.state(currentDraftKeys()),
                 approvalNotesSupported,
                 ...sourceKindAdvert,
                 prMetadata: pr.metadata,
@@ -3509,9 +3525,35 @@ export async function startReviewServer(
 
           // API: Annotation draft persistence
           if (url.pathname === "/api/draft") {
-            if (req.method === "POST") return handleDraftSave(req, draftKey);
-            if (req.method === "DELETE") return handleDraftDelete(draftKey, req);
-            return handleDraftLoad(draftKey);
+            if (req.method === "POST") {
+              try {
+                const keys = currentDraftKeys();
+                const saved = reviewDrafts.save(keys, await req.json());
+                // PR mode reports a rejected (stale-generation) save instead of
+                // swallowing it; local reviews keep the historical always-ok.
+                if (!saved && keys.targetKey) {
+                  return Response.json(
+                    { ok: false, error: "stale draft generation", ...reviewDrafts.state(keys) },
+                    { status: 409 },
+                  );
+                }
+                return Response.json({ ok: true });
+              } catch (err) {
+                const message = err instanceof Error ? err.message : "Failed to save draft";
+                console.error(`[draft] save failed: ${message}`);
+                return Response.json({ error: message }, { status: 500 });
+              }
+            }
+            if (req.method === "DELETE") {
+              reviewDrafts.remove(currentDraftKeys(), readDraftGenerationFromUrl(req));
+              return Response.json({ ok: true });
+            }
+            const loaded = reviewDrafts.load(currentDraftKeys());
+            if (loaded.found) return Response.json(loaded.draft);
+            return Response.json(
+              { found: false, ...(loaded.draftGeneration !== null ? { draftGeneration: loaded.draftGeneration } : {}) },
+              { status: 404 },
+            );
           }
 
           // API: Editor annotations (VS Code extension)
@@ -3596,7 +3638,7 @@ export async function startReviewServer(
             // often reviews are closed without feedback is exactly the
             // behavior data the archive exists to answer.
             archiveReviewSubmission("", [], "dismissed");
-            deleteDraft(draftKey, readDraftGenerationFromUrl(req));
+            reviewDrafts.settle(currentDraftKeys(), readDraftGenerationFromUrl(req));
             resolveDecision({ approved: false, feedback: "", annotations: [], exit: true });
             return Response.json({ ok: true });
           }
@@ -3627,7 +3669,7 @@ export async function startReviewServer(
                 annotationsValue,
                 approved ? (hasContent ? "approved-with-notes" : "lgtm") : "feedback",
               );
-              if (durable) deleteDraft(draftKey, readDraftGenerationFromBody(body));
+              if (durable) reviewDrafts.settle(currentDraftKeys(), readDraftGenerationFromBody(body));
               resolveDecision({
                 approved,
                 feedback: feedbackValue,

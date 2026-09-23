@@ -29,7 +29,7 @@ for f in config-types storage-types workspace-status-types; do
 done
 
 # Everything else in the original flat list stays sourced from packages/shared.
-for f in prompts review-core generated-files feedback-archive cli-pagination jj-core gitbutler-core vcs-core review-args review-open-state draft annotate-history pr-types pr-context-live pr-artifact-document pr-provider pr-stack pr-github pr-gitlab checklist integrations-common repo reference-common markdown-extensions resolve-file doc-resolve file-browser-watch-core annotate-reference-roots-node worktree worktree-pool html-to-markdown html-diff html-assets html-assets-node url-to-markdown tour annotate-args annotate-target at-reference review-workspace-node review-workspace pfm-reminder improvement-hooks code-nav data-dir semantic-diff-types semantic-diff call-flow-types call-flow-languages call-flow-pack-locks call-flow-install-lock call-flow call-flow-install single-flight source-save-node review-profiles guide-store guide-instructions-store commit-avatars commit-history port-range annotate-client-lease annotate-decision archive-mode tailscale live-proxy-core live-probe live-proxy-node; do
+for f in prompts review-core generated-files feedback-archive cli-pagination jj-core gitbutler-core vcs-core review-args review-open-state draft review-draft annotate-history pr-types pr-context-live pr-artifact-document pr-provider pr-stack pr-github pr-gitlab checklist integrations-common repo reference-common markdown-extensions resolve-file doc-resolve file-browser-watch-core annotate-reference-roots-node worktree worktree-pool html-to-markdown html-diff html-assets html-assets-node url-to-markdown tour annotate-args annotate-target at-reference review-workspace-node review-workspace pfm-reminder improvement-hooks code-nav data-dir semantic-diff-types semantic-diff call-flow-types call-flow-languages call-flow-pack-locks call-flow-install-lock call-flow call-flow-install single-flight source-save-node review-profiles guide-store guide-instructions-store commit-avatars commit-history port-range annotate-client-lease annotate-decision archive-mode tailscale live-proxy-core live-probe live-proxy-node; do
   src="../../packages/shared/$f.ts"
   # Shared modules that import browser-safe siblings from @plannotator/core
   # (e.g. guide-store → core/guide-format): generated/ is flat and vendors the
@@ -113,20 +113,25 @@ done
 printf '// @generated — DO NOT EDIT. Source: packages/ui/components/html-viewer/bridge-script.ts\n' \
   | cat - "../../packages/ui/components/html-viewer/bridge-script.ts" > "generated/bridge-script.ts"
 
-# Vendor the moved AI context types from core into generated/ai/.
-printf '// @generated — DO NOT EDIT. Source: packages/core/ai-context.ts\n' \
-  | cat - "../../packages/core/ai-context.ts" > "generated/ai/ai-context.ts"
+# Vendor the moved AI context types and the model catalog from core into generated/ai/.
+for f in ai-context model-catalog; do
+  printf '// @generated — DO NOT EDIT. Source: packages/core/%s.ts\n' "$f" \
+    | cat - "../../packages/core/$f.ts" > "generated/ai/$f.ts"
+done
 
 for f in index types provider session-manager endpoints context base-session; do
   src="../../packages/ai/$f.ts"
   printf '// @generated — DO NOT EDIT. Source: packages/ai/%s.ts\n' "$f" | cat - "$src" \
-    | sed "s|from ['\"]@plannotator/core/ai-context['\"]|from './ai-context.ts'|g" \
+    | sed -e "s|from ['\"]@plannotator/core/ai-context['\"]|from './ai-context.ts'|g" \
+          -e "s|from ['\"]@plannotator/core/model-catalog['\"]|from './model-catalog.ts'|g" \
     > "generated/ai/$f.ts"
 done
 
 for f in claude-agent-sdk codex-app-server opencode-sdk command-path child-io pi-sdk pi-sdk-node pi-events kimi-cli; do
   src="../../packages/ai/providers/$f.ts"
-  printf '// @generated — DO NOT EDIT. Source: packages/ai/providers/%s.ts\n' "$f" | cat - "$src" > "generated/ai/providers/$f.ts"
+  printf '// @generated — DO NOT EDIT. Source: packages/ai/providers/%s.ts\n' "$f" | cat - "$src" \
+    | sed "s|from ['\"]@plannotator/core/model-catalog['\"]|from '../model-catalog.ts'|g" \
+    > "generated/ai/providers/$f.ts"
 done
 
 # ---------------------------------------------------------------------------

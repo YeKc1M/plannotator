@@ -348,6 +348,37 @@ export interface CodeAnnotation {
   gitButlerBase?: string;
   /** Exact server snapshot that supplied the GitButler line coordinates. */
   gitButlerSnapshotId?: string;
+  /**
+   * PR reviews only (#1590): the text of the diff lines this line comment
+   * was anchored to at creation (lineStart..lineEnd on `side`, joined with
+   * "\n"). When a saved draft is restored against a different patch, the
+   * comment keeps its position only if these lines still read the same;
+   * otherwise it is marked `outdated`. Absent on older annotations and on
+   * lines outside the patch hunks.
+   */
+  anchorText?: string;
+  /**
+   * PR reviews only (#1590): the lines around the anchor on the same side
+   * (up to two before and two after; `null` where a line is outside the patch
+   * hunks) and the hunk header's function context (`hunk`, when git printed
+   * one), so a comment on a common line (`}`, `return null;`) only keeps its
+   * position when its surroundings still match too.
+   */
+  anchorContext?: { before: (string | null)[]; after: (string | null)[]; hunk?: string };
+  /**
+   * PR reviews only (#1590): the review snapshot id of the diff whose line
+   * coordinates this comment uses. Re-stamped when a later diff passes the
+   * anchor check; a line comment is only posted inline when this matches the
+   * diff currently known for its PR.
+   */
+  anchorSnapshot?: string;
+  /**
+   * Set when a restored PR draft's comment no longer matches the code it was
+   * written on (the PR changed between sessions). Its line numbers refer to
+   * the earlier version: it is listed and exported (labelled) but never drawn
+   * inline on the current diff and never posted as an inline PR comment.
+   */
+  outdated?: boolean;
 }
 
 /** Token-level metadata passed from selection to annotation creation. */

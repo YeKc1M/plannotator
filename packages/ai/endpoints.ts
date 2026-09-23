@@ -13,7 +13,8 @@
  *   GET  /api/ai/capabilities  — Check if AI features are available
  */
 
-import type { AIContext, AIMessage, CreateSessionOptions } from "./types.ts";
+import { resolveModelChoice } from "@plannotator/core/model-catalog";
+import type { AIContext, AIMessage, AIProvider, CreateSessionOptions } from "./types.ts";
 import type { ProviderRegistry } from "./provider.ts";
 import type { SessionManager } from "./session-manager.ts";
 
@@ -52,8 +53,8 @@ export interface CreateSessionRequest {
   maxTurns?: number;
   /** Max budget in USD. */
   maxBudgetUsd?: number;
-  /** Reasoning effort (Codex only). */
-  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  /** Reasoning effort — one of the selected model's `reasoningEfforts`. */
+  reasoningEffort?: string;
 }
 
 export interface QueryRequest {
@@ -83,20 +84,83 @@ export interface AIEndpointDeps {
   getCwd?: () => string;
   /** Optional hook to finish lazy provider capability loading before reporting capabilities. */
   beforeCapabilities?: () => Promise<void> | void;
-  /** Optional hook to finish provider-specific lazy initialization before creating a session. */
-  beforeProviderSession?: (providerId: string) => Promise<void> | void;
+  /**
+   * Optional hook to run provider-specific lazy initialization, either before
+   * creating a session (`session`) or for an explicit `?activate=` probe
+   * (`activate`, which reports the refreshed model list and so must wait).
+   */
+  beforeProviderSession?: (
+    providerId: string,
+    reason: "session" | "activate",
+    requestedModel?: string,
+  ) => Promise<void> | void;
 }
 
 const MAX_CLIENT_MAX_TURNS = 99;
 const MAX_CLIENT_BUDGET_USD = 5;
 
+/**
+ * Run a lazy initializer (model discovery) at most once on success. Callers
+ * share one in-flight run and never see its error; a failed run may be retried
+ * by a later call once `retryAfterMs` has passed, so a transient failure does
+ * not pin the fallback for the life of the process while a persistently
+ * broken tool is not re-spawned on every session.
+ */
 export function createBestEffortOnce(
   initialize: () => Promise<void>,
+  retryAfterMs = 60_000,
 ): () => Promise<void> {
   let result: Promise<void> | null = null;
+  let failedAt = 0;
   return () => {
-    result ??= initialize().catch(() => {});
+    if (result === null || (failedAt && Date.now() - failedAt >= retryAfterMs)) {
+      failedAt = 0;
+      result = initialize().catch(() => {
+        failedAt = Date.now();
+      });
+    }
     return result;
+  };
+}
+
+/**
+ * Deferred model discovery shared by both runtimes. Discovery spawns the
+ * provider's CLI, so it runs on first explicit activation (?activate= from a
+ * model picker) or the first session, never at startup. An `?activate=` probe
+ * always waits for it (it reports the refreshed list). A session waits only
+ * for providers registered with `blockSession` (the default); the others
+ * resolve the model against their current list and let discovery finish in
+ * the background — unless that list is still the static fallback and does not
+ * offer the requested model (e.g. `opus[1m]`, which the fallback lacks), where
+ * resolving now would silently change the pick for the first session only, so
+ * the session waits for discovery (bounded by the provider's own timeout).
+ */
+export function createDeferredModelDiscovery() {
+  const initializers = new Map<string, () => Promise<void>>();
+  const background = new Map<string, Pick<AIProvider, "models" | "modelsSource">>();
+  return {
+    defer(providerId: string, provider: object | null | undefined, { blockSession = true }: { blockSession?: boolean } = {}) {
+      if (!provider || !("fetchModels" in provider)) return;
+      const fetchModels = provider.fetchModels as () => Promise<void>;
+      initializers.set(providerId, createBestEffortOnce(() => fetchModels.call(provider)));
+      if (!blockSession) background.set(providerId, provider as Pick<AIProvider, "models" | "modelsSource">);
+    },
+    async beforeProviderSession(providerId: string, reason: "session" | "activate", requestedModel?: string): Promise<void> {
+      const initialize = initializers.get(providerId);
+      if (!initialize) return;
+      const provider = background.get(providerId);
+      if (reason === "session" && provider) {
+        const pickOnFallbackOnly =
+          !!requestedModel &&
+          provider.modelsSource === "fallback" &&
+          !(provider.models ?? []).some((m) => m.id === requestedModel);
+        if (!pickOnFallbackOnly) {
+          void initialize();
+          return;
+        }
+      }
+      await initialize();
+    },
   };
 }
 
@@ -145,7 +209,7 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
       // deferral exists to prevent.
       const activateId = new URL(req.url).searchParams.get("activate");
       if (activateId && registry.get(activateId)) {
-        await beforeProviderSession?.(activateId);
+        await beforeProviderSession?.(activateId, "activate");
       }
       const defaultEntry = registry.getDefault();
       const providerDetails = registry.list().map(id => {
@@ -155,6 +219,7 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
           name: p.name,
           capabilities: p.capabilities,
           models: p.models ?? [],
+          ...(p.modelsSource ? { modelsSource: p.modelsSource } : {}),
         };
       });
       return Response.json({
@@ -193,17 +258,21 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
       }
 
       try {
-        await beforeProviderSession?.(providerEntry.id);
-        // Resolve the model against the post-activation list: a requested
-        // model the (possibly refreshed) provider still offers is honored,
-        // anything else — including a stale pre-discovery fallback id — snaps
-        // to the provider's current default. Providers that report no models
-        // pass the request through verbatim.
+        await beforeProviderSession?.(providerEntry.id, "session", model);
+        // Resolve the model against the post-activation list with the shared
+        // resolver (exact id → the model an alias covers → same-family alias →
+        // the provider's default), so a stale pre-discovery pick lands on the
+        // closest current model. Providers that report no models pass the
+        // request through verbatim.
         const models = provider.models ?? [];
-        const effectiveModel =
-          model && models.some((candidate) => candidate.id === model)
-            ? model
-            : models.find((candidate) => candidate.default)?.id ?? models[0]?.id ?? model;
+        const effectiveModel = models.length > 0 ? resolveModelChoice(model ?? "", models) : model;
+        // Only forward an effort the resolved model accepts (a model that
+        // reports no efforts takes none); unlisted models pass it through.
+        const modelInfo = models.find((candidate) => candidate.id === effectiveModel);
+        const effectiveEffort =
+          reasoningEffort && (!modelInfo || modelInfo.reasoningEfforts?.some((e) => e.id === reasoningEffort))
+            ? reasoningEffort
+            : undefined;
         const boundedMaxTurns = clampPositiveInteger(maxTurns, MAX_CLIENT_MAX_TURNS);
         const boundedMaxBudgetUsd = clampPositiveNumber(maxBudgetUsd, MAX_CLIENT_BUDGET_USD);
         const options: CreateSessionOptions = {
@@ -212,7 +281,7 @@ export function createAIEndpoints(deps: AIEndpointDeps) {
           model: effectiveModel,
           ...(boundedMaxTurns !== undefined && { maxTurns: boundedMaxTurns }),
           ...(boundedMaxBudgetUsd !== undefined && { maxBudgetUsd: boundedMaxBudgetUsd }),
-          reasoningEffort,
+          reasoningEffort: effectiveEffort,
         };
 
         // Fork if parent session is provided AND provider supports it.

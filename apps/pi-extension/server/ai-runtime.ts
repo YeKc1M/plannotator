@@ -36,7 +36,11 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 		const registry = new ai.ProviderRegistry();
 		const sessionManager = new ai.SessionManager();
 		const modelDiscovery: Promise<void>[] = [];
-		const providerInitializers = new Map<string, () => Promise<void>>();
+		// Model discovery spawns the provider's CLI, so it runs on first explicit
+		// activation (?activate= from a model picker) or the first session — never
+		// at startup.
+		const discovery = ai.createDeferredModelDiscovery();
+		const deferModelDiscovery = discovery.defer;
 
 		try {
 			await import("../generated/ai/providers/claude-agent-sdk.ts");
@@ -46,7 +50,10 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 				cwd,
 				...(claudePath && { claudeExecutablePath: claudePath }),
 			});
-			registry.register(provider);
+			const providerId = registry.register(provider);
+			// A Claude session spawns its own `claude`, so it never waits on discovery
+			// (~2s, up to 10s): the first Ask AI answer starts at once.
+			deferModelDiscovery(providerId, provider, { blockSession: false });
 		} catch {
 			// Claude SDK not available.
 		}
@@ -61,14 +68,7 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 					...(codexPath ? { codexExecutablePath: codexPath } : {}),
 				});
 				const providerId = registry.register(provider);
-				if (provider && "fetchModels" in provider) {
-					providerInitializers.set(
-						providerId,
-						ai.createBestEffortOnce(
-							() => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
-						),
-					);
-				}
+				deferModelDiscovery(providerId, provider);
 			}
 		} catch {
 			// Codex not available.
@@ -138,14 +138,7 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 				// sessions orphaned it. The initializer runs on first explicit
 				// activation (?activate= from the model picker) or first opencode
 				// session.
-				if (provider && "fetchModels" in provider) {
-					providerInitializers.set(
-						providerId,
-						ai.createBestEffortOnce(
-							() => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
-						),
-					);
-				}
+				deferModelDiscovery(providerId, provider);
 			}
 		} catch {
 			// OpenCode not available.
@@ -159,9 +152,7 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 				beforeCapabilities: async () => {
 					await Promise.allSettled(modelDiscovery);
 				},
-				beforeProviderSession: async (providerId) => {
-					await providerInitializers.get(providerId)?.();
-				},
+				beforeProviderSession: discovery.beforeProviderSession,
 			}),
 			dispose: () => {
 				sessionManager.disposeAll();

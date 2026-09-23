@@ -5,7 +5,8 @@ import os from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
 
 import { SingleFlight } from "../generated/single-flight.ts";
-import { contentHash, deleteDraft } from "../generated/draft.ts";
+import { contentHash } from "../generated/draft.ts";
+import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "../generated/review-draft.ts";
 import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl, resolveGitRemoteCheck } from "../generated/config.ts";
 import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "../generated/feedback-archive.ts";
 import { isFaviconStyle, type FaviconStyle } from "../generated/favicon.ts";
@@ -87,7 +88,7 @@ import { createAgentJobHandler, whichCmd as commandExists } from "./agent-jobs.t
 import { type AgentJobInfo, REVIEW_OUTPUT_FAILED, getAgentJobAnnotationContext, markJobReviewFailed } from "../generated/agent-jobs.ts";
 import { createExternalAnnotationHandler } from "./external-annotations.ts";
 import {
-	handleDraftRequest,
+	handleReviewDraftRequest,
 	handleFavicon,
 	handleImageRequest,
 	readDraftGenerationFromBody,
@@ -331,6 +332,8 @@ export async function startReviewServer(options: {
 	prMetadata?: PRMetadata;
 	/** Platform review writer override used by isolated runtime tests. */
 	prReviewSubmitter?: typeof submitPRReview;
+	/** In-place PR switch fetcher override used by isolated runtime tests. */
+	prFetcher?: typeof fetchPR;
 	/**
 	 * The initial layer patch is missing per-file content (platform APIs
 	 * withhold patches on very large PRs). Enables the local recompute upgrade
@@ -464,6 +467,14 @@ export async function startReviewServer(options: {
 	let originalPRGitRef = options.gitRef;
 	let originalPRError = options.error;
 	let currentPRDiffScope: PRDiffScope = "layer";
+	// Draft keys for the diff on screen (#1590), mirroring the Bun server:
+	// patch key only outside PR mode (unchanged behavior), plus the PR's stable
+	// target key in PR mode. Read late — a PR switch or scope change moves both.
+	const reviewDrafts = createReviewDraftSession();
+	const currentDraftKeys = (): ReviewDraftKeys => ({
+		patchKey: draftKey,
+		targetKey: isPRMode && prMeta ? prDraftTargetKey(prMeta, currentPRDiffScope) : null,
+	});
 	// Monotonic guard for PR scope/switch state writes. Scope requests now park
 	// on long awaits (checkout warmup, full recompute) — a request that resumed
 	// after a NEWER scope select or pr-switch must not overwrite their state.
@@ -2668,6 +2679,7 @@ export async function startReviewServer(options: {
 						aiReviewContext: buildCurrentAiReviewContext(),
 						gitRef: currentGitRef,
 						snapshotId: currentSnapshotId(),
+						draftState: reviewDrafts.state(currentDraftKeys()),
 						approvalNotesSupported,
 						...sourceKindAdvert,
 						prDiffScope: currentPRDiffScope,
@@ -2735,6 +2747,7 @@ export async function startReviewServer(options: {
 						aiReviewContext: buildCurrentAiReviewContext(),
 						gitRef: currentGitRef,
 						snapshotId: currentSnapshotId(),
+						draftState: reviewDrafts.state(currentDraftKeys()),
 						approvalNotesSupported,
 						...sourceKindAdvert,
 						prDiffScope: currentPRDiffScope,
@@ -2776,6 +2789,7 @@ export async function startReviewServer(options: {
 					aiReviewContext: buildCurrentAiReviewContext(),
 					gitRef: currentGitRef,
 					snapshotId: currentSnapshotId(),
+					draftState: reviewDrafts.state(currentDraftKeys()),
 					approvalNotesSupported,
 					...sourceKindAdvert,
 					prDiffScope: currentPRDiffScope,
@@ -2798,7 +2812,7 @@ export async function startReviewServer(options: {
 				if (!isSameProject(newRef, prRef!)) return json(res, { error: "Cannot switch to a PR in a different repository" }, 400);
 
 				const cached = prSwitchCache.get(body.url);
-				const pr = cached ?? await fetchPR(newRef);
+				const pr = cached ?? await (options.prFetcher ?? fetchPR)(newRef);
 				if (!cached) prSwitchCache.set(body.url, pr);
 				// Bump the scope epoch so a scope request parked on a long await
 				// cannot overwrite this switch.
@@ -2862,6 +2876,7 @@ export async function startReviewServer(options: {
 					aiReviewContext: buildCurrentAiReviewContext(),
 					gitRef: currentGitRef,
 					snapshotId: currentSnapshotId(),
+					draftState: reviewDrafts.state(currentDraftKeys()),
 					approvalNotesSupported,
 					...sourceKindAdvert,
 					prMetadata: pr.metadata,
@@ -3500,7 +3515,7 @@ export async function startReviewServer(options: {
 				);
 			}
 		} else if (url.pathname === "/api/draft") {
-			await handleDraftRequest(req, res, draftKey);
+			await handleReviewDraftRequest(req, res, currentDraftKeys(), reviewDrafts);
 		} else if (url.pathname === "/favicon.png") {
 			handleFavicon(res);
 		} else if (
@@ -3574,7 +3589,7 @@ export async function startReviewServer(options: {
 			// Decision-only line: dismissal rate is behavior data, and a
 			// contentless failure must not change the legacy draft behavior.
 			archiveReviewSubmission("", [], "dismissed");
-			deleteDraft(draftKey, readDraftGenerationFromUrl(req));
+			reviewDrafts.settle(currentDraftKeys(), readDraftGenerationFromUrl(req));
 			resolveDecision({ approved: false, feedback: '', annotations: [], exit: true });
 			json(res, { ok: true });
 		} else if (url.pathname === "/api/feedback" && req.method === "POST") {
@@ -3595,7 +3610,7 @@ export async function startReviewServer(options: {
 					annotationList,
 					approved ? (hasContent ? "approved-with-notes" : "lgtm") : "feedback",
 				);
-				if (durable) deleteDraft(draftKey, readDraftGenerationFromBody(body));
+				if (durable) reviewDrafts.settle(currentDraftKeys(), readDraftGenerationFromBody(body));
 				resolveDecision({
 					approved,
 					feedback: feedbackText,

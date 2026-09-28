@@ -19,6 +19,7 @@ import {
   buildReviewApprovalBody,
   compactPrimaryIdForReviewDecision,
   compactRowIdForReviewDecisionItem,
+  compactRowIdForPlatformDecisionItem,
   createGeneralReviewComment,
   readApprovalNotesAdvert,
   resolvePlatformDecisionAction,
@@ -179,7 +180,7 @@ import { ExternalLineAnnotationComposer } from './components/ExternalLineAnnotat
 import { DestinationSpotlight } from './components/DestinationSpotlight';
 import { needsDestinationSpotlight, markDestinationSpotlightSeen } from './utils/destinationSpotlight';
 import { TextShimmer } from '@plannotator/ui/components/TextShimmer';
-import type { PRMetadata } from '@plannotator/shared/pr-types';
+import type { PRMetadata, PRReviewAction } from '@plannotator/shared/pr-types';
 import type { PRDiffScope, PRDiffScopeOption, PRStackInfo, PRStackTree } from '@plannotator/shared/pr-stack';
 import { altKey } from '@plannotator/ui/utils/platform';
 import { copyTextToClipboard } from '@plannotator/ui/utils/clipboard';
@@ -646,6 +647,10 @@ const ReviewApp: React.FC = () => {
   // that never sends the field renders no approve-carrying items (PR3
   // behavior); read off every diff payload that carries it.
   const [approvalNotesSupported, setApprovalNotesSupported] = useState(false);
+  // Image preview capability advert (#1598): can the server read Before/After
+  // bytes of changed images? Absent (old server, demo) reads as false, so no
+  // preview renders and no /api/review-image request is ever issued.
+  const [imagePreviewSupported, setImagePreviewSupported] = useState(false);
   // Session-constant capability advert from `/api/diff`: 'patch' means the
   // diff is caller-supplied bytes (`plannotator review --patch-file`) with no
   // repository behind it. ABSENT reads as 'vcs', so an old server keeps every
@@ -701,12 +706,13 @@ const ReviewApp: React.FC = () => {
     if (submitted) reviewHistory.clear();
   }, [reviewHistory, submitted]);
 
-  // The Commits view (linear history rail) exists for plain local git
-  // sessions only — PR/workspace/jj/p4 keep their existing panels. Unlike
+  // The Commits view (linear history rail) exists for plain local git and jj
+  // sessions — PR/workspace/GitButler/p4 keep their existing panels. Unlike
   // sections it has NO coupled diff: the review opens on the user's normal
   // default until a commit is clicked, and the clicked sha is never persisted.
   // Declared this early because the global keyboard handler consults it.
-  const commitsCapable = !prMetadata && reviewMode !== 'workspace' && gitContext?.vcsType === 'git';
+  const commitsVcs = gitContext?.vcsType === 'git' || gitContext?.vcsType === 'jj' ? gitContext.vcsType : null;
+  const commitsCapable = !prMetadata && reviewMode !== 'workspace' && commitsVcs !== null;
   const showCommitsPanel = commitsCapable && panelView === 'commits';
   // The diff the session was reviewing before the Commits view's commit
   // clicks (or its HEAD auto-select) took over the single session-global
@@ -740,7 +746,8 @@ const ReviewApp: React.FC = () => {
   const [isPlatformActioning, setIsPlatformActioning] = useState(false);
   const [platformActionError, setPlatformActionError] = useState<string | null>(null);
   const [platformUser, setPlatformUser] = useState<string | null>(null);
-  const [platformCommentDialog, setPlatformCommentDialog] = useState<{ action: 'approve' | 'comment'; plan: ReviewSubmission } | null>(null);
+  // `chooseEvent` (#1611): the dialog offers Comment / Request changes.
+  const [platformCommentDialog, setPlatformCommentDialog] = useState<{ action: PRReviewAction; plan: ReviewSubmission; chooseEvent: boolean } | null>(null);
   const [platformGeneralComment, setPlatformGeneralComment] = useState('');
   const [platformReviewRecovery, setPlatformReviewRecovery] = useState<{
     rootPrUrl: string;
@@ -771,6 +778,14 @@ const ReviewApp: React.FC = () => {
   const mrLabel = prMetadata ? getMRLabel(prMetadata) : 'PR';
   const mrNumberLabel = prMetadata ? getMRNumberLabel(prMetadata) : '';
   const displayRepo = prMetadata ? getDisplayRepo(prMetadata) : '';
+  // #1611: GitHub has a REQUEST_CHANGES review (refused on your own PR, like
+  // approve); GitLab has none, so Request changes posts as a comment there.
+  const requestChangesSupported = prMetadata?.platform === 'github';
+  const requestChangesUnavailableReason = !requestChangesSupported
+    ? `${platformLabel} has no request-changes review; this posts as a comment.`
+    : isOwnPR
+      ? `You can't request changes on your own pull request on ${platformLabel}.`
+      : undefined;
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0';
   const updateInfo = useUpdateCheck();
   const updateToastShown = useRef(false);
@@ -1551,7 +1566,8 @@ const ReviewApp: React.FC = () => {
   const activeCommitContext = useMemo(() => {
     const sha = commitShaFromMode(activeDiffBase);
     if (!sha) return null;
-    return { sha, subject: commitInfo?.sha === sha ? commitInfo.subject : undefined };
+    const info = commitInfo?.sha === sha ? commitInfo : null;
+    return { sha, subject: info?.subject, shortId: info?.shortSha };
   }, [activeDiffBase, commitInfo]);
   const activeGitButlerContext = useMemo(() => {
     if (!activeDiffBase.startsWith('gitbutler:')) return null;
@@ -2093,6 +2109,7 @@ const ReviewApp: React.FC = () => {
         agentCwd?: string | null;
         sharingEnabled?: boolean;
         approvalNotesSupported?: boolean;
+        imagePreviewSupported?: boolean;
         sourceKind?: ReviewSourceKind;
         repoInfo?: { display: string; branch?: string };
         prMetadata?: PRMetadata;
@@ -2154,6 +2171,7 @@ const ReviewApp: React.FC = () => {
         if (data.agentCwd !== undefined) setAgentCwd(data.agentCwd);
         if (data.sharingEnabled !== undefined) setSharingEnabled(data.sharingEnabled);
         setApprovalNotesSupported(readApprovalNotesAdvert(data.approvalNotesSupported));
+        setImagePreviewSupported(data.imagePreviewSupported === true);
         // Session-constant: a static patch session has no diff-type switch to
         // re-advertise it on, so `/api/diff` is the only place it can arrive.
         setSourceKind(data.sourceKind === 'patch' ? 'patch' : 'vcs');
@@ -2601,7 +2619,7 @@ const ReviewApp: React.FC = () => {
     // Rule 4 — only the review target. The guide takeover CSS-hides the dock
     // (so its files are not what the reviewer is reading), and a commit diff
     // is a documented session-only detour, not the change under review.
-    suspended: guideOpen || activeDiffBase.startsWith('commit:'),
+    suspended: guideOpen || !!commitShaFromMode(activeDiffBase),
     viewedFiles,
     suppressedFiles: autoViewSuppressed,
     onMark: markFilesViewed,
@@ -2628,9 +2646,7 @@ const ReviewApp: React.FC = () => {
   // toggling back to Sections switches the diff back to since-base.
   const sectionsCapable = !prMetadata && reviewMode !== 'workspace'
     && !!gitContext?.diffOptions?.some(option => option.id === 'since-base');
-  const activeCommitSha = activeDiffBase.startsWith('commit:')
-    ? activeDiffBase.slice('commit:'.length)
-    : null;
+  const activeCommitSha = commitShaFromMode(activeDiffBase) ?? null;
 
   // The view actually RENDERED for the current selection — a latent
   // 'sections'/'commits' selection the session can't offer resolves to the
@@ -2733,6 +2749,7 @@ const ReviewApp: React.FC = () => {
     callFlow?: CallFlowAdvert;
     agentCwd?: string | null;
     approvalNotesSupported?: boolean;
+    imagePreviewSupported?: boolean;
     draftState?: CodeDraftTargetState;
   }) {
     const isPRSwitch = !!data.prMetadata;
@@ -2745,6 +2762,7 @@ const ReviewApp: React.FC = () => {
     if (data.approvalNotesSupported !== undefined) {
       setApprovalNotesSupported(readApprovalNotesAdvert(data.approvalNotesSupported));
     }
+    if (data.imagePreviewSupported !== undefined) setImagePreviewSupported(data.imagePreviewSupported === true);
     const nextFiles = parseDiffToFiles(data.rawPatch);
     dockApi?.getPanel(REVIEW_DIFF_PANEL_ID)?.api.close();
     needsInitialDiffPanel.current = true;
@@ -2851,6 +2869,7 @@ const ReviewApp: React.FC = () => {
         generatedFiles?: string[];
         baseBehindRemote?: boolean;
         approvalNotesSupported?: boolean;
+        imagePreviewSupported?: boolean;
         superseded?: boolean;
       };
 
@@ -2872,6 +2891,7 @@ const ReviewApp: React.FC = () => {
       if (data.approvalNotesSupported !== undefined) {
         setApprovalNotesSupported(readApprovalNotesAdvert(data.approvalNotesSupported));
       }
+      if (data.imagePreviewSupported !== undefined) setImagePreviewSupported(data.imagePreviewSupported === true);
 
       const nextFiles = orderFilesBySections(parseDiffToFiles(data.rawPatch), data.sections);
       // Rule 5 of auto-mark-viewed: a checkmark on content that has since
@@ -2915,6 +2935,13 @@ const ReviewApp: React.FC = () => {
         // If the current file was removed (whitespace-only), retarget the
         // dock panel to the first remaining file.
         setDiffData(prev => prev ? { ...prev, rawPatch: data.rawPatch, gitRef: data.gitRef, aiReviewContext: data.aiReviewContext } : prev);
+        // A jj revision rewritten since it was opened (editing `@`) comes back
+        // as its successor's jj-commit id: adopt it, or the next refresh would
+        // ask for the frozen id again and the rail could not mark the row.
+        if (isCommitDiffType(data.diffType) && data.diffType !== fullDiffType) {
+          setDiffType(data.diffType);
+          setDiffData(prev => prev ? { ...prev, diffType: data.diffType } : prev);
+        }
         if (data.diffOptions) setWorkspaceDiffOptions(data.diffOptions);
         // Adopt the server's base even on in-place refreshes: the staleness
         // Refresh and post-Fetch paths both preserveFile, and they're exactly
@@ -3099,9 +3126,13 @@ const ReviewApp: React.FC = () => {
     // and the switch itself (going through handleDiffSwitch would compose it
     // a second time in a second place — fragile duplication for no benefit;
     // its evolog base handling never applies to commit diffs).
-    const fullDiffType = activeWorktreePath
-      ? `worktree:${activeWorktreePath}:commit:${sha}`
-      : `commit:${sha}`;
+    // A jj session opens the jj family (the git provider owns `commit:`, and
+    // a pure jj repo has no git work tree to run it in); jj has no worktrees.
+    const fullDiffType = commitsVcs === 'jj'
+      ? `jj-commit:${sha}`
+      : activeWorktreePath
+        ? `worktree:${activeWorktreePath}:commit:${sha}`
+        : `commit:${sha}`;
     if (fullDiffType === diffType) {
       openAllFilesPanel();
       return;
@@ -3118,7 +3149,7 @@ const ReviewApp: React.FC = () => {
       preCommitDiffRef.current = { diffType, base: selectedBase };
     }
     void fetchDiffSwitch(fullDiffType);
-  }, [activeWorktreePath, diffType, selectedBase, fetchDiffSwitch, openAllFilesPanel]);
+  }, [activeWorktreePath, commitsVcs, diffType, selectedBase, fetchDiffSwitch, openAllFilesPanel]);
 
   // The Commits-view session machine (log + poll + HEAD auto-select + center
   // veil) lives in the hook so its invariants stay in one file; App supplies
@@ -3212,7 +3243,7 @@ const ReviewApp: React.FC = () => {
   const handleWorktreeSwitch = useCallback(async (worktreePath: string | null) => {
     if (worktreePath === activeWorktreePath) return;
     let carriedBase = activeDiffBase;
-    if (activeDiffBase.startsWith('commit:')) {
+    if (commitShaFromMode(activeDiffBase)) {
       const preferred = configStore.get('defaultDiffType');
       const options = gitContext?.diffOptions ?? [];
       carriedBase = options.some((o) => o.id === preferred)
@@ -3553,6 +3584,7 @@ const ReviewApp: React.FC = () => {
             base: committedBase ?? undefined,
             worktreePath: activeWorktreePath,
             commitSubject: activeCommitContext?.subject,
+            commitShortId: activeCommitContext?.shortId,
             snapshotId,
           },
     [prMetadata, activeDiffBase, committedBase, activeWorktreePath, activeCommitContext, snapshotId],
@@ -3603,6 +3635,8 @@ const ReviewApp: React.FC = () => {
     agentCwd,
     canUseLiveWorkspaceActions,
     contextExpansionAvailable: !isStaticPatch,
+    imagePreviewAvailable: imagePreviewSupported && !isStaticPatch,
+    snapshotId,
     // Outdated comments (#1590) carry line numbers from an earlier version of
     // the PR: they stay in the sidebar and the export, never on the diff.
     allAnnotations: diffAnnotations,
@@ -3715,7 +3749,7 @@ const ReviewApp: React.FC = () => {
   }), [
     files, diffData?.rawPatch, activeFileIndex, guideOpen, effectiveDiffStyle, handleDiffStyleChange, isCompactTouchLayout, diffOverflow, diffIndicators,
     diffLineDiffType, diffShowLineNumbers, diffShowBackground,
-    diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd, canUseLiveWorkspaceActions, isStaticPatch,
+    diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd, canUseLiveWorkspaceActions, isStaticPatch, imagePreviewSupported, snapshotId,
     diffAnnotations, externalAnnotations,
     visibleDescriptionAnnotations, selectedDescriptionAnnotationId, handleAddDescriptionAnnotation,
     handleSelectDescriptionAnnotation, handleDeleteDescriptionAnnotation, handleAskAIForDescription,
@@ -4062,7 +4096,7 @@ const ReviewApp: React.FC = () => {
   }, [compactComposerItem, compactConfirmItem, compactDecisionComposer, compactDecisionConfirm]);
 
   // Submit reviews to one or more PRs via /api/pr-action
-  const handlePlatformAction = useCallback(async (action: 'approve' | 'comment', plan: ReviewSubmission, generalComment?: string) => {
+  const handlePlatformAction = useCallback(async (action: PRReviewAction, plan: ReviewSubmission, generalComment?: string) => {
     setIsPlatformActioning(true);
     setPlatformActionError(null);
 
@@ -4089,7 +4123,7 @@ const ReviewApp: React.FC = () => {
           prNumber: prMetadata ? (prMetadata.platform === 'github' ? prMetadata.number : prMetadata.iid) : 0,
           prTitle: prMetadata?.title ?? '',
           prRepo: prMetadata ? getDisplayRepo(prMetadata) : '',
-          fileComments: [], fileScopedBody: '',
+          fileComments: [], fileLevelComments: [], fileScopedBody: '',
           fileCount: 0, annotationCount: 0, status: 'pending' as const,
         }];
       }
@@ -4137,7 +4171,9 @@ const ReviewApp: React.FC = () => {
       const prLinks = openUrls.join(', ');
       const statusMessage = action === 'approve'
         ? `${mrLabel === 'MR' ? 'Merge request' : 'Pull request'} approved on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`
-        : `${mrLabel === 'MR' ? 'Merge request' : 'Pull request'} reviewed on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`;
+        : action === 'request_changes' && prMetadata.platform === 'github'
+          ? `Changes requested on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`
+          : `${mrLabel === 'MR' ? 'Merge request' : 'Pull request'} reviewed on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`;
       fetch('/api/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4159,14 +4195,14 @@ const ReviewApp: React.FC = () => {
     }
   }, [platformOpenPR, platformLabel, mrLabel, prMetadata, getDraftGeneration]);
 
-  const openPlatformDialog = useCallback((action: 'approve' | 'comment') => {
+  const openPlatformDialog = useCallback((action: PRReviewAction, chooseEvent = false) => {
     const diffPaths = new Set(files.map(f => f.path));
     const prMeta = prMetadata ? {
       number: prMetadata.platform === 'github' ? prMetadata.number : prMetadata.iid,
       title: prMetadata.title,
       repo: getDisplayRepo(prMetadata),
     } : undefined;
-    const plan = buildReviewSubmission(allAnnotations, visibleEditorAnnotations, prMetadata?.url, diffPaths, prMeta, knownPrSnapshotsRef.current);
+    const plan = buildReviewSubmission(allAnnotations, visibleEditorAnnotations, prMetadata?.url, diffPaths, prMeta, knownPrSnapshotsRef.current, prMetadata?.platform);
     // PR description/comment notes aren't line-anchored, so they can't post as
     // inline review comments — seed them into the review body instead (quoted),
     // where the user can edit before submitting. Also means a review with only
@@ -4194,11 +4230,15 @@ const ReviewApp: React.FC = () => {
       setPlatformCommentDialog({
         action: recovery.action,
         plan: restoreReviewSubmission(plan, recovery),
+        // A retained Request changes submission shows its (locked) event
+        // choice, so the reviewer sees which event the retry carries; the
+        // comment and approve recoveries render exactly as before.
+        chooseEvent: recovery.action === 'request_changes',
       });
       return;
     }
     setPlatformGeneralComment(seededGeneralComment);
-    setPlatformCommentDialog({ action, plan });
+    setPlatformCommentDialog({ action, plan, chooseEvent });
   }, [allAnnotations, visibleEditorAnnotations, files, prMetadata, visibleDescriptionAnnotations, visibleCommentAnnotations, prContext?.body, platformReviewRecovery]);
 
   // --- PR6 (§3.4): platform mode adopts the control's SHAPE ----------------
@@ -4207,8 +4247,9 @@ const ReviewApp: React.FC = () => {
   // open" toggle — untouched), whose general-comment textarea stays the only
   // note field on this side. `approvalNotesSupported` is irrelevant here —
   // the platform posts to the forge API natively — so approve items gate
-  // only on self-authorship, muted rather than removed (Request changes… /
-  // Post comments, then… stay live; no state is a dead end).
+  // only on self-authorship, muted rather than removed. On GitHub, Request
+  // changes… mutes on your own PR too (#1611) and a live "Comment…" row takes
+  // its place, so no state is a dead end.
   const busyWithPlatformDecision = busyWithDecision || isPlatformActioning;
 
   const platformDecisionSpec = useMemo(() => buildDecisionSpec({
@@ -4217,8 +4258,8 @@ const ReviewApp: React.FC = () => {
     count: totalAnnotationCount,
     hasFeedback: totalAnnotationCount > 0,
     approvalNotesSupported: false, // ignored by the platform arm
-    platform: { label: platformLabel, mrLabel, selfAuthored: isOwnPR },
-  }), [totalAnnotationCount, platformLabel, mrLabel, isOwnPR]);
+    platform: { label: platformLabel, mrLabel, selfAuthored: isOwnPR, requestChangesSupported },
+  }), [totalAnnotationCount, platformLabel, mrLabel, isOwnPR, requestChangesSupported]);
 
   const runPlatformDecisionAction = useCallback((id: DecisionActionId) => {
     if (submitted || busyWithPlatformDecision) return;
@@ -4231,9 +4272,9 @@ const ReviewApp: React.FC = () => {
     // any future caller included) — resolve the mute from the live spec, not
     // from whichever surface fired.
     if (platformDecisionSpec.items.some((item) => item.id === id && item.muted)) return;
-    const mode = resolvePlatformDecisionAction(id, totalAnnotationCount > 0);
-    if (mode) openPlatformDialog(mode);
-  }, [busyWithPlatformDecision, openPlatformDialog, platformDecisionSpec, submitted, totalAnnotationCount]);
+    const mode = resolvePlatformDecisionAction(id, totalAnnotationCount > 0, requestChangesSupported);
+    if (mode) openPlatformDialog(mode.action, mode.chooseEvent);
+  }, [busyWithPlatformDecision, openPlatformDialog, platformDecisionSpec, submitted, totalAnnotationCount, requestChangesSupported]);
 
   const platformDecisionHandlers = useMemo<Record<DecisionActionId, DecisionHandler>>(() => ({
     'primary': () => runPlatformDecisionAction('primary'),
@@ -4491,7 +4532,7 @@ const ReviewApp: React.FC = () => {
               disabled: compactActionBusy || !!platformDecisionSpec.primary.muted,
             },
             ...platformDecisionSpec.items.map((item) => ({
-              id: compactRowIdForReviewDecisionItem(item.id),
+              id: compactRowIdForPlatformDecisionItem(item.id),
               label: item.label,
               subtitle: item.subtitle,
               onSelect: () => runPlatformDecisionAction(item.id),
@@ -5211,6 +5252,7 @@ const ReviewApp: React.FC = () => {
                 onRetry={commitsView.refresh}
                 onSelectPanelView={handlePanelViewSelect}
                 showSectionsOption={sectionsCapable}
+                headLabel={commitsVcs === 'jj' ? '@' : 'HEAD'}
               />
             </ReviewNavigatorContainer>
           )}
@@ -5399,7 +5441,7 @@ const ReviewApp: React.FC = () => {
                         <p className="text-xs text-muted-foreground mt-1">
                           {activeDiffBase === 'since-base' && `No changes since ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''} — committed, uncommitted, or untracked.`}
                           {showsLocalVsRemoteEmptyState && `Your local branch matches its remote-tracking branch${activeWorktreePath ? ' in this worktree' : ''}.`}
-                          {activeDiffBase.startsWith('commit:') && 'This commit has no changes.'}
+                          {commitShaFromMode(activeDiffBase) && 'This commit has no changes.'}
                           {activeDiffBase === 'uncommitted' && `No uncommitted changes${activeWorktreePath ? ' in this worktree' : ' to review'}.`}
                           {activeDiffBase === 'staged' && "No staged changes. Stage some files with git add."}
                           {activeDiffBase === 'unstaged' && "No unstaged changes. All changes are staged."}
@@ -5742,6 +5784,10 @@ const ReviewApp: React.FC = () => {
         <ReviewSubmissionDialog
           isOpen={!!platformCommentDialog}
           action={platformCommentDialog?.action ?? 'comment'}
+          onActionChange={platformCommentDialog?.chooseEvent
+            ? (next) => setPlatformCommentDialog(prev => prev ? { ...prev, action: next } : prev)
+            : undefined}
+          requestChangesUnavailableReason={requestChangesUnavailableReason}
           submission={platformCommentDialog?.plan ?? { targets: [], orphans: [] }}
           generalComment={platformGeneralComment}
           onGeneralCommentChange={setPlatformGeneralComment}

@@ -185,6 +185,43 @@ export interface PRReviewFileComment {
   start_side?: "LEFT" | "RIGHT";
 }
 
+/**
+ * The review event a platform submission carries (#1611). GitHub maps these
+ * to `APPROVE` / `COMMENT` / `REQUEST_CHANGES`. GitLab has no request-changes
+ * review, so it posts `request_changes` exactly like `comment` (a note plus
+ * discussions); only `approve` adds a mutation there.
+ */
+export type PRReviewAction = "approve" | "comment" | "request_changes";
+
+/** Read the untrusted `action` field of a review request; null when invalid. */
+export function parsePRReviewAction(value: unknown): PRReviewAction | null {
+  return value === "approve" || value === "comment" || value === "request_changes" ? value : null;
+}
+
+/**
+ * A comment on a whole file rather than a line (#1599). GitHub posts it as a
+ * file-level review thread; GitLab has no equivalent and folds it into the body.
+ */
+export interface PRReviewFileLevelComment {
+  path: string;
+  body: string;
+}
+
+/**
+ * Read the untrusted `fileLevelComments` field of a review request. Keeps only
+ * entries with a non-empty string path and body; anything else is dropped.
+ */
+export function parseFileLevelComments(value: unknown): PRReviewFileLevelComment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): PRReviewFileLevelComment[] => {
+    if (typeof item !== "object" || item === null) return [];
+    const { path, body } = item as Record<string, unknown>;
+    return typeof path === "string" && path.length > 0 && typeof body === "string" && body.trim().length > 0
+      ? [{ path, body }]
+      : [];
+  });
+}
+
 /** One inline comment that GitLab did not accept, paired with its safe error text. */
 export interface PRReviewCommentFailure {
   comment: PRReviewFileComment;
@@ -323,6 +360,33 @@ export function getCliInstallUrl(ref: PRRef): string {
   return ref.platform === "github"
     ? "https://cli.github.com"
     : "https://gitlab.com/gitlab-org/cli";
+}
+
+/**
+ * One side of a PR file as raw bytes (code-review image preview). Transport
+ * failures other than "not found" throw, so the endpoint can answer 502.
+ */
+export type PRFileBytesResult =
+  | { kind: "ok"; bytes: Uint8Array; etag?: string }
+  | { kind: "missing" }
+  | { kind: "too-large"; size: number };
+
+/** Decode a platform API base64 payload (GitHub wraps it at 60 columns). */
+export function decodeBase64Bytes(value: string): Uint8Array {
+  const clean = value.replace(/\s+/g, "");
+  const binary = atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * True when a gh/glab failure is the API's "no such file at this ref" (HTTP
+ * 404). A missing CLI ("gh: command not found") is a transport failure, not a
+ * missing file, so only the status code counts.
+ */
+export function isNotFoundCommandFailure(stderr: string): boolean {
+  return /\bHTTP 404\b|\b404 Not Found\b/i.test(stderr);
 }
 
 /** Encode a file path for use in platform API URLs */

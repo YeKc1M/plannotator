@@ -1511,8 +1511,23 @@ Behaviour changes a host may notice:
 - `useAgentSettings(catalogs?)` takes the catalogs and returns EFFECTIVE (resolved) model/effort values; called without catalogs it returns the saved values unchanged, as before.
 - `AIProviderModel` is now an alias of `CatalogModel` (adds optional `resolvedId`, `fastMode`); `resolveAIModelForProvider` uses the shared resolver, so a stale pinned id keeps its model family instead of snapping to the provider default.
 
+## Forge-aware `#123` / `@user` links (unreleased, additive; #1596)
+
+Bare `#123` and `@user` in a document used to link to github.com whenever `githubRepo` held a slash, so GitLab and GitHub Enterprise repos got links to the wrong forge. `InlineMarkdown` (and every block component that forwards `githubRepo`: `BlockRenderer`, `RenderedMarkdown`, `TableBlock`, `TablePopout`, `AlertBlock`, `Callout`, `proseBody`) gains an optional `repoHost?: string` beside it; `Viewer` passes `repoInfo.host`. The rule is the new `@plannotator/core/forge-refs` subpath (`forgeRefLinks`, `classifyForgeHost`, `normalizeForgeHost`). The host is normalized first: lowercased, port dropped, `www.github.com` / `ssh.github.com` / SSH aliases starting `github.com-` folded to `github.com` and `altssh.gitlab.com` to `gitlab.com`; a host that is not a plausible DNS name (no dot, brackets, `@`, a dotless SSH alias) counts as absent. Then a github host (`github.com`, `github.*`) links to `https://<host>/<path>/issues/N`, a gitlab host (`gitlab.com`, `gitlab.*`, `*.gitlab.*`) to `https://<host>/<path>/-/issues/N`, users to `https://<host>/<user>`, and any other host renders the ref as an unlinked span. **A host that passes no `repoHost` (or an implausible one) keeps the old github.com links**, so nothing changes until it opts in. Because ui imports a new core subpath and `@plannotator/ui` pins `@plannotator/core` EXACTLY (currently `"0.25.6"`), the core version bump and ui's pin must move together in the same release: bump core, set ui's `@plannotator/core` dependency to that same version, `bun install`, then publish `core` first and `ui` second. A ui built against this code on the old core pin would import a `forge-refs` subpath the pinned core does not ship.
+
+## Guided Review generation in core (core 0.25.6, unreleased, additive)
+
+Core-only; `@plannotator/ui` imports none of it, so ui's exact `0.25.6` pin is unchanged. The pure half of Guided Review generation moved verbatim from the private `@plannotator/server` (`packages/server/guide/guide-review.ts`, which re-exports every name) so a host such as Workspaces generates guides with Plannotator's exact prompt and holds the output to the same coverage rule. All three subpaths are browser-safe and zero-dependency:
+
+- `@plannotator/core/guide-prompt`: `GUIDE_REVIEW_PROMPT` (the organizer methodology), `GUIDE_SCHEMA_JSON` (the output JSON schema, as a string), `buildGuideUserMessage(patch, diffType, options?, prMetadata?, changedFiles?)`, `validateGuideOutput(raw, changedFiles)`, `GUIDE_NO_SECTIONS_ERROR`, the sanitizers `sanitizeGuideSection` / `sanitizeGuideSections` / `sanitizeUnplacedFiles`, and the types `GuideChangedFile` and `GuidePromptPRMetadata` (`{ url, baseBranch }`, structural, so a full GitHub/GitLab `PRMetadata` is accepted).
+- `@plannotator/core/review-prompt` (what `buildGuideUserMessage` frames a local diff with): `getLocalDiffInstruction`, `buildWorkspacePromptContextLines`, and the types `LocalDiffInstruction`, `WorkspaceReviewPromptContext`, `WorkspacePromptRepoContext`, `WorkspaceChildVcsType`.
+- `@plannotator/core/diff-type`: the `DiffType` union (including jj's `jj-commit:<id>`) plus `parseCommitDiffType`, `parseJjCommitDiffType`, `jjCommitRevset`, `commitFamilyId`, `parseWorktreeDiffType`, `JJ_TRUNK_REVSET`, `jjLineBaseRevset`, `jjCompareTargetRevset`, `parseRemoteBookmark`, `BARE_HEX_SHA_RE` (moved from `packages/shared/review-core.ts`, which re-exports them).
+
+The guide chain's engine plumbing (Claude/Codex/marker commands, output parsing, `composeGuideMethodology`, sessions) stays in the server. It ships in core 0.25.6 alongside what that unpublished version already carries; ui needs no change for it.
+
 ## Publishing & versioning
 
+- **ui 0.46.1 (fix, ui only, core pin unchanged at `0.25.6`):** `useVimSelection` (mounted by every `Viewer`) now only clears a page selection whose anchor or focus lies inside the viewer's own container; with vim off it used to clear the WHOLE page's selection on every mount and `contentVersion` change, so a selection in another host panel vanished whenever the document behind it loaded or changed.
 - **ui 0.45.0 (annotation card header slot + mentions on the card's edit box): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.44.0, both props on `AnnotationPanel`: `renderCardHeader` (the header-row twin of `renderCardFooter`, wrapper `[data-annotation-card-header]`, renders under `readOnly`, open-document cards only in the All-files view) and `mentionSource` (the 0.43.0 type, applied to the card's EDIT box, saving `onEdit(id, { text, mentions })` only when a source was supplied and a pick survived). Nothing is removed, no new supported imports (`components/MentionAutocomplete` is internal glue), no export-, share- or archive-visible change, and Plannotator passes neither — `packages/editor` and `packages/review-editor` have zero source diff, and the panel is byte-identical to 0.44.0. Known difference from `CommentPopover`: no chips in the card's edit box (follow-up named in the section). See "Annotation card header slot and mentions on the edit box (0.45.0)".
 - **ui 0.44.0 (mention token chips in the composer): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.43.2: the `@Label` tokens a `mentionSource` composer inserted render as chips in the composer's existing highlight overlay, `MentionSource.tokenClassName?` lets a host restyle them (under the metric rule), `useMentionAutocomplete` also returns the surviving `mentions`, and `utils/composerTokens` joins the supported-import list. Nothing is removed, no export-, share- or archive-visible change, and Plannotator passes none of it — with neither `mentionSource` nor `skillReferences` the composer is byte-identical to 0.43.2. See "Mention token chips in the composer (0.44.0)".
 - **ui 0.43.1 (`mentionSource` on the viewers): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.43.0: `mentionSource` on `Viewer` and `HtmlViewer` (forwarded to every comment composer each mounts) and the optional `Annotation.mentions` field the picked ids land on, set only when a source was supplied and a token survived. Nothing is removed, no new modules, no export-, share- or archive-visible change, and Plannotator passes none of it. See "`mentionSource` on the viewers (0.43.1)".
@@ -1531,6 +1546,25 @@ Behaviour changes a host may notice:
 - **`--provenance` only works from a supported CI environment (GitHub Actions OIDC)** — a local publish fails with `Automatic provenance generation not supported for provider: null`. Until a CI publish job exists for these two packages, local publishes drop the flag. Publishing under `--tag next` first lets the consumer preflight before `npm dist-tag add <pkg>@<version> latest` promotes it.
 - `styles.css` is built by the `prepack` script (`bun run build:css`) so the published tarball always carries fresh precompiled CSS; since 0.33.0 `prepack` also runs `build:bridge-assets`, which generates the gitignored `bridge-script.asset.js` and `bridge-script.lite.ts` beside their source. Both are in `files`, so a tarball built without `prepack` (a hand-rolled `npm pack --ignore-scripts`) would ship export subpaths that resolve to nothing; always build with `bun pm pack`.
 - There is **no CI publish job for these two packages yet** — first publish is manual from `main` after merge. (Wiring a CI publish job is a follow-up.)
+
+---
+
+## `Settings` `annotateParity` (shipped in 0.46.0)
+
+`<Settings mode="annotate">` takes a new optional `annotateParity?: boolean`,
+default `false`. **A host that omits it sees exactly the annotate Settings it
+had**: General, Theme, Vim, Shortcuts, Files, plus the OpenCode agent-switch
+row when `origin="opencode"`. Plannotator's own annotate app passes `true`,
+which adds the plan-review document tabs (Display, Saving, Labels, Obsidian,
+Bear, Octarine) and hides the agent-switch row, which only ever applied to
+plan approval.
+
+Within those tabs the plan-decision rows stay plan-only: Save Plans and the
+three "Auto-save on Plan Arrival" switches. The Obsidian / Bear / Octarine
+enable switches are the SAME cookies plan review reads on approve, so turning
+one on from annotate also makes plan review save every approved plan there;
+the annotate description says so. `mode="plan"` and `mode="review"` are
+unaffected by the prop. Purely additive: no export, share or archive change.
 
 ---
 

@@ -11,9 +11,9 @@
  * browser-safe.
  */
 
-import { checkGhAuth, getGhUser, fetchGhPR, fetchGhPRContext, fetchGhPRFileContent, submitGhPRReview, fetchGhPRViewedFiles, markGhFilesViewed, fetchGhPRStack, fetchGhPRList } from "./pr-github";
-import { checkGlAuth, getGlUser, fetchGlMR, fetchGlMRContext, fetchGlFileContent, submitGlMRReview } from "./pr-gitlab";
-import type { PRRuntime, PRRef, PRMetadata, PRContext, PRReviewFileComment, PRReviewSubmissionResult, PRStackTree, PRListItem } from "./pr-types";
+import { checkGhAuth, getGhUser, fetchGhPR, fetchGhPRContext, fetchGhPRFileContent, fetchGhPRFileBytes, submitGhPRReview, foldFileLevelComments, fetchGhPRViewedFiles, markGhFilesViewed, fetchGhPRStack, fetchGhPRList } from "./pr-github";
+import { checkGlAuth, getGlUser, fetchGlMR, fetchGlMRContext, fetchGlFileContent, fetchGlFileBytes, submitGlMRReview } from "./pr-gitlab";
+import type { PRFileBytesResult, PRRuntime, PRRef, PRMetadata, PRContext, PRReviewFileComment, PRReviewFileLevelComment, PRReviewAction, PRReviewSubmissionResult, PRStackTree, PRListItem } from "./pr-types";
 
 // Re-export the browser-safe surface so server callers can keep using
 // pr-provider as a single facade. Browser code imports from pr-types
@@ -58,17 +58,33 @@ export async function fetchPRFileContent(
   return fetchGlFileContent(runtime, ref, sha, filePath);
 }
 
+/** One file at one commit as raw bytes (image preview), capped at `maxBytes`. */
+export async function fetchPRFileBytes(
+  runtime: PRRuntime,
+  ref: PRRef,
+  sha: string,
+  filePath: string,
+  maxBytes: number,
+): Promise<PRFileBytesResult> {
+  if (ref.platform === "github") return fetchGhPRFileBytes(runtime, ref, sha, filePath, maxBytes);
+  return fetchGlFileBytes(runtime, ref, sha, filePath, maxBytes);
+}
+
 /** Submit a platform review and preserve any provider-specific partial result. */
 export async function submitPRReview(
   runtime: PRRuntime,
   ref: PRRef,
   headSha: string,
-  action: "approve" | "comment",
+  action: PRReviewAction,
   body: string,
   fileComments: PRReviewFileComment[],
+  fileLevelComments: PRReviewFileLevelComment[] = [],
 ): Promise<PRReviewSubmissionResult> {
-  if (ref.platform === "github") return submitGhPRReview(runtime, ref, headSha, action, body, fileComments);
-  return submitGlMRReview(runtime, ref, headSha, action, body, fileComments);
+  if (ref.platform === "github") {
+    return submitGhPRReview(runtime, ref, headSha, action, body, fileComments, fileLevelComments);
+  }
+  // GitLab has no file-level discussion: file comments ride the body (#1599).
+  return submitGlMRReview(runtime, ref, headSha, action, foldFileLevelComments(body, fileLevelComments), fileComments);
 }
 
 /**

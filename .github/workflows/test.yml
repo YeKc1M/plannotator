@@ -78,6 +78,7 @@ jobs:
           packages/review-editor/components/DiffViewer.fullContentSwap.test.tsx
           packages/review-editor/components/DiffViewer.oversizedStub.test.tsx
           packages/review-editor/components/DiffViewer.binaryNotice.test.tsx
+          packages/review-editor/components/DiffViewer.imagePreview.test.tsx
           packages/review-editor/components/DiffViewer.headerControls.test.tsx
 
       # Seam contracts + the remaining DOM-gated tests. Scoped to the DOM files
@@ -97,7 +98,9 @@ jobs:
           packages/ui/components/html-viewer/HtmlViewer.bridgeAsset.test.tsx
           packages/ui/components/Viewer.vimMode.integration.test.tsx
           packages/ui/hooks/useVimSelection.test.tsx
+          packages/ui/hooks/useVimSelection.selectionScope.test.tsx
           packages/ui/hooks/useModelCatalogs.dom.test.tsx
+          packages/ui/components/ModelSourceHint.dom.test.tsx
           packages/ui/hooks/useAgentSettings.dom.test.tsx
           packages/ui/utils/codeHighlight.test.ts
           packages/ui/utils/htmlChrome.test.ts
@@ -126,6 +129,7 @@ jobs:
           packages/editor/editableDocumentsHook.test.tsx
           packages/review-editor/components/ReviewSubmissionDialog.ui.test.tsx
           packages/review-editor/App.panelView.test.tsx
+          packages/review-editor/App.commitsJj.test.tsx
           packages/review-editor/components/AnnotationToolbar.placement.test.tsx
           packages/review-editor/dock/panels/ReviewPROverviewPanel.ui.test.tsx
           packages/review-editor/components/FileHeader.edit.test.tsx
@@ -232,6 +236,7 @@ jobs:
           packages/ui/components/sidebar/SidebarContainer.mobile.test.tsx
           packages/ui/components/ui/mobile-foundation.test.tsx
           packages/ui/components/Settings.vim.test.tsx
+          packages/ui/components/Settings.annotateParity.test.tsx
           packages/ui/components/Settings.compactDisplay.test.tsx
           packages/ui/components/AnnotationToolbar.touchTargets.test.tsx
           packages/ui/components/AnnotationToolbar.modeShortcutGuard.test.tsx

@@ -9,15 +9,18 @@
  *   PLANNOTATOR_PORT   - Fixed port or inclusive range (default: random locally, 19432 for remote)
  */
 
+import { appHtmlResponse, likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
 import type { Origin } from "@plannotator/shared/agents";
-import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, getVcsDiffFingerprint, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext, detectRemoteDefaultCompareTarget, resolveAvailableDiffType, vcsOwnsDiffType, vcsSupportsSnapshot, materializeVcsSnapshot, gitRuntime } from "./vcs";
+import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, getVcsFileBytesForDiff, getVcsDiffFingerprint, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext, detectRemoteDefaultCompareTarget, resolveAvailableDiffType, vcsOwnsDiffType, vcsSupportsSnapshot, materializeVcsSnapshot, gitRuntime } from "./vcs";
 import { basename } from "node:path";
 import { existsSync } from "node:fs";
 import { SingleFlight } from "@plannotator/shared/single-flight";
 import {
+  commitFamilyId,
   isSameCwdCommitSwitch,
   parseCommitDiffType,
+  parseJjCommitDiffType,
   parseWorktreeDiffType,
   resolveBaseBranch,
   getSinceBaseSections,
@@ -25,6 +28,7 @@ import {
   nextRemoteBaseCheckInterval,
   REMOTE_BASE_CHECK_INTERVAL_MS,
   isBinaryPatchFile,
+  getFileBytesForDiff,
   listPatchFiles,
   STATIC_PATCH_DIFF_TYPE,
   type RemoteDefaultInfo,
@@ -36,10 +40,23 @@ import {
 } from "@plannotator/shared/gitbutler-core";
 import {
   getCommitDiffInfo,
+  getJjCommitDiffInfo,
   listCommitHistory,
+  listJjCommitHistory,
+  resolveJjCommitRailBase,
   type CommitDiffInfo,
 } from "@plannotator/shared/commit-history";
+import { runtime as jjRuntime } from "./jj";
+import { canonicalizeJjCommitDiffType } from "@plannotator/shared/jj-core";
 import { resolvePoolCwd } from "@plannotator/shared/worktree-pool";
+import {
+  REVIEW_IMAGE_ENDPOINT,
+  REVIEW_IMAGE_READ_CONCURRENCY,
+  createConcurrencyLimiter,
+  handleReviewImageRequest,
+  readPRImageSide,
+} from "@plannotator/shared/review-image";
+import type { DiffSide, FileBytesRead } from "@plannotator/shared/review-core";
 import {
   createDefaultSemanticDiffRuntime,
   getSemanticDiffAvailability,
@@ -119,7 +136,7 @@ import {
 import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGitRemoteCheck } from "./config";
 import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "@plannotator/shared/feedback-archive";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
-import { type PRMetadata, type PRRef, type PRReviewFileComment, type PRStackTree, type PRListItem, fetchPR, fetchPRFileContent, fetchPRContext, submitPRReview, fetchPRViewedFiles, markPRFilesViewed, fetchPRStack, fetchPRList, getPRUser, parsePRUrl, prRefFromMetadata, isSameProject, getDisplayRepo, getMRLabel, getMRNumberLabel, prCommandRuntime } from "./pr";
+import { type PRMetadata, type PRRef, type PRReviewFileComment, type PRStackTree, type PRListItem, fetchPR, fetchPRFileContent, fetchPRFileBytes, fetchPRContext, submitPRReview, parseFileLevelComments, parsePRReviewAction, fetchPRViewedFiles, markPRFilesViewed, fetchPRStack, fetchPRList, getPRUser, parsePRUrl, prRefFromMetadata, isSameProject, getDisplayRepo, getMRLabel, getMRNumberLabel, prCommandRuntime } from "./pr";
 import {
   PR_CONTEXT_HEARTBEAT_COMMENT,
   PR_CONTEXT_HEARTBEAT_INTERVAL_MS,
@@ -157,6 +174,12 @@ export { handleServerReady as handleReviewServerReady } from "./shared-handlers"
 // --- Types ---
 
 export interface ReviewServerOptions {
+  /**
+   * The session is loopback-bound but published across the user's tailnet
+   * (--tailscale), so its browser may be on another device: the app page is
+   * served compressed, as in remote mode (#1617).
+   */
+  tailnetPublished?: boolean;
   /** Raw git diff patch string */
   rawPatch: string;
   /** Git ref used for the diff (e.g., "HEAD", "main..HEAD", "--staged") */
@@ -297,6 +320,11 @@ export async function startReviewServer(
   // that would otherwise resolve patch paths against whatever cwd the server
   // happens to run in.
   const isStaticPatchMode = options.diffType === STATIC_PATCH_DIFF_TYPE;
+  // Image preview capability advert (#1598), beside approvalNotesSupported on
+  // every diff payload. Off where nothing can be read: a static patch has
+  // no repository, and P4 drops binary files from its patch entirely.
+  const imagePreviewSupported = !isStaticPatchMode && gitContext?.vcsType !== "p4";
+  const runImageRead = createConcurrencyLimiter(REVIEW_IMAGE_READ_CONCURRENCY);
   const sourceKindAdvert = isStaticPatchMode
     ? ({ sourceKind: "patch" } as const)
     : ({} as Record<string, never>);
@@ -833,9 +861,12 @@ export async function startReviewServer(
     if (isPRMode || workspace || !gitContext) return undefined;
     const effective = parseWorktreeDiffType(diffType)?.subType ?? diffType;
     const sha = parseCommitDiffType(effective as string)?.sha;
-    if (!sha) return undefined;
+    const jjCommitId = parseJjCommitDiffType(effective as string)?.commitId;
+    if (!sha && !jjCommitId) return undefined;
     const cwd = resolveVcsCwd(diffType as DiffType, gitContext.cwd);
-    const info = await getCommitDiffInfo(gitRuntime, sha, cwd);
+    const info = jjCommitId
+      ? await getJjCommitDiffInfo(jjRuntime, jjCommitId, cwd)
+      : await getCommitDiffInfo(gitRuntime, sha!, cwd);
     if (!info) return undefined;
     const avatars = await commitAvatars.resolve(cwd, [info.authorEmail]);
     const avatarUrl = avatars.get(info.authorEmail);
@@ -1452,7 +1483,7 @@ export async function startReviewServer(
         // record D6): captured from the SAME launch-time snapshot as the
         // patch the model is given, never re-read at export time. Repairs
         // reuse the FAILED job's own review, like changedFilesSnapshot.
-        const commitSha = parseCommitDiffType(String(worktreeParts?.subType ?? launchDiffType))?.sha;
+        const commitSha = commitFamilyId(String(launchDiffType)) ?? undefined;
         const launchSource: GuideSnapshotSource = workspacePrompt
           ? { kind: "workspace", ...(repoInfo?.display && { repo: repoInfo.display }) }
           : launchMetadata
@@ -1532,8 +1563,8 @@ export async function startReviewServer(
       // appends the marker-block output contract (even for a custom profile —
       // it's the only thing that makes their prose output parseable). The
       // engine's buildArgv passes the prompt as the trailing positional arg and
-      // threads the spawn cwd (--workspace for Cursor, --dir for OpenCode; Pi has
-      // no cwd flag — it always uses the process's actual cwd, which spawnJob
+      // threads the spawn cwd (--workspace for Cursor; OpenCode (#1609) and Pi have
+      // no cwd flag — they use the process's actual cwd, which spawnJob
       // already sets from this same cwd).
       // captureStdout is required: the marker block comes back on stdout NDJSON.
       const markerEngine = MARKER_ENGINES[provider as MarkerEngineId];
@@ -1760,6 +1791,9 @@ export async function startReviewServer(
   const aiRuntime = aiEnabled ? await createAIRuntime({ getCwd: resolveAgentCwd }) : null;
 
   const isRemote = isRemoteSession();
+  // The app page is served compressed only to sessions reachable from another
+  // device: remote mode or --tailscale (#1617). Local sessions are unchanged.
+  const compressAppHtml = isRemote || options.tailnetPublished === true;
   const wslFlag = await isWSL();
   const gitUser = detectGitUser();
 
@@ -2142,6 +2176,7 @@ export async function startReviewServer(
               gitContext: hasLocalAccess ? servedGitContext : undefined,
               sharingEnabled,
               approvalNotesSupported,
+              imagePreviewSupported,
               ...sourceKindAdvert,
               // Mount is the only place the pin matters, so it rides /api/diff
               // alone (not the switch endpoints).
@@ -2438,26 +2473,45 @@ export async function startReviewServer(
             }
           }
 
-          // API: Linear commit history for the Commits panel. Git-local
-          // sessions only — PR/workspace/jj/p4 don't offer the view (same
-          // gate the client's commitsCapable applies). Computed against the
-          // same cwd as the active diff so worktree sessions list the
+          // API: Linear commit history for the Commits panel. Local git and
+          // jj sessions only — PR/workspace/GitButler/p4 don't offer the view
+          // (same gate the client's commitsCapable applies). Computed against
+          // the same cwd as the active diff so worktree sessions list the
           // worktree's history, and against the active base so the divider
-          // matches the review baseline.
+          // matches the review baseline (jj: the compare target, see
+          // resolveJjCommitRailBase).
           if (url.pathname === "/api/commits" && req.method === "GET") {
-            if (!gitContext || isPRMode || workspace || (sessionVcsType && sessionVcsType !== "git")) {
+            const commitsVcs = sessionVcsType ?? "git";
+            if (!gitContext || isPRMode || workspace || (commitsVcs !== "git" && commitsVcs !== "jj")) {
               return Response.json(
-                { error: "Commit history is only available for local git reviews" },
+                { error: "Commit history is only available for local git and jj reviews" },
                 { status: 400 },
               );
             }
             const limitParam = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
             const before = url.searchParams.get("before") ?? undefined;
             const commitsCwd = resolveVcsCwd(currentDiffType as DiffType, gitContext.cwd);
-            const page = await listCommitHistory(gitRuntime, currentBase, commitsCwd, {
+            const pageOptions = {
               ...(Number.isFinite(limitParam) && { limit: limitParam }),
               ...(before !== undefined && { before }),
-            });
+            };
+            let page;
+            try {
+              if (commitsVcs === "jj") {
+                const railBase = resolveJjCommitRailBase(currentBase, clientGitContext ?? gitContext);
+                page = await listJjCommitHistory(jjRuntime, railBase.target, commitsCwd, {
+                  ...pageOptions,
+                  baseLabel: railBase.label,
+                });
+              } else {
+                page = await listCommitHistory(gitRuntime, currentBase, commitsCwd, pageOptions);
+              }
+            } catch (err) {
+              return Response.json(
+                { error: err instanceof Error ? err.message : "Could not read commit history" },
+                { status: 500 },
+              );
+            }
             if (!page) {
               return Response.json({ error: "Could not read commit history" }, { status: 500 });
             }
@@ -2537,6 +2591,7 @@ export async function startReviewServer(
                   gitRef: currentGitRef,
                   snapshotId: currentSnapshotId(),
                   approvalNotesSupported,
+                  imagePreviewSupported,
                   ...sourceKindAdvert,
                   diffType: currentDiffType,
                   diffOptions: workspace.diffOptions,
@@ -2570,6 +2625,12 @@ export async function startReviewServer(
                 ? resolveAvailableDiffType(clientGitContext, requestedDiffType, nextBaseExplicitlyChosen)
                 : { diffType: requestedDiffType };
               newDiffType = availability.diffType;
+              // A jj revision rewritten since it was opened (the working copy
+              // on every save) resolves to its change's current version, so
+              // Refresh and rail clicks never serve a frozen snapshot.
+              if (sessionVcsType === "jj") {
+                newDiffType = await canonicalizeJjCommitDiffType(jjRuntime, newDiffType as string, gitContext?.cwd) as DiffType;
+              }
               const base = resolveReviewBase(
                 requestedBase,
                 nextBaseExplicitlyChosen,
@@ -2698,6 +2759,7 @@ export async function startReviewServer(
                 gitRef: currentGitRef,
                 snapshotId: currentSnapshotId(),
                 approvalNotesSupported,
+                imagePreviewSupported,
                 ...sourceKindAdvert,
                 diffType: currentDiffType,
                 // Echo the base the server actually used. resolveBaseBranch
@@ -2765,6 +2827,7 @@ export async function startReviewServer(
                   snapshotId: currentSnapshotId(),
                   draftState: reviewDrafts.state(currentDraftKeys()),
                   approvalNotesSupported,
+                  imagePreviewSupported,
                   ...sourceKindAdvert,
                   prDiffScope: currentPRDiffScope,
                   ...(layerPatchIncomplete && { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable }),
@@ -2824,6 +2887,7 @@ export async function startReviewServer(
                   snapshotId: currentSnapshotId(),
                   draftState: reviewDrafts.state(currentDraftKeys()),
                   approvalNotesSupported,
+                  imagePreviewSupported,
                   ...sourceKindAdvert,
                   prDiffScope: currentPRDiffScope,
                   ...(layerPatchIncomplete && { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable }),
@@ -2874,6 +2938,7 @@ export async function startReviewServer(
                 snapshotId: currentSnapshotId(),
                 draftState: reviewDrafts.state(currentDraftKeys()),
                 approvalNotesSupported,
+                imagePreviewSupported,
                 ...sourceKindAdvert,
                 prDiffScope: currentPRDiffScope,
                 semanticDiff: await getSemanticDiffAdvert(),
@@ -3005,6 +3070,7 @@ export async function startReviewServer(
                 snapshotId: currentSnapshotId(),
                 draftState: reviewDrafts.state(currentDraftKeys()),
                 approvalNotesSupported,
+                imagePreviewSupported,
                 ...sourceKindAdvert,
                 prMetadata: pr.metadata,
                 // The new PR's checkout (null while warming) so Open-in re-roots
@@ -3119,6 +3185,69 @@ export async function startReviewServer(
               const message = error instanceof Error ? error.message : "Failed to fetch artifact content";
               return Response.json({ error: message }, { status });
             }
+          }
+
+          // API: One side of a changed image, as bytes (#1598). Every decision
+          // (eligibility, caps, sniffing, headers) is in the shared handler;
+          // this closure only says where the current mode reads a side from,
+          // in the same priority order as /api/file-content below.
+          if (url.pathname === REVIEW_IMAGE_ENDPOINT && req.method === "GET") {
+            const readSide = async (
+              side: DiffSide,
+              filePath: string,
+              oldPath: string | undefined,
+              maxBytes: number,
+              signal?: AbortSignal,
+            ): Promise<FileBytesRead> => {
+              if (workspace) return workspace.getFileBytes(filePath, oldPath, side, maxBytes);
+              const prCwd = resolvePRLocalCwd();
+              if (isPRMode && currentPRDiffScope === "full-stack" && prCwd && prMetadata?.defaultBranch) {
+                const baseRef = await resolvePRFullStackBaseRef(gitRuntime, prMetadata.defaultBranch, prCwd);
+                if (!baseRef) return { kind: "missing" };
+                return getFileBytesForDiff(gitRuntime, "merge-base", baseRef, filePath, oldPath, side, maxBytes, prCwd);
+              }
+              if (hasLocalAccess) {
+                return getVcsFileBytesForDiff(
+                  currentDiffType as DiffType,
+                  currentBase,
+                  filePath,
+                  oldPath,
+                  side,
+                  maxBytes,
+                  gitContext?.cwd,
+                );
+              }
+              if (isPRMode && prMetadata && prRef) {
+                const ref = prRef;
+                return readPRImageSide({
+                  gitRuntime,
+                  poolCwd: prCwd,
+                  oldSha: prMetadata.mergeBaseSha ?? prMetadata.baseSha,
+                  headSha: prMetadata.headSha,
+                  side,
+                  filePath,
+                  oldPath,
+                  maxBytes,
+                  fetchBytes: (sha, path, max) => fetchPRFileBytes(ref, sha, path, max),
+                  signal,
+                });
+              }
+              return { kind: "unavailable" };
+            };
+            const result = await handleReviewImageRequest({
+              params: url.searchParams,
+              ifNoneMatch: req.headers.get("if-none-match"),
+              available: imagePreviewSupported,
+              patch: currentPatch,
+              isCurrentSnapshot: (snapshot) => snapshot === currentSnapshotId(),
+              signal: req.signal,
+              readSide: (side, filePath, oldPath, maxBytes, signal) =>
+                runImageRead(() => readSide(side, filePath, oldPath, maxBytes, signal), signal),
+            });
+            return new Response(result.body as BodyInit | null, {
+              status: result.status,
+              headers: result.headers,
+            });
           }
 
           // API: Get file content for expandable diff context
@@ -3692,11 +3821,20 @@ export async function startReviewServer(
             }
             try {
               const body = (await req.json()) as {
-                action: "approve" | "comment";
+                action: unknown;
                 body: string;
                 fileComments: PRReviewFileComment[];
+                fileLevelComments?: unknown;
                 targetPrUrl?: string;
               };
+              const action = parsePRReviewAction(body.action);
+              if (!action) {
+                return Response.json(
+                  { error: "action must be one of approve, comment, request_changes" },
+                  { status: 400 },
+                );
+              }
+              const fileLevelComments = parseFileLevelComments(body.fileLevelComments);
 
               // Resolve target PR — either explicit target or current.
               // When targetPrUrl is provided, the client has already filtered
@@ -3720,14 +3858,15 @@ export async function startReviewServer(
                 );
               }
 
-              console.error(`[pr-action] ${body.action} with ${body.fileComments.length} file comment(s), target=${targetUrl}, headSha=${targetHeadSha}`);
+              console.error(`[pr-action] ${action} with ${body.fileComments.length} line comment(s) and ${fileLevelComments.length} file-level comment(s), target=${targetUrl}, headSha=${targetHeadSha}`);
 
               const submission = await submitPlatformReview(
                 targetRef,
                 targetHeadSha,
-                body.action,
+                action,
                 body.body,
                 body.fileComments,
+                fileLevelComments,
               );
 
               console.error(`[pr-action] ${submission.status === "complete" ? "Success" : "Partial success"}`);
@@ -3812,9 +3951,7 @@ export async function startReviewServer(
           }
 
           // Serve embedded HTML for all other routes (SPA)
-          return new Response(htmlContent, {
-            headers: { "Content-Type": "text/html" },
-          });
+          return appHtmlResponse(req, htmlContent, compressAppHtml);
         },
 
         error(err) {
@@ -3847,6 +3984,12 @@ export async function startReviewServer(
       } catch { /* best effort */ }
     }
   };
+
+  // Start the likely encoding now (gzip for plain-http remote mode, brotli
+  // behind tailscale serve) so the first load does not wait for it.
+  if (compressAppHtml) {
+    prewarmAppHtml(htmlContent, likelyAppHtmlEncoding(options.tailnetPublished === true));
+  }
 
   // Notify caller that server is ready. An async ready handler that rejects
   // (e.g. --tailscale publishing failed) must stop the server and propagate:

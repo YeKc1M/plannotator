@@ -207,6 +207,58 @@ export function composeClaudeReviewPrompt(
 // Command builder
 // ---------------------------------------------------------------------------
 
+/** Options shared by every Claude Code agent-job command builder. */
+export interface ClaudeJobCommandOptions {
+  /** False turns Claude Code's sandbox off for this job only (see
+   *  `claudeJobIsolationArgs`). Callers resolve this via
+   *  resolveClaudeSandbox() (PLANNOTATOR_CLAUDE_SANDBOX / config.json
+   *  `claudeSandbox`); the builders stay env-free. Default: the user's own
+   *  Claude Code sandbox setting applies. */
+  sandbox?: boolean;
+}
+
+/**
+ * Appended to the system prompt of every Claude agent job. Jobs run under
+ * `--permission-mode dontAsk` with a prefix allowlist, so a compound shell
+ * command (`MB=$(git merge-base ...) && git log $MB`) is refused as a whole
+ * even when every part is allowlisted, and models reach for exactly that
+ * shape (#1627).
+ */
+export const CLAUDE_JOB_SHELL_GUIDANCE =
+  "Shell access in this session is limited to an allowlist of read-only commands, " +
+  "and anything outside it is refused without a prompt. Run each command on its own " +
+  "as one simple invocation: no `&&`, `||`, `;`, pipes, redirects, `$(...)` or shell " +
+  "variables. If you need a value from one command (such as a merge-base sha), run it, " +
+  "read the output, then pass the literal value to the next command.";
+
+/**
+ * Arguments that keep a Claude agent job hermetic and runnable (#1627):
+ *
+ * - `--strict-mcp-config` with no `--mcp-config`: loads NO MCP servers, so the
+ *   user's own servers (IDE bridges, SaaS connectors) never reach a review
+ *   job. The allowlist already refuses them; without this flag the model
+ *   still sees them and wanders off to them when Bash fails.
+ * - `--append-system-prompt`: the single-command guidance above.
+ * - `sandbox: false` → `--settings {"sandbox":{"enabled":false}}`. Where
+ *   Claude Code's sandbox cannot start (Linux without bubblewrap/socat,
+ *   AppArmor-restricted user namespaces), a command falls back to running
+ *   unsandboxed only with permission, which dontAsk refuses, so every Bash
+ *   call fails. Opting out runs the job's commands WITHOUT OS containment,
+ *   exactly like any user who never enabled Claude's sandbox (Claude Code's
+ *   default). `--tools`, the command allowlist and the disallow list are
+ *   unchanged, but the allowlist LIMITS what the model can run; it does not
+ *   contain it (allowlisted prefixes such as `git -C` or `gh api` accept
+ *   arguments that execute or write). `--settings` outranks user/project
+ *   settings but not managed policy, so an enterprise-enforced sandbox wins.
+ */
+export function claudeJobIsolationArgs(opts?: ClaudeJobCommandOptions): string[] {
+  return [
+    "--strict-mcp-config",
+    "--append-system-prompt", CLAUDE_JOB_SHELL_GUIDANCE,
+    ...(opts?.sandbox === false ? ["--settings", JSON.stringify({ sandbox: { enabled: false } })] : []),
+  ];
+}
+
 export interface ClaudeCommandResult {
   command: string[];
   /** Prompt text to write to stdin (Claude reads prompt from stdin, not argv). */
@@ -217,7 +269,12 @@ export interface ClaudeCommandResult {
  * Build the `claude -p` command. Prompt is passed via stdin, not as a
  * positional arg — avoids quoting issues, argv limits, and variadic flag conflicts.
  */
-export function buildClaudeCommand(prompt: string, model: string = "opus", effort?: string): ClaudeCommandResult {
+export function buildClaudeCommand(
+  prompt: string,
+  model: string = "opus",
+  effort?: string,
+  opts?: ClaudeJobCommandOptions,
+): ClaudeCommandResult {
   const allowedTools = [
     "Agent", "Read", "Glob", "Grep",
     // GitHub CLI
@@ -261,6 +318,7 @@ export function buildClaudeCommand(prompt: string, model: string = "opus", effor
       "--tools", "Agent,Bash,Read,Glob,Grep",
       "--allowedTools", allowedTools,
       "--disallowedTools", disallowedTools,
+      ...claudeJobIsolationArgs(opts),
     ],
     stdinPrompt: prompt,
   };
@@ -351,4 +409,113 @@ export function formatClaudeLogEvent(line: string): string | null {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked-shell detection (#1627)
+// ---------------------------------------------------------------------------
+
+/** Job warning shown when a Claude job could not run a single shell command. */
+export const CLAUDE_SHELL_BLOCKED_WARNING =
+  "Claude Code refused every shell command this job tried, so it could not inspect the repository with git. " +
+  "If your Claude Code settings enable its sandbox and the sandbox cannot start on this machine " +
+  "(for example Linux without bubblewrap and socat), set PLANNOTATOR_CLAUDE_SANDBOX=0 or " +
+  "{ \"claudeSandbox\": false } in ~/.plannotator/config.json and run the job again.";
+
+/** A Bash tool_result that reads as a refusal rather than a command's own failure. */
+function isBashRefusal(content: unknown): boolean {
+  const text = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((c) => (c && typeof c === "object" && typeof (c as { text?: unknown }).text === "string" ? (c as { text: string }).text : "")).join(" ")
+      : "";
+  return /permission to use bash has been denied|sandbox/i.test(text);
+}
+
+/** `Bash(<pattern>)` entries of an `--allowedTools` value, as matchers for one
+ *  whole command: `git log:*` is the prefix `git log` followed by nothing or
+ *  whitespace; `*` elsewhere matches any run of characters. */
+function allowlistMatchers(allowedTools: string): RegExp[] {
+  const out: RegExp[] = [];
+  for (const m of allowedTools.matchAll(/Bash\(([^)]*)\)/g)) {
+    let pattern = m[1].trim();
+    const prefixForm = pattern.endsWith(":*");
+    if (prefixForm) pattern = pattern.slice(0, -2);
+    if (!pattern) continue;
+    const body = pattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+    out.push(new RegExp(`^${body}${prefixForm ? "(\\s|$)" : "$"}`));
+  }
+  return out;
+}
+
+/** A command the job's allowlist admits outright: one invocation with no shell
+ *  operators, substitutions, redirects or variables, matching a `Bash(...)`
+ *  entry. `dontAsk` never refuses such a command unless the shell itself is
+ *  unavailable (the sandbox cannot start and the unsandboxed fallback needs a
+ *  permission prompt). */
+function isPlainAllowlistedCommand(command: unknown, matchers: RegExp[]): boolean {
+  if (typeof command !== "string") return false;
+  const cmd = command.trim();
+  if (!cmd || /[|&;<>`$\n\\(){}]/.test(cmd)) return false;
+  return matchers.some((re) => re.test(cmd));
+}
+
+/**
+ * Decide from a Claude job's stream-json stdout whether its shell was blocked
+ * outright, the #1627 shape. Rule: at least one refused Bash call was a PLAIN
+ * command its own allowlist admits (see isPlainAllowlistedCommand; refused
+ * means listed in the result event's `permission_denials`, or answered by an
+ * error tool_result that reads as a permission/sandbox refusal) AND not one
+ * Bash call succeeded.
+ *
+ * Refusals of compound commands, variables or commands outside the allowlist
+ * never count: `dontAsk` refuses those by design and the model's next single
+ * command usually works. A plain allowlisted command is only refused when the
+ * shell cannot run at all, so one such refusal is the signal; requiring zero
+ * successes on top keeps a transient oddity from warning. `allowedTools` is
+ * the job's own `--allowedTools` value; without it nothing counts.
+ */
+export function detectClaudeShellBlocked(stdout: string, allowedTools: string): boolean {
+  const matchers = allowlistMatchers(allowedTools);
+  if (matchers.length === 0) return false;
+  const bashCommands = new Map<string, unknown>();
+  const refused = new Set<string>();
+  let succeeded = 0;
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    let event: any;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (event?.type === "assistant" && Array.isArray(event.message?.content)) {
+      for (const block of event.message.content) {
+        if (block?.type === "tool_use" && block.name === "Bash" && typeof block.id === "string") {
+          bashCommands.set(block.id, block.input?.command);
+        }
+      }
+    } else if (event?.type === "user" && Array.isArray(event.message?.content)) {
+      for (const block of event.message.content) {
+        if (block?.type !== "tool_result" || !bashCommands.has(block.tool_use_id)) continue;
+        if (block.is_error !== true) succeeded++;
+        else if (isBashRefusal(block.content)) refused.add(block.tool_use_id);
+      }
+    } else if (event?.type === "result" && Array.isArray(event.permission_denials)) {
+      for (const d of event.permission_denials) {
+        if (d?.tool_name !== "Bash" || typeof d.tool_use_id !== "string") continue;
+        refused.add(d.tool_use_id);
+        // A denial carries its own input; keep it when the tool_use line was missed.
+        if (!bashCommands.has(d.tool_use_id)) bashCommands.set(d.tool_use_id, d.tool_input?.command);
+      }
+    }
+  }
+  if (succeeded > 0) return false;
+  for (const id of refused) {
+    if (isPlainAllowlistedCommand(bashCommands.get(id), matchers)) return true;
+  }
+  return false;
+}
+
+/** The `--allowedTools` value of a spawned command, or "" when absent. */
+export function allowedToolsOf(command: readonly string[]): string {
+  const i = command.indexOf("--allowedTools");
+  return i === -1 ? "" : (command[i + 1] ?? "");
 }

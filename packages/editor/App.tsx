@@ -176,6 +176,7 @@ import {
   type CheckboxOverrideSnapshot,
   type CheckboxToggleMutation,
 } from './hooks/useCheckboxOverrides';
+import { useQuestionAnswers } from './hooks/useQuestionAnswers';
 import {
   usePlanDiffNavigationAutoExit,
   usePlanDiffViewAutoExit,
@@ -4386,6 +4387,9 @@ const App: React.FC = () => {
     }
   };
 
+  // `:::question` answers: minimal upsert into the annotation list.
+  const handleAnswerQuestion = useQuestionAnswers(setAnnotations, annotationsRef);
+
   // Interactive checkbox toggling with annotation tracking
   const checkbox = useCheckboxOverrides({
     blocks,
@@ -6824,6 +6828,7 @@ const App: React.FC = () => {
                     }
                     onToggleCheckbox={checkbox.toggle}
                     checkboxOverrides={checkbox.overrides}
+                    onAnswerQuestion={handleAnswerQuestion}
                     actionsLabelMode={actionsLabelMode}
                     onAskAI={canUseDocumentAskAI ? handleAskAI : undefined}
                     readOnly={documentReadOnly}

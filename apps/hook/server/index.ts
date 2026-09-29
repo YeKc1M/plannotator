@@ -138,7 +138,8 @@ import {
   buildPlanFileRule,
 } from "@plannotator/shared/prompts";
 import { buildReviewOutput, supportsReviewApprovalNotes } from "./review-output";
-import { registerSession, unregisterSession, listSessions } from "@plannotator/server/sessions";
+import { registerSession, unregisterSession, listSessions, type SessionInfo } from "@plannotator/server/sessions";
+import { enableAutoUpdateNotice, scheduleAutoUpdateCheck } from "@plannotator/server/auto-update";
 import { openBrowser } from "@plannotator/server/browser";
 import { inlineHtmlLocalAssets } from "@plannotator/server/html-assets";
 import { installAgentTerminalRuntime } from "@plannotator/server/agent-terminal-runtime";
@@ -185,6 +186,7 @@ import {
   formatSubcommandHelp,
   formatTopLevelHelp,
   formatVersion,
+  getCliVersion,
   isInteractiveNoArgInvocation,
   isSubcommandHelpInvocation,
   isTopLevelHelpInvocation,
@@ -575,6 +577,15 @@ if (isInteractiveNoArgInvocation(args, process.stdin.isTTY)) {
 // Ensure session cleanup on exit
 process.on("exit", () => unregisterSession());
 
+// Opt-in auto-update (#1634). Only this compiled-CLI entry point arms it; the
+// OpenCode and Pi servers never do. Both calls are no-ops for a dev/source run
+// (no __CLI_VERSION__), and the check itself is scheduled, never awaited.
+enableAutoUpdateNotice(getCliVersion());
+function registerCliSession(info: SessionInfo): void {
+  registerSession(info);
+  scheduleAutoUpdateCheck(getCliVersion());
+}
+
 // Route fatal signals through process.exit() so "exit" handlers run — by
 // default a SIGINT/SIGTERM death skips them, leaking background-warmup
 // children and stale `git worktree` registrations (the --local PR checkout
@@ -810,7 +821,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1234,7 +1245,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1485,7 +1496,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1733,7 +1744,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1783,7 +1794,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1846,7 +1857,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2066,7 +2077,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2169,7 +2180,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2236,7 +2247,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2342,7 +2353,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2527,7 +2538,7 @@ if (args[0] === "sessions") {
       },
     });
 
-    registerSession({
+    registerCliSession({
       pid: process.pid,
       port: server.port,
       url: server.url,
@@ -2596,7 +2607,7 @@ if (args[0] === "sessions") {
       },
     });
 
-    registerSession({
+    registerCliSession({
       pid: process.pid,
       port: vibeServer.port,
       url: vibeServer.url,
@@ -2677,7 +2688,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,

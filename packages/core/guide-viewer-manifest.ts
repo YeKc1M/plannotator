@@ -6,9 +6,9 @@ import type { GuideViewerAssets } from "./guide-format";
 
 export const GUIDE_VIEWER_MANIFEST: Omit<GuideViewerAssets, "baseUrl"> = {
   js: "viewer.-XQ6Upr-.js",
-  css: "viewer.02BlDU30.css",
+  css: "viewer.Ci6tjhXU.css",
   jsIntegrity: "sha384-pZjQc79NxBxPZ/Ee3U2kyUz56DUmJ9TRZJUASnqVqvb4H9dZlb5vu145fLA0FYDr",
-  cssIntegrity: "sha384-80J/q+hm6koj7ro827QKv6TvHXF3wPtawtFo0SnXA06bKkwrIET9yWcTuls76prN",
+  cssIntegrity: "sha384-HHBdPc5NL9KlP+aua7qm2StlzWYp3S9J/WdhywTxstQtMnSKr5mnprMRMxE9UwYk",
   langs: {
     "astro": "chunks/astro.Ts5EKq2l.js",
     "c": "chunks/c.BIGW1oBm.js",

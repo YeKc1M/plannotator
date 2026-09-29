@@ -179,6 +179,22 @@ import {
 } from './hooks/useCheckboxOverrides';
 import { useQuestionAnswers } from './hooks/useQuestionAnswers';
 import {
+  countQuestionAnswers,
+  describeFeedbackLoss,
+  frameAnswersOnlyFeedback,
+  isAnswersOnlyFeedback,
+  isQuestionAnswerRow,
+  questionAnswerRemapper,
+  SEND_ANSWERS_LABEL,
+} from './questionDecision';
+import {
+  buildQuestionPanelRows,
+  focusQuestionCard,
+  nextOpenQuestionKey,
+  questionProgress,
+  type QuestionPanelRow,
+} from '@plannotator/ui/utils/questionAnswers';
+import {
   usePlanDiffNavigationAutoExit,
   usePlanDiffViewAutoExit,
 } from './hooks/usePlanDiffViewAutoExit';
@@ -358,14 +374,6 @@ const draftBannerMessage = (banner: { count: number; timeAgo: string; hasEdits: 
   return `Found ${parts.join(' and ')} from ${banner.timeAgo}. Would you like to restore them?`;
 };
 
-const feedbackLossDescription = (annotationCount: number, hasDirectEdits: boolean): string => {
-  const parts = [
-    annotationCount > 0 ? `${annotationCount} annotation${annotationCount !== 1 ? 's' : ''}` : '',
-    hasDirectEdits ? 'direct edits' : '',
-  ].filter(Boolean);
-  return parts.length > 0 ? parts.join(' and ') : 'feedback';
-};
-
 type SourceFileEditWarningAction = 'send-feedback' | 'approve' | 'close';
 type CompactPlanTransientSurface = Extract<
   CompactPlanSurface,
@@ -402,7 +410,8 @@ const itemId = (item: { id: string }): string => item.id;
 function annotationOwnsHighlight(annotation: Annotation): boolean {
   return !annotation.diffContext
     && annotation.type !== AnnotationType.GLOBAL_COMMENT
-    && !annotation.id.startsWith('ann-checkbox-');
+    && !annotation.id.startsWith('ann-checkbox-')
+    && !isQuestionAnswerRow(annotation);
 }
 
 /**
@@ -2549,7 +2558,12 @@ const App: React.FC = () => {
     // Match the display parse (blocks memo) — the active document's
     // frontmatter rule must apply here too or the remapped blockIds drift.
     const newBlocks = parseMarkdownToBlocks(next, { frontmatter: parseFrontmatterRef.current });
+    // An answer follows its question by key, not by quote: the prompt is the
+    // quote, and a reworded prompt is a different question (blockId '' then,
+    // so the panel lists the answer as unanchored and it still exports).
+    const remapAnswer = questionAnswerRemapper(newBlocks);
     const remapped = sourceAnnotations.map((a) => {
+      if (isQuestionAnswerRow(a)) return remapAnswer(a);
       if (a.diffContext || a.type === AnnotationType.GLOBAL_COMMENT || a.id.startsWith('ann-checkbox-')) return a;
       const blk = newBlocks.find((b) => b.content.includes(a.originalText));
       if ((blk?.id ?? '') === a.blockId) return a;
@@ -2571,9 +2585,7 @@ const App: React.FC = () => {
   // annotation highlights the same way the share-import path does.
   const repaintHighlights = useCallback((list: Annotation[]) => {
     resetExternalHighlights();
-    const planAnnotations = list.filter(
-      (a) => !a.diffContext && a.type !== AnnotationType.GLOBAL_COMMENT && !a.id.startsWith('ann-checkbox-')
-    );
+    const planAnnotations = list.filter(annotationOwnsHighlight);
     if (planAnnotations.length === 0) return;
     setTimeout(() => {
       viewerRef.current?.applySharedAnnotations(planAnnotations);
@@ -3058,7 +3070,58 @@ const App: React.FC = () => {
     (isEditingMarkdown ? editorDiffersFromBaseline : editedMarkdownRef.current !== null);
   const hasSavedFileChanges = savedFileChanges.length > 0;
   const hasFeedbackContent = hasAnyAnnotations || hasDirectEdits || hasSavedFileChanges;
-  const feedbackLoss = feedbackLossDescription(feedbackAnnotationCount, hasDirectEdits);
+  // Answers to `:::question` blocks in the open document. Plan review labels
+  // its primary "Send answers" when they are the only feedback.
+  const questionAnswerCount = useMemo(() => countQuestionAnswers([allAnnotations]), [allAnnotations]);
+  const answersOnlyFeedback = !annotateMode && isAnswersOnlyFeedback({
+    answerCount: questionAnswerCount,
+    feedbackCount: feedbackAnnotationCount,
+    hasDirectEdits,
+    hasSavedFileChanges,
+  });
+  const feedbackLoss = describeFeedbackLoss(feedbackAnnotationCount, hasDirectEdits, questionAnswerCount);
+
+  // The Questions panel section and the header "N/M answered" chip. Empty
+  // (no question, no answer) means neither renders.
+  const questionRows = useMemo(
+    () => (isHtmlSurface ? [] : buildQuestionPanelRows(blocks, viewerAnnotations)),
+    [blocks, isHtmlSurface, viewerAnnotations],
+  );
+  const questionProgressState = useMemo(() => questionProgress(questionRows), [questionRows]);
+  const lastQuestionJumpRef = useRef<string | null>(null);
+  const jumpToQuestion = useCallback((key: string) => {
+    lastQuestionJumpRef.current = key;
+    if (isCompactAnnotationsOpen) {
+      closeCompactPlanSurface(false);
+      requestAnimationFrame(() => { focusQuestionCard(key); });
+      return;
+    }
+    if (focusQuestionCard(key)) return;
+    // The cards are not drawn in the plan diff view: leave it, then jump.
+    if (isPlanDiffActive) {
+      setIsPlanDiffActive(false);
+      requestAnimationFrame(() => { focusQuestionCard(key); });
+    }
+  }, [closeCompactPlanSurface, isCompactAnnotationsOpen, isPlanDiffActive]);
+  const handleQuestionChipJump = useCallback(() => {
+    const last = lastQuestionJumpRef.current;
+    const skipped = questionRows.filter((row) => !row.orphaned && row.status === 'skipped');
+    const key = nextOpenQuestionKey(questionRows, last)
+      // Nothing open: step through the skipped ones instead, wrapping.
+      ?? skipped[(skipped.findIndex((row) => row.key === last) + 1) % Math.max(skipped.length, 1)]?.key
+      ?? null;
+    if (key) jumpToQuestion(key);
+  }, [jumpToQuestion, questionRows]);
+  const handleSelectQuestionRow = useCallback((row: QuestionPanelRow) => {
+    if (!row.orphaned) jumpToQuestion(row.key);
+  }, [jumpToQuestion]);
+  const headerQuestionProgress = questionProgressState.total > 0
+    ? {
+        ...questionProgressState,
+        hasOpen: nextOpenQuestionKey(questionRows) !== null,
+        onJump: handleQuestionChipJump,
+      }
+    : undefined;
   const hasUnsentFeedback = feedbackAnnotationCount > 0 || hasDirectEdits;
   const hasOnlySavedFileChanges = hasSavedFileChanges && !hasUnsentFeedback;
   const savedFileChangesLabel = savedFileChanges.length === 1 ? 'saved file change' : 'saved file changes';
@@ -3973,12 +4036,17 @@ const App: React.FC = () => {
         return;
       }
       const planSaveSettings = getPlanSaveSettings();
+      const payload = getCurrentFeedbackPayload(checkedSavedFileChanges);
       await fetch('/api/deny', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           draftGeneration: getDraftGeneration(),
-          feedback: getCurrentFeedbackPayload(checkedSavedFileChanges),
+          // Answers only: the agent is told the reviewer answered its
+          // questions, not that the plan was rejected. `answersOnly` is
+          // additive; today's servers ignore it.
+          feedback: answersOnlyFeedback ? frameAnswersOnlyFeedback(payload) : payload,
+          ...(answersOnlyFeedback ? { answersOnly: true } : {}),
           planSave: {
             enabled: planSaveSettings.enabled,
             ...(planSaveSettings.customPath && { customPath: planSaveSettings.customPath }),
@@ -4416,8 +4484,20 @@ const App: React.FC = () => {
     }
   };
 
-  // `:::question` answers: minimal upsert into the annotation list.
-  const handleAnswerQuestion = useQuestionAnswers(setAnnotations, annotationsRef);
+  // `:::question` answers: upserted into the annotation list and recorded in
+  // the annotation history (typing folds into one entry per burst).
+  const handleAnswerQuestion = useQuestionAnswers<DocumentHistoryAction>({
+    setAnnotations,
+    annotationsRef,
+    history: annotationHistory,
+    toAction: (mutation) => ({
+      kind: 'annotation',
+      mutation,
+      beforeSelection: selectionRef.current,
+      afterSelection: selectionRef.current,
+    }),
+    readOnly: documentReadOnly,
+  });
 
   // Interactive checkbox toggling with annotation tracking
   const checkbox = useCheckboxOverrides({
@@ -5792,10 +5872,12 @@ const App: React.FC = () => {
                 ]
               : [{
                   id: 'feedback' as const,
-                  label: 'Send feedback',
-                  subtitle: hasFeedbackToSend
-                    ? `${feedbackAnnotationCount} annotation${feedbackAnnotationCount === 1 ? '' : 's'}`
-                    : 'Add general feedback',
+                  label: answersOnlyFeedback ? SEND_ANSWERS_LABEL : 'Send feedback',
+                  subtitle: !hasFeedbackToSend
+                    ? 'Add general feedback'
+                    : answersOnlyFeedback
+                      ? `${questionAnswerCount} answer${questionAnswerCount === 1 ? '' : 's'}`
+                      : `${feedbackAnnotationCount} annotation${feedbackAnnotationCount === 1 ? '' : 's'}`,
                   onSelect: handleHeaderFeedback,
                   disabled: compactActionBusy,
                 }]),
@@ -6207,6 +6289,8 @@ const App: React.FC = () => {
       })) ?? null}
       onOtherFileAnnotationsClick={handleFlashAnnotatedFiles}
       readOnly={documentReadOnly}
+      questionRows={questionRows.length > 0 ? questionRows : undefined}
+      onSelectQuestion={handleSelectQuestionRow}
     />
   );
 
@@ -6297,6 +6381,8 @@ const App: React.FC = () => {
           agentName={agentName}
           availableAgents={availableAgents}
           showAnnotationsWarning={hasFeedbackToSend}
+          questionProgress={headerQuestionProgress}
+          feedbackLabel={answersOnlyFeedback ? SEND_ANSWERS_LABEL : undefined}
           annotateDecision={annotateMode ? annotateDecision : undefined}
           callbackConfig={callbackConfig}
           taterMode={taterMode}
@@ -7035,7 +7121,7 @@ const App: React.FC = () => {
           }
           subMessage={
             <>
-              To send feedback, use <strong>Send Feedback</strong> instead.
+              To send feedback, use <strong>{answersOnlyFeedback ? SEND_ANSWERS_LABEL : 'Send Feedback'}</strong> instead.
               <br /><br />
               Want this feature? Upvote these issues:
               <br />

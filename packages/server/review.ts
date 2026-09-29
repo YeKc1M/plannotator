@@ -89,6 +89,7 @@ import { getRepoInfo } from "./repo";
 import { handleImage, handleUpload, handleAgents, handleServerReady, handleApiNotFound, handleFavicon, readDraftGenerationFromBody, readDraftGenerationFromUrl, type OpencodeClient } from "./shared-handlers";
 import { contentHash } from "./draft";
 import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "@plannotator/shared/review-draft";
+import { captureReviewProgress, handleReviewProgress } from "@plannotator/shared/review-progress";
 import { createEditorAnnotationHandler } from "./editor-annotations";
 import { createExternalAnnotationHandler } from "./external-annotations";
 import { createAgentJobHandler } from "./agent-jobs";
@@ -133,7 +134,7 @@ import {
   extractMarkerNonce,
   type MarkerEngineId,
 } from "./marker-review";
-import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveClaudeSandbox, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGitRemoteCheck } from "./config";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveClaudeSandbox, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGitRemoteCheck, resolveReviewProgress } from "./config";
 import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "@plannotator/shared/feedback-archive";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
 import { type PRMetadata, type PRRef, type PRReviewFileComment, type PRStackTree, type PRListItem, fetchPR, fetchPRFileContent, fetchPRFileBytes, fetchPRContext, submitPRReview, parseFileLevelComments, parsePRReviewAction, fetchPRViewedFiles, markPRFilesViewed, fetchPRStack, fetchPRList, getPRUser, parsePRUrl, prRefFromMetadata, isSameProject, getDisplayRepo, getMRLabel, getMRNumberLabel, prCommandRuntime } from "./pr";
@@ -223,6 +224,7 @@ export interface ReviewServerOptions {
   openStatePinned?: boolean;
   /** Freshness token captured atomically with the initial provider patch. */
   initialFingerprint?: string;
+  initialFileIdentities?: Record<string, string>;
   /** Whether URL sharing is enabled (default: true) */
   sharingEnabled?: boolean;
   /**
@@ -409,6 +411,7 @@ export async function startReviewServer(
 
   // Mutable state for diff switching
   let currentPatch = options.rawPatch;
+  let currentFileIdentities = options.initialFileIdentities;
   let currentGitRef = options.gitRef;
   let currentDiffType: DiffType | WorkspaceDiffType = options.diffType || workspace?.diffType || "uncommitted";
   let currentError = options.error;
@@ -595,7 +598,25 @@ export async function startReviewServer(
       if (ok) callFlowService.invalidateRuntimeState();
     },
   });
+  // PLANNOTATOR_REVIEW_PROGRESS / config.reviewProgress: when off, no snapshot
+  // exists, so the endpoint answers `available: false` without touching disk and
+  // the client keeps viewed marks in the draft, as for unsupported modes.
+  const captureProgress = () => !resolveReviewProgress(loadConfig()) ? Promise.resolve(null) : captureReviewProgress({
+    patch: currentPatch,
+    fileIdentities: currentFileIdentities,
+    diffType: currentDiffType,
+    base: currentBase,
+    cwd: gitContext ? gitContext.cwd ?? process.cwd() : undefined,
+    vcsType: sessionVcsType,
+    prUrl: prMetadata?.url,
+    prScope: currentPRDiffScope,
+    workspaceRoot: workspace?.root,
+  }, gitRuntime.runGit);
+  // Captured once at startup: either by the initial fingerprint capture below
+  // or, when the caller already supplied a fingerprint, right after it.
+  let progressSnapshot: ReturnType<typeof captureProgress> = Promise.resolve(null);
   const captureDiffFingerprint = (knownFingerprint?: string): void => {
+    progressSnapshot = captureProgress();
     // A fingerprint capture marks a committed review-view change. Stop work
     // for the prior snapshot even when the new view cannot run CallDiff.
     callFlowService.cancelAll();
@@ -620,6 +641,7 @@ export async function startReviewServer(
     });
   };
   if (currentFingerprint === null) captureDiffFingerprint();
+  else progressSnapshot = captureProgress();
 
   const resolveReviewBase = (
     requestedBase?: string,
@@ -797,11 +819,12 @@ export async function startReviewServer(
                 currentDiffType as DiffType,
                 remote,
                 gitContext.cwd,
-                { hideWhitespace: currentHideWhitespace },
+                { hideWhitespace: currentHideWhitespace, captureFileIdentities: true },
               );
               if (!baseEverSwitched) {
                 currentBase = remote;
                 currentPatch = rebuilt.patch;
+                currentFileIdentities = rebuilt.fileIdentities;
                 currentGitRef = rebuilt.label;
                 currentError = rebuilt.error;
                 // draftKey doubles as the snapshot id the freshness probe
@@ -967,7 +990,7 @@ export async function startReviewServer(
   // itself stays a pure content hash — drafts survive content-identical
   // mode round-trips.
   const currentSnapshotId = (): string =>
-    `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}`;
+    `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}${currentFileIdentities ? `:${contentHash(JSON.stringify(currentFileIdentities))}` : ""}`;
 
   // --- Durable feedback archive --------------------------------------------
   //
@@ -2577,6 +2600,7 @@ export async function startReviewServer(
                 }
                 currentHideWhitespace = effectiveHideWhitespace;
                 currentPatch = snapshot.rawPatch;
+                currentFileIdentities = undefined;
                 currentGitRef = snapshot.gitRef;
                 currentDiffType = workspace.diffType;
                 currentError = snapshot.error;
@@ -2641,6 +2665,7 @@ export async function startReviewServer(
               // Run the new diff
               const result = await runVcsDiff(newDiffType as DiffType, base, defaultCwd, {
                 hideWhitespace: effectiveHideWhitespace,
+                captureFileIdentities: sessionVcsType === "git",
               });
               const resultContext = sessionVcsType === "gitbutler" && result.gitContext?.vcsType === "gitbutler"
                 ? result.gitContext
@@ -2712,6 +2737,7 @@ export async function startReviewServer(
               }
               currentHideWhitespace = effectiveHideWhitespace;
               currentPatch = result.patch;
+              currentFileIdentities = result.fileIdentities;
               currentGitRef = result.label;
               currentDiffType = newDiffType;
               currentBase = nextBase;
@@ -2869,6 +2895,7 @@ export async function startReviewServer(
                 }
                 if (scopeEpoch !== prScopeEpoch) return supersededResponse();
                 currentPatch = originalPRPatch;
+                currentFileIdentities = undefined;
                 currentGitRef = originalPRGitRef;
                 currentError = originalPRError;
                 currentPRDiffScope = "layer";
@@ -2921,6 +2948,7 @@ export async function startReviewServer(
 
               if (scopeEpoch !== prScopeEpoch) return supersededResponse();
               currentPatch = result.patch;
+              currentFileIdentities = undefined;
               currentGitRef = result.label;
               currentError = undefined;
               currentPRDiffScope = "full-stack";
@@ -3001,6 +3029,7 @@ export async function startReviewServer(
               prRef = prRefFromMetadata(pr.metadata);
               warmPRContext(pr.metadata.url, prRef);
               currentPatch = pr.rawPatch;
+              currentFileIdentities = undefined;
               currentGitRef = `${getMRLabel(pr.metadata)} ${getMRNumberLabel(pr.metadata)}`;
               currentError = undefined;
               originalPRPatch = pr.rawPatch;
@@ -3650,6 +3679,27 @@ export async function startReviewServer(
               }
               return Response.json({ instructions: writeGuideInstructions(instructions) });
             }
+          }
+
+          // API: Durable viewed-file progress
+          if (url.pathname === "/api/review-progress") {
+            if (req.method === "POST" && !callFlowInstallOriginAllowed(req.headers.get("origin"), url.host)) {
+              return Response.json({ error: "Cross-origin progress updates are not allowed" }, { status: 403 });
+            }
+            let body: unknown;
+            if (req.method === "POST") {
+              try {
+                body = await req.json();
+              } catch {
+                return Response.json({ error: "Invalid JSON" }, { status: 400 });
+              }
+            }
+            const result = await handleReviewProgress({
+              method: req.method, snapshotId: url.searchParams.get("snapshot"),
+              currentSnapshotId, progress: progressSnapshot, currentProgress: () => progressSnapshot,
+              body, platformViewed: isPRMode ? initialViewedFiles : [],
+            });
+            return Response.json(result.body, { status: result.status });
           }
 
           // API: Annotation draft persistence

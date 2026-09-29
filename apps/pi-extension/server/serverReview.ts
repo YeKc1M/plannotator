@@ -8,7 +8,7 @@ import { basename, resolve as resolvePath } from "node:path";
 import { SingleFlight } from "../generated/single-flight.ts";
 import { contentHash } from "../generated/draft.ts";
 import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "../generated/review-draft.ts";
-import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveClaudeSandbox, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl, resolveGitRemoteCheck } from "../generated/config.ts";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveClaudeSandbox, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl, resolveGitRemoteCheck, resolveReviewProgress } from "../generated/config.ts";
 import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "../generated/feedback-archive.ts";
 import { isFaviconStyle, type FaviconStyle } from "../generated/favicon.ts";
 
@@ -113,6 +113,7 @@ import {
 	handleUploadRequest,
 } from "./handlers.ts";
 import { handleApiNotFound, html, json, parseBody, parseJsonBody, readBody, requestUrl, send } from "./helpers.ts";
+import { captureReviewProgress, handleReviewProgress } from "../generated/review-progress.ts";
 import { createPiAIRuntime, handlePiAIRequest } from "./ai-runtime.ts";
 
 import { buildAdvertisedUrl, isRemoteSession, listenOnPort } from "./network.ts";
@@ -338,6 +339,7 @@ export async function startReviewServer(options: {
 	openStatePinned?: boolean;
 	/** Freshness token captured atomically with the initial provider patch. */
 	initialFingerprint?: string;
+	initialFileIdentities?: Record<string, string>;
 	error?: string;
 	sharingEnabled?: boolean;
 	/**
@@ -481,6 +483,7 @@ export async function startReviewServer(options: {
 	const externalAnnotations = createExternalAnnotationHandler("review");
 
 	let currentPatch = options.rawPatch;
+	let currentFileIdentities = options.initialFileIdentities;
 	let currentGitRef = options.gitRef;
 	let currentDiffType: DiffType | WorkspaceDiffType = options.diffType || workspace?.diffType || "uncommitted";
 	let currentError = options.error;
@@ -617,7 +620,25 @@ export async function startReviewServer(options: {
 			if (ok) callFlowService.invalidateRuntimeState();
 		},
 	});
+	// PLANNOTATOR_REVIEW_PROGRESS / config.reviewProgress: when off, no snapshot
+	// exists, so the endpoint answers `available: false` without touching disk and
+	// the client keeps viewed marks in the draft, as for unsupported modes.
+	const captureProgress = () => !resolveReviewProgress(loadConfig()) ? Promise.resolve(null) : captureReviewProgress({
+		patch: currentPatch,
+		fileIdentities: currentFileIdentities,
+		diffType: currentDiffType,
+		base: currentBase,
+		cwd: options.gitContext ? options.gitContext.cwd ?? process.cwd() : undefined,
+		vcsType: sessionVcsType,
+		prUrl: prMeta?.url,
+		prScope: currentPRDiffScope,
+		workspaceRoot: workspace?.root,
+	}, reviewRuntime.runGit);
+	// Captured once at startup: either by the initial fingerprint capture below
+	// or, when the caller already supplied a fingerprint, right after it.
+	let progressSnapshot: ReturnType<typeof captureProgress> = Promise.resolve(null);
 	const captureDiffFingerprint = (knownFingerprint?: string): void => {
+		progressSnapshot = captureProgress();
 		// A fingerprint capture marks a committed review-view change. Stop work
 		// for the prior snapshot even when the new view cannot run CallDiff.
 		callFlowService.cancelAll();
@@ -641,6 +662,7 @@ export async function startReviewServer(options: {
 		});
 	};
 	if (currentFingerprint === null) captureDiffFingerprint();
+	else progressSnapshot = captureProgress();
 
 	// --- Base staleness vs the remote (mirrors Bun review.ts) -----------------
 	// `origin/<default>` is GitHub's state as of the last fetch. The startup
@@ -847,11 +869,12 @@ export async function startReviewServer(options: {
 								currentDiffType as DiffType,
 								remote,
 								gitCwd,
-								{ hideWhitespace: currentHideWhitespace },
+								{ hideWhitespace: currentHideWhitespace, captureFileIdentities: true },
 							);
 							if (!baseEverSwitched) {
 								currentBase = remote;
 								currentPatch = rebuilt.patch;
+								currentFileIdentities = rebuilt.fileIdentities;
 								currentGitRef = rebuilt.label;
 								currentError = rebuilt.error;
 								// draftKey doubles as the snapshot id the freshness probe
@@ -951,7 +974,7 @@ export async function startReviewServer(options: {
 	// itself stays a pure content hash — drafts survive content-identical
 	// mode round-trips.
 	function currentSnapshotId(): string {
-		return `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}`;
+		return `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}${currentFileIdentities ? `:${contentHash(JSON.stringify(currentFileIdentities))}` : ""}`;
 	}
 
 	// --- Durable feedback archive (Node mirror of packages/server/review.ts) ---
@@ -2507,6 +2530,7 @@ export async function startReviewServer(options: {
 					}
 					currentHideWhitespace = effectiveHideWhitespace;
 					currentPatch = snapshot.rawPatch;
+					currentFileIdentities = undefined;
 					currentGitRef = snapshot.gitRef;
 					currentDiffType = workspace.diffType;
 					currentError = snapshot.error;
@@ -2560,6 +2584,7 @@ export async function startReviewServer(options: {
 				);
 				const defaultCwd = options.gitContext?.cwd;
 				const result = await runVcsDiff(newType as DiffType, base, defaultCwd, {
+					captureFileIdentities: sessionVcsType === "git",
 					hideWhitespace: effectiveHideWhitespace,
 				});
 				const resultContext = sessionVcsType === "gitbutler" && result.gitContext?.vcsType === "gitbutler"
@@ -2624,6 +2649,7 @@ export async function startReviewServer(options: {
 				}
 				currentHideWhitespace = effectiveHideWhitespace;
 				currentPatch = result.patch;
+				currentFileIdentities = result.fileIdentities;
 				currentGitRef = result.label;
 				currentDiffType = newType;
 				currentBase = nextBase;
@@ -2787,6 +2813,7 @@ export async function startReviewServer(options: {
 					}
 					if (scopeEpoch !== prScopeEpoch) return respondSuperseded();
 					currentPatch = originalPRPatch;
+					currentFileIdentities = undefined;
 					currentGitRef = originalPRGitRef;
 					currentError = originalPRError;
 					currentPRDiffScope = "layer";
@@ -2832,6 +2859,7 @@ export async function startReviewServer(options: {
 
 				if (scopeEpoch !== prScopeEpoch) return respondSuperseded();
 				currentPatch = result.patch;
+				currentFileIdentities = undefined;
 				currentGitRef = result.label;
 				currentError = undefined;
 				currentPRDiffScope = "full-stack";
@@ -2879,6 +2907,7 @@ export async function startReviewServer(options: {
 				prRef = prRefFromMetadata(pr.metadata);
 				warmPRContext(pr.metadata.url, prRef);
 				currentPatch = pr.rawPatch;
+				currentFileIdentities = undefined;
 				currentGitRef = `${getMRLabel(pr.metadata)} ${getMRNumberLabel(pr.metadata)}`;
 				currentError = undefined;
 				originalPRPatch = pr.rawPatch;
@@ -3645,6 +3674,21 @@ export async function startReviewServer(options: {
 					500,
 				);
 			}
+		} else if (url.pathname === "/api/review-progress") {
+			if (req.method === "POST" && !callFlowInstallOriginAllowed(req.headers.origin ?? null, req.headers.host ?? "")) {
+				json(res, { error: "Cross-origin progress updates are not allowed" }, 403);
+				return;
+			}
+			let body: unknown;
+			if (req.method === "POST") {
+				try { body = JSON.parse(await readBody(req)); } catch { json(res, { error: "Invalid JSON" }, 400); return; }
+			}
+			const result = await handleReviewProgress({
+				method: req.method ?? "GET", snapshotId: url.searchParams.get("snapshot"),
+				currentSnapshotId, progress: progressSnapshot, currentProgress: () => progressSnapshot,
+				body, platformViewed: isPRMode ? initialViewedFiles : [],
+			});
+			json(res, result.body, result.status);
 		} else if (url.pathname === "/api/draft") {
 			await handleReviewDraftRequest(req, res, currentDraftKeys(), reviewDrafts);
 		} else if (url.pathname === "/favicon.png") {

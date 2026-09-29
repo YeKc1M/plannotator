@@ -864,6 +864,7 @@ if (args[0] === "sessions") {
   let gitRef: string;
   let diffError: string | undefined;
   let initialFingerprint: string | undefined;
+  let initialFileIdentities: Record<string, string> | undefined;
   let gitContext: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
   let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
   let prPatchIncomplete = false;
@@ -1163,6 +1164,7 @@ if (args[0] === "sessions") {
       // the server would serve this patch under the detected default: a
       // mixed-base review (wrong file-content fetches, wrong agent prompts).
       if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
+      initialFileIdentities = diffResult.fileIdentities;
     } else {
       // Multi-repo workspace review has no base parameter — the open-state
       // flags always error here.
@@ -1205,6 +1207,7 @@ if (args[0] === "sessions") {
     // undefined leaves PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck deciding.
     gitRemoteCheck: reviewArgs.gitRemoteCheck,
     initialFingerprint,
+    initialFileIdentities,
     prMetadata,
     prPatchIncomplete,
     workspace,
@@ -1909,6 +1912,7 @@ if (args[0] === "sessions") {
   let gitRef: string;
   let diffError: string | undefined;
   let initialFingerprint: string | undefined;
+  let initialFileIdentities: Record<string, string> | undefined;
   let userDiffType: DiffType | WorkspaceDiffType | undefined;
   let gitContext: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
   let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
@@ -1996,6 +2000,7 @@ if (args[0] === "sessions") {
       diffError = diffResult.error;
       initialFingerprint = diffResult.fingerprint;
       if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
+      initialFileIdentities = diffResult.fileIdentities;
     } else {
       await resolveCliReviewOpenState(reviewArgs, {
         isPRMode: false,
@@ -2038,6 +2043,7 @@ if (args[0] === "sessions") {
     // undefined leaves PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck deciding.
     gitRemoteCheck: reviewArgs.gitRemoteCheck,
     initialFingerprint,
+    initialFileIdentities,
     prMetadata,
     prPatchIncomplete,
     workspace,

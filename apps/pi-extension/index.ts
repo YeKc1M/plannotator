@@ -677,7 +677,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("plannotator-review", {
-		description: "Open interactive code review for current changes or a PR URL; pass --git or --gitbutler to force that provider, --base <ref> / --diff-type <type> to pin the session's opening diff",
+		description: "Open interactive code review for current changes, a directory, or a PR URL; pass --git or --gitbutler to force that provider, --base <ref> / --diff-type <type> to pin the session's opening diff",
 		handler: async (args, ctx) => {
 			if (!hasReviewBrowserHtml()) {
 				ctx.ui.notify(
@@ -691,7 +691,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 			const origin = getPiSessionIdentity(ctx);
 
 			try {
-				const { parseReviewArgs } = await import("./generated/review-args.ts");
+				const { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory } = await import("./generated/review-args.ts");
 				const reviewArgs = parseReviewArgs(args ?? "");
 				// Argument-shape failures refuse to start a session (same contract
 				// as the CLI's exit 1), surfaced through Pi's notifier.
@@ -699,7 +699,12 @@ export default function plannotator(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Plannotator: ${reviewArgs.errors.join("; ")}`, "error");
 					return;
 				}
+				const reviewTarget = resolveReviewTarget(reviewArgs, ctx.cwd);
+				const ignoredNotice = formatIgnoredReviewWords(reviewTarget);
+				if (ignoredNotice) ctx.ui.notify(`Plannotator: ${ignoredNotice}`, "info");
 				const session = await startCodeReviewBrowserSession(ctx, {
+					cwd: reviewTarget.directory,
+					includeReviewDirectory: !!reviewTarget.directory,
 					prUrl: reviewArgs.prUrl,
 					patchFile: reviewArgs.patchFile,
 					vcsType: reviewArgs.vcsType,
@@ -721,6 +726,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 					.waitForDecision()
 					.then(async (result) => {
 						try {
+							if (result.feedback) result.feedback = withReviewDirectory(result.feedback, result.reviewDirectory);
 							if (result.exit) {
 								safeNotify(ctx, "Code review session closed.", "info", origin);
 								return;

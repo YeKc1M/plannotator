@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -11,12 +11,67 @@ import {
   canLaunchGatedAnnotate,
   formatUserFacingCliStderrLine,
   getRecentAssistantMessages,
+  handleCliCommand,
   injectSessionPrompt,
 } from "./cli-bridge";
 import { composeReviewApprovedMessage, getReviewApprovedPrompt, getReviewDeniedSuffix } from "@plannotator/shared/prompts";
 import { OpenCodePromptDeliveryError } from "./prompt-delivery-error";
 
 describe("OpenCode CLI bridge helpers", () => {
+  test.skipIf(process.platform === "win32")("an older CLI refuses directory reviews before opening the caller repo", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "plannotator-review-skew-"));
+    mkdirSync(path.join(root, "caller"));
+    mkdirSync(path.join(root, "target"));
+    const binary = path.join(root, "old-cli.ts");
+    const opened = path.join(root, "review-opened");
+    const previous = process.env.PLANNOTATOR_BIN;
+    // Model the old binary's contract: opencode-review ignores positional
+    // words; unknown commands exit before opening any UI.
+    writeFileSync(binary, `#!/usr/bin/env bun
+import { writeFileSync } from "node:fs";
+await Bun.stdin.text();
+if (process.argv[2] !== "opencode-review") {
+  console.error("Unknown command: " + process.argv[2]);
+  process.exit(1);
+}
+writeFileSync(${JSON.stringify(opened)}, "opened");
+console.log(JSON.stringify({ decision: "annotated", feedback: "caller feedback" }));
+`, { mode: 0o755 });
+    const client = {
+      app: { log: mock((_entry: { message: string }) => {}) },
+      session: { prompt: mock(async (_input: unknown) => ({})) },
+    };
+    try {
+      process.env.PLANNOTATOR_BIN = binary;
+      await handleCliCommand({ command: "plannotator-review", client, sessionId: "caller", cwd: path.join(root, "caller"), rawArgs: "../target" });
+      expect(existsSync(opened)).toBe(false);
+      expect(client.session.prompt).not.toHaveBeenCalled();
+      expect(client.app.log.mock.calls.map(([entry]) => entry.message).join("\n")).toContain("Update the Plannotator CLI");
+      // Binaries older than 0.27.11 have no unknown-command guard: the stdin
+      // JSON reaches the plan hook path, which fails with its own message.
+      const ancient = path.join(root, "ancient-cli.ts");
+      writeFileSync(ancient, `#!/usr/bin/env bun
+await Bun.stdin.text();
+console.error("No plan content in hook event");
+process.exit(1);
+`, { mode: 0o755 });
+      process.env.PLANNOTATOR_BIN = ancient;
+      client.app.log.mockClear();
+      await handleCliCommand({ command: "plannotator-review", client, sessionId: "caller", cwd: path.join(root, "caller"), rawArgs: "../target" });
+      expect(client.app.log.mock.calls.map(([entry]) => entry.message).join("\n")).toContain("Update the Plannotator CLI");
+      process.env.PLANNOTATOR_BIN = binary;
+      // Prose names no directory, so it keeps the old command and still works
+      // against an old binary exactly as before (#1483 tolerance).
+      await handleCliCommand({ command: "plannotator-review", client, sessionId: "caller", cwd: path.join(root, "caller"), rawArgs: "please review my changes" });
+      expect(existsSync(opened)).toBe(true);
+      expect(client.session.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previous === undefined) delete process.env.PLANNOTATOR_BIN;
+      else process.env.PLANNOTATOR_BIN = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("maps OpenCode sharing context into child CLI env", () => {
     expect(buildCliBridgeEnv({
       sharingEnabled: false,

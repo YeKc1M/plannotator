@@ -16,6 +16,29 @@ The `/plannotator-review` command opens an interactive code review UI for your l
 /plannotator-review
 ```
 
+**Review another repository or worktree:**
+
+```bash
+plannotator review ../feature-worktree
+plannotator review "../my repo" --base main
+```
+
+The slash command accepts the same target: `/plannotator-review ./backend`.
+Paths resolve relative to the invoking terminal or agent session. A directory
+inside a repository selects its root; a non-repository parent reviews its nested
+repositories together. The target selects the review workspace, not a file filter.
+Feedback returns to the invoking session and names the directory active at submission,
+including after switching worktrees.
+
+Supply one directory or PR URL. A sole word, or any path-shaped word (containing
+`/`, or starting with `.` or `~`), is a directory target: a missing path-shaped
+directory, a file, two targets, or a directory combined with `--patch-file` is an
+error. Other words are ignored as prose with a notice, so
+`/plannotator-review please review my changes` still reviews the current workspace;
+write `./backend` rather than a bare `backend` inside a sentence. OpenCode directory
+targets require an updated Plannotator CLI; an older binary is rejected instead of
+opening the wrong repo.
+
 **Review a GitHub pull request:**
 
 ```
@@ -46,7 +69,7 @@ no diff-staleness refresh. Annotating, Ask AI, Guided Review and submitting
 feedback all work as usual, and the header names the patch instead of a branch.
 
 Because it replaces VCS detection entirely, `--patch-file` cannot be combined
-with a PR/MR URL, `--base`, `--diff-type`, `--git`/`--gitbutler`, or
+with a directory, a PR/MR URL, `--base`, `--diff-type`, `--git`/`--gitbutler`, or
 `--local`/`--no-local`; each combination is a startup error naming the conflict,
 as is an empty or unreadable patch.
 

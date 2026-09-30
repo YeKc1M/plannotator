@@ -66,6 +66,8 @@ export interface PromptConfig {
     approvedWithNotes?: string;
     autoApproved?: string;
     denied?: string;
+    /** A deny whose only feedback is answers to the plan's questions. */
+    answered?: string;
   };
   annotate?: PromptSectionConfig & {
     fileFeedback?: string;

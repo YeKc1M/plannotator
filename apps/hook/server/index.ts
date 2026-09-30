@@ -133,7 +133,7 @@ import {
 import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
-  getPlanDeniedPrompt,
+  composePlanDeniedMessage,
   getPlanToolName,
   buildPlanFileRule,
 } from "@plannotator/shared/prompts";
@@ -1887,6 +1887,7 @@ if (args[0] === "sessions") {
     ...(result.feedback && { feedback: result.feedback }),
     ...(result.savedPath && { savedPath: result.savedPath }),
     ...(result.agentSwitch && { agentSwitch: result.agentSwitch }),
+    ...(result.answersOnly && { answersOnly: true }),
   }));
   process.exit(0);
 
@@ -2267,11 +2268,11 @@ if (args[0] === "sessions") {
       permissionDecision: "allow",
     }));
   } else {
-    const feedback = getPlanDeniedPrompt("copilot-cli", undefined, {
+    const feedback = composePlanDeniedMessage("copilot-cli", undefined, {
       toolName: getPlanToolName("copilot-cli"),
       planFileRule: "",
       feedback: result.feedback || "Plan changes requested",
-    });
+    }, { answersOnly: result.answersOnly });
     console.log(JSON.stringify({
       permissionDecision: "deny",
       permissionDecisionReason: feedback,
@@ -2558,11 +2559,11 @@ if (args[0] === "sessions") {
       console.log(
         JSON.stringify({
           decision: "block",
-          reason: getPlanDeniedPrompt("codex", undefined, {
+          reason: composePlanDeniedMessage("codex", undefined, {
             toolName: getPlanToolName("codex"),
             planFileRule: "",
             feedback: result.feedback || "Plan changes requested",
-          }),
+          }, { answersOnly: result.answersOnly }),
         })
       );
     }
@@ -2627,11 +2628,11 @@ if (args[0] === "sessions") {
       console.log(
         JSON.stringify({
           decision: "deny",
-          reason: getPlanDeniedPrompt("mistral-vibe", undefined, {
+          reason: composePlanDeniedMessage("mistral-vibe", undefined, {
             toolName: getPlanToolName("mistral-vibe"),
             planFileRule: "",
             feedback: vibeResult.feedback || "Plan changes requested",
-          }),
+          }, { answersOnly: vibeResult.answersOnly }),
         })
       );
     }
@@ -2715,11 +2716,11 @@ if (args[0] === "sessions") {
       console.log(
         JSON.stringify({
           decision: "deny",
-          reason: getPlanDeniedPrompt("gemini-cli", undefined, {
+          reason: composePlanDeniedMessage("gemini-cli", undefined, {
             toolName: getPlanToolName("gemini-cli"),
             planFileRule: buildPlanFileRule(getPlanToolName("gemini-cli"), planFilename),
             feedback: result.feedback || "Plan changes requested",
-          }),
+          }, { answersOnly: result.answersOnly }),
         })
       );
     }
@@ -2758,11 +2759,11 @@ if (args[0] === "sessions") {
             hookEventName: "PermissionRequest",
             decision: {
               behavior: "deny",
-              message: getPlanDeniedPrompt(detectedOrigin, undefined, {
+              message: composePlanDeniedMessage(detectedOrigin, undefined, {
                 toolName: getPlanToolName(detectedOrigin),
                 planFileRule: "",
                 feedback: result.feedback || "Plan changes requested",
-              }),
+              }, { answersOnly: result.answersOnly }),
             },
           },
         })

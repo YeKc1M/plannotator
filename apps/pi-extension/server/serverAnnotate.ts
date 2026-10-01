@@ -1,4 +1,5 @@
 import { annotateDiagramRenderKind } from "../generated/annotatable.ts";
+import { likelyAppHtmlEncoding, prewarmAppHtml } from "../generated/app-html.ts";
 import { createServer } from "node:http";
 import type { IncomingMessage } from "node:http";
 import { dirname, resolve as resolvePath } from "node:path";
@@ -937,12 +938,13 @@ export async function startAnnotateServer(options: {
 			handleShareHtml(res, url);
 		} else if (url.pathname === "/api/config" && req.method === "POST") {
 			try {
-				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; conventionalComments?: boolean; agentTerminalSide?: unknown; agentTerminalDefaultAgent?: unknown };
+				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; autoUpdate?: unknown; conventionalComments?: boolean; agentTerminalSide?: unknown; agentTerminalDefaultAgent?: unknown };
 				const toSave: Record<string, unknown> = {};
 				if (body.displayName !== undefined) toSave.displayName = body.displayName;
 				if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
 				if (body.theme !== undefined) toSave.theme = body.theme;
 				if (isFaviconStyle(body.favicon)) toSave.favicon = body.favicon;
+				if (typeof body.autoUpdate === "boolean") toSave.autoUpdate = body.autoUpdate;
 				if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
 				if (isAgentTerminalSide(body.agentTerminalSide)) toSave.agentTerminalSide = body.agentTerminalSide;
 				if (typeof body.agentTerminalDefaultAgent === "string") toSave.agentTerminalDefaultAgent = body.agentTerminalDefaultAgent;
@@ -1188,7 +1190,7 @@ export async function startAnnotateServer(options: {
 			res.writeHead(404, htmlAssetDocumentHeaders(HTML_ASSET_ERROR_CSP));
 			res.end(buildHtmlAssetErrorDocument(404, "Not found", name));
 		} else {
-			html(res, options.htmlContent);
+			await html(req, res, options.htmlContent, isRemoteSession());
 		}
 	});
 	const agentTerminal = await createNodeAgentTerminalBridge({
@@ -1199,6 +1201,9 @@ export async function startAnnotateServer(options: {
 	agentTerminalCapability = agentTerminal.capability;
 
 	const { port, portSource } = await listenOnPort(server);
+	// Remote sessions serve the app page compressed (#1617); start gzip (what
+	// browsers ask for over plain http) now so the first load does not wait.
+	if (isRemoteSession()) prewarmAppHtml(options.htmlContent, likelyAppHtmlEncoding(false));
 
 	if (options.liveApp) {
 		// Compose the proxy-served bridge body via the shared assembly (config

@@ -189,10 +189,12 @@ We deliberately did **not** restructure the exports map in this PR (move-don't-r
 | `theme` / `styles.css` | Theme tokens + precompiled stylesheet. **Prefer `styles.css`.** The raw `theme` export still `@import`s KaTeX (re-acquiring the fonts `styles.css` deliberately excludes, as separate lazy files) and contains Tailwind v4 `@theme` at-rules, so it's inert without Tailwind processing. |
 | `types` | `Annotation`, `Block`, `AnnotationType`, etc. |
 | `utils/parser` (`parseMarkdownToBlocks`, `exportAnnotations`) | Pure — no backend. |
+| `utils/questionAnswers` (`upsertQuestionAnswerAnnotation`, `collectQuestionAnswers`, `questionAnswerToAnnotation`, `buildQuestionPanelRows`, `questionProgress`, `nextOpenQuestionKey`, `focusQuestionCard`) | Pure (except `focusQuestionCard`, which scrolls and focuses a card in the DOM). Applies `Viewer`'s `onAnswerQuestion` to your annotation list and derives the panel rows and progress (0.48.0; see "Questions in documents"). |
+| `components/QuestionProgressChip`, `components/QuestionsPanelSection` | The header "N/M answered" chip and the panel's Questions section (0.48.0). `AnnotationPanel` renders the section itself when you pass `questionRows`. |
 | `components/BlockRenderer` + the block components it renders (`TableBlock`, `HtmlBlock`, `Callout`, `MermaidBlock`, `MathBlock`, …) | Pure rendering. |
 | `components/InlineMarkdown` | Code-file hover previews route through the `docPreviewFetcher` seam. Wiki-link rendering takes the sync `resolveLinkedDoc` prop (live labels + deleted-doc treatment; see "Wiki-link seams (0.27.0)"). |
 | `components/Viewer` | The full annotatable document. Required props: `markdown` and `taterMode` (pass `false`). **Pass `disableCodePathValidation` unless you implement `/api/doc/exists`** — code-path validation is a prop-level opt-out, not a `configure` seam. `annotationHeader={{ onInputMethodChange, onModeChange, hideQuickLabel? }}` opts into one Viewer-owned, in-flow header containing the compact annotation controls and existing document actions. It reserves its measured responsive height, preserves all document badges, and follows `stickyActions` as one unit; omit it for the legacy action bar. Compact mode contains no help link. `hideQuickLabel` still requires the host to clamp restored mode state away from `'quickLabel'`. A host-owned scroll element must be supplied through `ScrollViewportProvider` (`hooks/useScrollViewport`) so stuck chrome and anchor clearance use the real scroller. |
-| `components/MarkdownEditor` | Theme-bridging wrapper over `@plannotator/markdown-editor`. Takes CM6 extensions via the `extensions` prop (captured ONCE per `documentId` — see "Wiki-link seams (0.27.0)") and re-exports `wikiLinks`, `embedPicker`, `embedSlashItem`, `planEmbedInsert`, and their public types. |
+| `components/MarkdownEditor` | Theme-bridging wrapper over `@plannotator/markdown-editor`. Takes CM6 extensions via the `extensions` prop (captured ONCE per `documentId` — see "Wiki-link seams (0.27.0)") and re-exports `wikiLinks`, `linkWidgets`, `refreshLinkWidgets` (0.47.0), `embedPicker`, `embedSlashItem`, `planEmbedInsert`, and their public types. |
 | `components/MarkdownDiff` | Theme-bridging wrapper over `@plannotator/markdown-editor`'s frozen two-revision diff. Same shim pattern as `components/MarkdownEditor` (ThemeProvider bridge, `extensions` passthrough, grid card chrome); never editable. See "Frozen markdown diff (0.28.0)". |
 | `components/CommentPopover` | Anchor capture + comment entry. Ask-AI UI renders only if you pass `onAskAI`. |
 | `components/AnnotationPanel` | Renders from your annotation state; no fetches of its own. |
@@ -1511,8 +1513,105 @@ Behaviour changes a host may notice:
 - `useAgentSettings(catalogs?)` takes the catalogs and returns EFFECTIVE (resolved) model/effort values; called without catalogs it returns the saved values unchanged, as before.
 - `AIProviderModel` is now an alias of `CatalogModel` (adds optional `resolvedId`, `fastMode`); `resolveAIModelForProvider` uses the shared resolver, so a stale pinned id keeps its model family instead of snapping to the provider default.
 
+## Forge-aware `#123` / `@user` links (additive; #1596; published in core 0.25.6 / ui 0.46.x)
+
+Bare `#123` and `@user` in a document used to link to github.com whenever `githubRepo` held a slash, so GitLab and GitHub Enterprise repos got links to the wrong forge. `InlineMarkdown` (and every block component that forwards `githubRepo`: `BlockRenderer`, `RenderedMarkdown`, `TableBlock`, `TablePopout`, `AlertBlock`, `Callout`, `proseBody`) gains an optional `repoHost?: string` beside it; `Viewer` passes `repoInfo.host`. The rule is the new `@plannotator/core/forge-refs` subpath (`forgeRefLinks`, `classifyForgeHost`, `normalizeForgeHost`). The host is normalized first: lowercased, port dropped, `www.github.com` / `ssh.github.com` / SSH aliases starting `github.com-` folded to `github.com` and `altssh.gitlab.com` to `gitlab.com`; a host that is not a plausible DNS name (no dot, brackets, `@`, a dotless SSH alias) counts as absent. Then a github host (`github.com`, `github.*`) links to `https://<host>/<path>/issues/N`, a gitlab host (`gitlab.com`, `gitlab.*`, `*.gitlab.*`) to `https://<host>/<path>/-/issues/N`, users to `https://<host>/<user>`, and any other host renders the ref as an unlinked span. **A host that passes no `repoHost` (or an implausible one) keeps the old github.com links**, so nothing changes until it opts in. Because ui imports a new core subpath and `@plannotator/ui` pins `@plannotator/core` EXACTLY (currently `"0.25.6"`), the core version bump and ui's pin must move together in the same release: bump core, set ui's `@plannotator/core` dependency to that same version, `bun install`, then publish `core` first and `ui` second. A ui built against this code on the old core pin would import a `forge-refs` subpath the pinned core does not ship.
+
+## Guided Review generation in core (core 0.25.6, published, additive)
+
+Core-only; `@plannotator/ui` imports none of it, so ui's exact `0.25.6` pin is unchanged. The pure half of Guided Review generation moved verbatim from the private `@plannotator/server` (`packages/server/guide/guide-review.ts`, which re-exports every name) so a host such as Workspaces generates guides with Plannotator's exact prompt and holds the output to the same coverage rule. All three subpaths are browser-safe and zero-dependency:
+
+- `@plannotator/core/guide-prompt`: `GUIDE_REVIEW_PROMPT` (the organizer methodology), `GUIDE_SCHEMA_JSON` (the output JSON schema, as a string), `buildGuideUserMessage(patch, diffType, options?, prMetadata?, changedFiles?)`, `validateGuideOutput(raw, changedFiles)`, `GUIDE_NO_SECTIONS_ERROR`, the sanitizers `sanitizeGuideSection` / `sanitizeGuideSections` / `sanitizeUnplacedFiles`, and the types `GuideChangedFile` and `GuidePromptPRMetadata` (`{ url, baseBranch }`, structural, so a full GitHub/GitLab `PRMetadata` is accepted).
+- `@plannotator/core/review-prompt` (what `buildGuideUserMessage` frames a local diff with): `getLocalDiffInstruction`, `buildWorkspacePromptContextLines`, and the types `LocalDiffInstruction`, `WorkspaceReviewPromptContext`, `WorkspacePromptRepoContext`, `WorkspaceChildVcsType`.
+- `@plannotator/core/diff-type`: the `DiffType` union (including jj's `jj-commit:<id>`) plus `parseCommitDiffType`, `parseJjCommitDiffType`, `jjCommitRevset`, `commitFamilyId`, `parseWorktreeDiffType`, `JJ_TRUNK_REVSET`, `jjLineBaseRevset`, `jjCompareTargetRevset`, `parseRemoteBookmark`, `BARE_HEX_SHA_RE` (moved from `packages/shared/review-core.ts`, which re-exports them).
+
+The guide chain's engine plumbing (Claude/Codex/marker commands, output parsing, `composeGuideMethodology`, sessions) stays in the server. It ships in core 0.25.6 alongside what that unpublished version already carries; ui needs no change for it.
+
+## Host link widgets (0.47.0, core 0.25.7)
+
+Additive. `components/MarkdownEditor` re-exports the engine's new link seam beside `wikiLinks`: `linkWidgets(...specs: LinkWidgetSpec[]): Extension`, `refreshLinkWidgets: StateEffectType<null>`, and the types `LinkWidgetSpec` (`{ match(link: LinkWidgetLink): WidgetType | null }`) and `LinkWidgetLink` (`{ url; text; title?; from; to }`). They are the engine's own objects (identity pinned by `MarkdownEditor.linkWidgets.test.tsx`); hosts import them from `@plannotator/ui/components/MarkdownEditor`, never from `@plannotator/atomic-editor`.
+
+- **What it does.** For a single-line `[text](url)` link the inline preview would draw with its syntax hidden, the engine asks each registered spec in order; the first non-null widget replaces the whole link range (no link mark, no hidden `[` / `](url)` replaces, no open-in-new-tab icon beside it). `null` keeps the engine's link. Revealed links, multi-line links, reference / autolinks / wiki links, links inside tables and links wrapping an image are never offered. A spec that throws is logged once and skipped.
+- **The reveal rule stays the engine's.** Caret inside, overlapping selection, focus, the pointer-press freeze and `MarkdownDiff` changed ranges decide when the raw bytes show, exactly as for a normal link, so a widget comes and goes when the hidden syntax would. The source text is never changed.
+- **`match` runs on every rebuild** (selection, focus, document change): synchronous, no side effects, and implement `eq` on the widget so an unchanged widget keeps its DOM. Do not `preventDefault` on `mousedown` in the widget: it blocks a drag selection that starts on it.
+- **Refreshing.** When a spec's answer changes without a document edit (a record arrives after mount), dispatch `view.dispatch({ effects: refreshLinkWidgets.of(null) })`. It changes no text, adds no history entry and sends nothing through collab bindings; during a held pointer press the rebuild waits for the release.
+- **Composition.** `linkWidgets(spec)` goes in the same stable `extensions` array as `wikiLinks`, captured once per `documentId`. Several `linkWidgets(...)` extensions concatenate in extension order.
+
+**Dependency note:** 0.47.0 requires `@plannotator/atomic-editor ^0.9.0` (adds the seam) and `@plannotator/markdown-editor ^0.5.0` (widens its engine peer to `^0.8.0 || ^0.9.0`). A host that pins either exactly (e.g. through package-manager overrides) must move both pins with the ui bump. Plannotator's own apps pass no `linkWidgets`, so their editor is unchanged.
+
+Also new in 0.47.0 (all additive, all no-op for a host that passes nothing):
+
+- **`useCodeAnnotationDraft` `persistViewedFiles?: boolean`** (default `true`, #1632). `false` leaves viewed-file state out of the draft: autosave omits `viewedFiles` / `autoViewSuppressed`, an empty-annotations session with only viewed files counts as empty, the restore banner ignores viewed counts, and `restoreDraft()` returns empty viewed lists. For hosts that persist review progress on their own (Plannotator's review app now does, server-side).
+- **Model source hint** (#1616). New module `components/ModelSourceHint` (`ModelSourceHint`, `modelSourceHint`, `modelSourceToolForProvider`, types `ModelSourceTool` / `ModelSourceInfo`): a muted line under a Claude/Codex model picker ("From your installed Codex 0.155.1", or the built-in-list variant). `ModelCatalog` (`hooks/useModelCatalogs`) and `AIProviderConfig` (`utils/aiProvider`) gain optional `modelsSource` and `toolVersion`, read from `/api/ai/capabilities`; the hint renders only when the server sends `toolVersion`, so a host whose backend omits it sees no change. `AgentsTab`, `AISettingsTab` and `AIProviderBar` render it.
+- **Guided Review Codex default** (#1616): `PREFERRED_GUIDE_CODEX_MODEL` (`'gpt-6-luna'`) from `hooks/useAgentSettings`; an unset guide Codex pick resolves to it when the catalog offers it, else to Codex's own default. Never written to the cookie.
+- **Agent job warnings** (#1627): `AgentsTab` shows `AgentJobInfo.warning` under a job row when present.
+- **Request changes on PR reviews** (#1611): `buildDecisionSpec`'s platform input takes optional `requestChangesSupported`. Absent keeps the previous copy; `false` says request-changes posts as a comment; `true` with `selfAuthored` mutes Request changes and adds a live `Comment…` row.
+
+### `@plannotator/core` 0.25.7
+
+Required by ui 0.47.0 (`components/ModelSourceHint` and `hooks/useModelCatalogs` import the new `ModelsSource` type). Changes since the published 0.25.6, all additive:
+
+- `@plannotator/core/model-catalog`: new `ModelsSource` type (`'fallback' | 'discovered'`) and `cliVersionFrom(text, toolLine?)` (reads a CLI's version out of `claude --version` or the codex app-server `userAgent`). `CODEX_FALLBACK_MODELS` refreshed to what codex 0.155.1 reports (GPT-6 Sol / Astra / Luna, GPT-5.6 Sol / Terra / Luna, GPT-5.5; efforts up to `max` / `ultra`). `claudeCatalogFromSdk` names a model from `displayName` when the SDK `description` is only a tagline (no ` · `), which Claude Code 2.1.282+ emits (#1615).
+- `@plannotator/core/agent-jobs`: optional `AgentJobInfo.warning` (#1627).
+- `@plannotator/core/agents`: the `mistral-vibe` origin in `AGENT_CONFIG` (#1480, merged just after 0.25.6 was published).
+- `@plannotator/core/review-prompt`: workspace review context lines now tell the model the inline diff is the complete combined changeset and to read files by folder-prefixed path, instead of suggesting `git -C` (#1629). Prompt text only.
+
+Minor rather than patch because of the new exports (`cliVersionFrom`, `ModelsSource`).
+
+## Questions in documents (0.48.0, core 0.25.8)
+
+Additive. An agent can ask the reviewer questions inside a markdown document with a `:::question` directive, and the reviewer answers in place. The approved design is the "Card" variant: an eyebrow ("Question 2 of 4", "· pick any" on multi), a status tag (Open / ✓ Answered / Skipped / ✓ Settled), the prompt, its context, the choices, and a footer with Add note · Skip · a right-aligned **Accept recommended**.
+
+```markdown
+:::question
+Where should losing conflict versions be kept?
+
+Last-write-wins silently drops the loser unless we keep it somewhere.
+
+- [ ] Local only, purged after 30 days — cheap, no server change
+- [ ] Server-side per user — survives reinstall, needs a retention policy
+
+Recommended: Local only, purged after 30 days
+:::
+```
+
+**`@plannotator/core/question-block` (new subpath, pure):**
+
+- `parseQuestionBlock(directiveKind, body)` returns a `ParsedQuestion` or **null** when the block is not a question (no prompt, wrong kind, over `MAX_QUESTION_BODY_CHARS`). It never throws. It is tolerant: tight or spaced markdown, `-`/`*`/`+`/`1.` markers, plain bullets as choices when there are no task-list items, indented continuation lines, `Recommended:` / `**Recommended:**` / `Recommendation:` / `➡️` / `->` / `=>` / `→`, a `label — reason` recommendation, and a `,` / `;` / `and` list on multi questions. `- [x]` means **settled** (already decided), not recommended.
+- `indexQuestionBlocks(blocks)` numbers the document's question blocks, gives the prompt's document line, and de-duplicates keys (`-2`, `-3`…). It takes a structural block shape, so it works on your own block list.
+- `questionKey(kind, prompt)` = `q-` + an 8-hex FNV-1a hash of the kind and the normalized prompt. It is stable across versions while the prompt is unchanged. A reworded prompt is a new question.
+- `QuestionAnswer` (`{ v: 1, key, kind, prompt, selected: labels[], other?, text?, note?, skipped?, sourceLine? }`), `parseQuestionAnswer` (fail-closed: wrong types return null, strings are truncated to the caps), `isQuestionAnswered`, `isQuestionAnswerEmpty`, `recommendedQuestionAnswer`, `buildQuestionAnswerAnnotation` (structural record, `type: 'COMMENT'`).
+- `formatQuestionAnswersSection(items, answers, { headingLevel })`, `questionExportItems(index)`, `formatQuestionAnswerLines`, `formatQuestionAnswerText`.
+- `QUESTION_AUTHORING_GUIDE`: the syntax reference as one markdown string. Put it in your own agent prompts. Plannotator's `plannotator` skill carries the same text byte for byte (a test keeps them equal).
+
+**`@plannotator/ui`:**
+
+- `Annotation.questionAnswer?: QuestionAnswer`. An answer is ONE annotation, id `ann-question-<key>`, `blockId` = the question block, `originalText` = the prompt, `text` = a one-line answer (`Answer: Local only — note: …`), offsets 0. A consumer that does not know the field still reads it as a comment. Your annotation store and `draftTransport` carry it as opaque JSON. Nothing new to persist.
+- `Viewer` `onAnswerQuestion?(blockId, answer | null, key)`: the only new prop. The Viewer derives every card's state from its `annotations` prop (matched by key, so an answer follows its question across re-parses). On a change it calls the handler with the next answer, or `null` when the answer became empty. Apply it with `upsertQuestionAnswerAnnotation(annotations, blockId, answer, key)` (`utils/questionAnswers`; replaces in place and keeps `createdA`, appends when new, removes on null/empty). With no handler, or `readOnly`, the cards render disabled and still show stored answers.
+- `BlockRenderer` takes optional `question` / `questionTotal` / `questionAnswer` / `onAnswerQuestion`. Without them (plan diff, `RenderedMarkdown`) a question block is parsed alone and renders read-only and unnumbered.
+- `components/blocks/QuestionBlock` is exported for a host that renders blocks itself.
+- The highlighter skips rows carrying `questionAnswer` (neither painted nor attempted nor unanchored), the same rule `diagramAnchor` rows follow.
+- Exporters: `exportAnnotations` prints `## Answers to your questions` right after the title (before reference images and the numbered feedback): `N of M questions answered.`, one `### Q<n>. <prompt> (line L)` entry per answered, skipped or noted question (`Answer: X (your recommendation)`, a bullet list for several picks, a blockquote for free text, `Skipped`, `Note: …`), an `### Unanswered` list, and answers whose question is no longer in the document. Answers are not counted in "I've reviewed this plan and have N pieces of feedback". Questions the agent settled with `[x]` and the reviewer left alone are neither counted nor listed as unanswered. `exportLinkedDocAnnotations` prints the same section per document one level deeper; `exportAnnotationEntry` prints one answer. A row whose `questionAnswer` fails validation exports as an ordinary comment. A document with questions but no answers and no feedback still exports `No changes detected.`
+- Interaction: native `<input type=radio|checkbox>` inside a `<label>`. A click on a row picks only when the pointer moved less than 4 px (10 px touch) and no text is selected, so a drag across option text is an annotation, never a pick. The eyebrow, tags and footer are `annotation-exclude` / `select-none` / `data-pinpoint-ignore`; the prompt, context and choice text are not. "Other…" is always offered. There are no required questions and no new keyboard shortcuts.
+- Fallback: an unparseable block renders through the existing directive `Callout`; a ui older than 0.48.0 renders every `:::question` that way (the prompt and the task list as text).
+
+**Progress, the panel and history (also 0.48.0, the editor PR):**
+
+- `AnnotationPanel` `questionRows?` + `onSelectQuestion?`: pass `buildQuestionPanelRows(blocks, annotations)` and the panel renders a **Questions** section (progress, one row per question with its answer or "Not answered yet" and an Open / answered / Skipped state) above a **Comments** heading, and stops listing answer rows as comment cards. A row whose question is no longer in the document shows the Unanchored chip and a "Remove answer" link that calls your `onDelete(annotationId)`; it still exports. Without `questionRows` the panel is unchanged (answers list as comment cards, as in the first 0.48.0 cut).
+- `QuestionProgressChip` (`done`, `total`, `hasOpen`, `onJump`): the header "N/M answered" chip. `questionProgress(rows)` counts answered and settled questions; `nextOpenQuestionKey(rows, afterKey)` walks the open ones in document order and wraps; `focusQuestionCard(key)` scrolls the card to the centre and focuses its first control.
+- Core: `questionStatus(question, answer)` is the one status rule (answered / skipped / settled / open) the card, the rows and the chip share. The export counts a settled `[x]` question the reviewer only added a note to as answered, printing its settled choice with the note, and a multi-line note keeps its line breaks as a blockquote.
+- Card fixes: a double-click on a word in an option selects the word and takes back the pick its first click made; in pinpoint input mode a click on option text pins the text and does not pick the option (a click on the radio itself answers and does not pin); the free-text, "Other…" and note fields are `annotation-exclude`, so a text-search restore never lands inside typed text.
+- History: `useUndoHistory` gains `replaceLast(expected, next)` (fold into the newest entry while it is still the one you recorded). Plannotator records one entry per answer change and folds a typing burst into one; a host with its own history can do the same.
+
+**No `configurePlannotatorUI` seam** is involved. Plannotator's server does not change.
+
+**guides.show:** the viewer JS is unchanged, but the shared stylesheet gained the card's utility classes, so `guide-viewer-manifest.ts` pins a new CSS hash. Deploy guides.show before a release that ships this manifest.
+
 ## Publishing & versioning
 
+- **core 0.25.8 / ui 0.48.0 (questions in documents): both change. Publish `core` 0.25.8 first, then `ui` 0.48.0**, which pins core `0.25.8` exactly and imports the new `@plannotator/core/question-block` subpath. Core is a patch bump because its change is additive and pre-1.0 caret ranges would not accept a minor. See "Questions in documents (0.48.0, core 0.25.8)".
+- **core 0.25.7 / ui 0.47.0 (host link widgets + model source hint + `persistViewedFiles`): both packages change, and both need unpublished upstream packages first.** Order: `@plannotator/atomic-editor` 0.9.0, then `@plannotator/markdown-editor` 0.5.0, then `bun install` here to refresh `bun.lock`, then publish `core` 0.25.7, then `ui` 0.47.0. ui pins core `0.25.7` exactly, `@plannotator/atomic-editor` `^0.9.0` and `@plannotator/markdown-editor` `^0.5.0`. See "Host link widgets (0.47.0, core 0.25.7)".
+- **ui 0.46.1 (fix, ui only, core pin unchanged at `0.25.6`):** `useVimSelection` (mounted by every `Viewer`) now only clears a page selection whose anchor or focus lies inside the viewer's own container; with vim off it used to clear the WHOLE page's selection on every mount and `contentVersion` change, so a selection in another host panel vanished whenever the document behind it loaded or changed.
 - **ui 0.45.0 (annotation card header slot + mentions on the card's edit box): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.44.0, both props on `AnnotationPanel`: `renderCardHeader` (the header-row twin of `renderCardFooter`, wrapper `[data-annotation-card-header]`, renders under `readOnly`, open-document cards only in the All-files view) and `mentionSource` (the 0.43.0 type, applied to the card's EDIT box, saving `onEdit(id, { text, mentions })` only when a source was supplied and a pick survived). Nothing is removed, no new supported imports (`components/MentionAutocomplete` is internal glue), no export-, share- or archive-visible change, and Plannotator passes neither — `packages/editor` and `packages/review-editor` have zero source diff, and the panel is byte-identical to 0.44.0. Known difference from `CommentPopover`: no chips in the card's edit box (follow-up named in the section). See "Annotation card header slot and mentions on the edit box (0.45.0)".
 - **ui 0.44.0 (mention token chips in the composer): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.43.2: the `@Label` tokens a `mentionSource` composer inserted render as chips in the composer's existing highlight overlay, `MentionSource.tokenClassName?` lets a host restyle them (under the metric rule), `useMentionAutocomplete` also returns the surviving `mentions`, and `utils/composerTokens` joins the supported-import list. Nothing is removed, no export-, share- or archive-visible change, and Plannotator passes none of it — with neither `mentionSource` nor `skillReferences` the composer is byte-identical to 0.43.2. See "Mention token chips in the composer (0.44.0)".
 - **ui 0.43.1 (`mentionSource` on the viewers): `@plannotator/ui` only — `@plannotator/core` is UNCHANGED at `0.25.5`, so this publishes alone** (core 0.25.5 must already be published). Purely additive over 0.43.0: `mentionSource` on `Viewer` and `HtmlViewer` (forwarded to every comment composer each mounts) and the optional `Annotation.mentions` field the picked ids land on, set only when a source was supplied and a token survived. Nothing is removed, no new modules, no export-, share- or archive-visible change, and Plannotator passes none of it. See "`mentionSource` on the viewers (0.43.1)".
@@ -1531,6 +1630,25 @@ Behaviour changes a host may notice:
 - **`--provenance` only works from a supported CI environment (GitHub Actions OIDC)** — a local publish fails with `Automatic provenance generation not supported for provider: null`. Until a CI publish job exists for these two packages, local publishes drop the flag. Publishing under `--tag next` first lets the consumer preflight before `npm dist-tag add <pkg>@<version> latest` promotes it.
 - `styles.css` is built by the `prepack` script (`bun run build:css`) so the published tarball always carries fresh precompiled CSS; since 0.33.0 `prepack` also runs `build:bridge-assets`, which generates the gitignored `bridge-script.asset.js` and `bridge-script.lite.ts` beside their source. Both are in `files`, so a tarball built without `prepack` (a hand-rolled `npm pack --ignore-scripts`) would ship export subpaths that resolve to nothing; always build with `bun pm pack`.
 - There is **no CI publish job for these two packages yet** — first publish is manual from `main` after merge. (Wiring a CI publish job is a follow-up.)
+
+---
+
+## `Settings` `annotateParity` (shipped in 0.46.0)
+
+`<Settings mode="annotate">` takes a new optional `annotateParity?: boolean`,
+default `false`. **A host that omits it sees exactly the annotate Settings it
+had**: General, Theme, Vim, Shortcuts, Files, plus the OpenCode agent-switch
+row when `origin="opencode"`. Plannotator's own annotate app passes `true`,
+which adds the plan-review document tabs (Display, Saving, Labels, Obsidian,
+Bear, Octarine) and hides the agent-switch row, which only ever applied to
+plan approval.
+
+Within those tabs the plan-decision rows stay plan-only: Save Plans and the
+three "Auto-save on Plan Arrival" switches. The Obsidian / Bear / Octarine
+enable switches are the SAME cookies plan review reads on approve, so turning
+one on from annotate also makes plan review save every approved plan there;
+the annotate description says so. `mode="plan"` and `mode="review"` are
+unaffected by the prop. Purely additive: no export, share or archive change.
 
 ---
 

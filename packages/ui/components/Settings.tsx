@@ -87,6 +87,13 @@ interface SettingsProps {
   onIdentityChange?: (oldIdentity: string, newIdentity: string) => void;
   origin?: Origin | null;
   mode?: 'plan' | 'annotate' | 'review';
+  /**
+   * `mode="annotate"` only: offer the document tabs plan review has (Display,
+   * Saving, Labels, and the Obsidian / Bear / Octarine integrations) and hide
+   * the plan-only OpenCode agent-switch row. Plannotator's annotate app passes
+   * true; a host that omits it keeps the pre-parity annotate tab set.
+   */
+  annotateParity?: boolean;
   onUIPreferencesChange?: (prefs: UIPreferences) => void;
   /** Externally controlled open state (for mobile menu integration) */
   externalOpen?: boolean;
@@ -95,6 +102,10 @@ interface SettingsProps {
   aiProviders?: Array<{ id: string; name: string; capabilities: Record<string, boolean>; models?: Array<{ id: string; label: string; default?: boolean }> }>;
   /** Git user name from `git config user.name`, for quick identity set */
   gitUser?: string;
+  /** Present when the server advertises the auto-update setting (#1634);
+   *  `env` is PLANNOTATOR_AUTO_UPDATE when it overrides the config file.
+   *  Hosts that omit it get no toggle. */
+  autoUpdateSetting?: { env?: boolean };
   /** Current session is a local git review where since-base ISN'T offered
    *  (base ref unresolvable) — the Git tab shows a note that the Git-status
    *  preference can't take effect in THIS repo. */
@@ -930,8 +941,9 @@ const CommentsTab: React.FC = () => {
   );
 };
 
-export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, sinceBaseUnavailable, isCompactTouchLayout = false, onDetectObsidianVaults, agentTerminalAvailable = false, webmcpAvailable = false }) => {
+export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', annotateParity = false, onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, autoUpdateSetting, sinceBaseUnavailable, isCompactTouchLayout = false, onDetectObsidianVaults, agentTerminalAvailable = false, webmcpAvailable = false }) => {
   const webmcpTools = useWebMcpToolsEnabled();
+  const autoUpdate = useConfigValue('autoUpdate');
   const [showDialog, setShowDialog] = useState(false);
   const settingsWasOpenRef = useRef(false);
   const [themePreview, setThemePreview] = useState(false);
@@ -981,6 +993,8 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
   // The agent switch default depends on the surface: plan approval hands off to
   // the build agent, review feedback stays on the current agent.
   const agentSurface: AgentSwitchSurface = mode === 'review' ? 'review' : 'plan';
+  // Annotate with parity on gets the same document tabs as plan review.
+  const annotateDocumentTabs = mode === 'annotate' && annotateParity;
   const [agent, setAgent] = useState<AgentSwitchSettings>(() => getAgentSwitchDefaults(agentSurface));
   const [planSave, setPlanSave] = useState<PlanSaveSettings>({ enabled: true, customPath: null });
   const [uiPrefs, setUiPrefs] = useState<UIPreferences>({ tocEnabled: true, stickyActionsEnabled: true, planWidth: 'compact' });
@@ -1001,7 +1015,11 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
   const mainTabs = useMemo(() => {
     const t: { id: SettingsTab; label: string }[] = [{ id: 'general', label: 'General' }];
     t.push({ id: 'theme', label: 'Theme' });
-    if (mode === 'plan') {
+    // Annotate renders the same document viewer as plan review, so the
+    // document-level tabs apply there too. Only rows that describe a plan
+    // decision (plan snapshots, plan-arrival auto-save, plan-time hooks,
+    // post-approval permission mode / agent switch) stay plan-only.
+    if (mode === 'plan' || annotateDocumentTabs) {
       t.push({ id: 'display', label: 'Display' });
       t.push({ id: 'saving', label: 'Saving' });
       t.push({ id: 'labels', label: 'Labels' });
@@ -1023,11 +1041,11 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
       t.push({ id: 'hooks', label: 'Hooks' });
     }
     return t;
-  }, [mode, aiProviders.length]);
+  }, [mode, annotateDocumentTabs, aiProviders.length]);
 
   const integrationTabs: { id: SettingsTab; label: string }[] = [
     { id: 'files', label: 'Files' },
-    ...(mode === 'plan'
+    ...(mode === 'plan' || annotateDocumentTabs
       ? [{ id: 'obsidian' as SettingsTab, label: 'Obsidian' }, { id: 'bear' as SettingsTab, label: 'Bear' }, { id: 'octarine' as SettingsTab, label: 'Octarine' }]
       : []),
   ];
@@ -1366,6 +1384,25 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                       </div>
                     </div>
 
+                    {/* Auto-update (#1634): opt-in, default off. Writes
+                        autoUpdate to ~/.plannotator/config.json. */}
+                    {autoUpdateSetting && (
+                      <>
+                        <div className="border-t border-border" />
+                        <ToggleSwitch
+                          checked={autoUpdateSetting.env ?? autoUpdate}
+                          onChange={(v) => configStore.set('autoUpdate', v)}
+                          disabled={autoUpdateSetting.env !== undefined}
+                          label="Keep Plannotator up to date"
+                          description={
+                            autoUpdateSetting.env !== undefined
+                              ? 'Set by PLANNOTATOR_AUTO_UPDATE in your environment.'
+                              : 'Installs new releases in the background, at most once a day, never while another review is open.'
+                          }
+                        />
+                      </>
+                    )}
+
                     {/* Agent tools (WebMCP). Shown only when the browser
                         exposes document.modelContext; off unregisters the
                         tools for this browser. Cookie-only and idle at its
@@ -1428,8 +1465,9 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                       </>
                     )}
 
-                    {/* Agent Switching (OpenCode only) */}
-                    {origin === 'opencode' && (
+                    {/* Agent Switching (OpenCode only). Applied on plan
+                        approval only; annotate decisions never switch agents. */}
+                    {origin === 'opencode' && !annotateDocumentTabs && (
                       <>
                         <div className="border-t border-border" />
                         <div className="space-y-2">
@@ -1689,9 +1727,9 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                     {/* Plan Width */}
                     <div className="space-y-3">
                       <div>
-                        <div className="text-sm font-medium flex items-center gap-2">Plan Width</div>
+                        <div className="text-sm font-medium flex items-center gap-2">{mode === 'annotate' ? 'Document Width' : 'Plan Width'}</div>
                         <div className="text-xs text-muted-foreground">
-                          Maximum width of the plan card
+                          {mode === 'annotate' ? 'Maximum width of the document card' : 'Maximum width of the plan card'}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-0.5">
@@ -1815,7 +1853,9 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                 {/* === SAVING TAB === */}
                 {activeTab === 'saving' && (
                   <>
-                    {/* Plan Saving */}
+                    {/* Plan Saving — decision snapshots in plans/ are written
+                        on plan approve/deny only. */}
+                    {mode === 'plan' && (<>
                     <div className="space-y-3">
                       <div className="flex items-center justify-between">
                         <div>
@@ -1858,6 +1898,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                     </div>
 
                     <div className="border-t border-border" />
+                    </>)}
 
                     {/* Default Notes App */}
                     <div className="space-y-2">
@@ -2256,7 +2297,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                       <div>
                         <div className="text-sm font-medium">Obsidian Integration</div>
                         <div className="text-xs text-muted-foreground">
-                          Auto-save approved plans to your vault
+                          {mode === 'annotate' ? 'Save documents to your vault from the Options menu. When on, plan review also saves each approved plan here.' : 'Auto-save approved plans to your vault'}
                         </div>
                       </div>
                       <button
@@ -2385,7 +2426,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                           </div>
 
                           <div className="text-[10px] text-muted-foreground/70">
-                            Plans saved to: {obsidian.vaultPath === CUSTOM_PATH_SENTINEL
+                            {mode === 'annotate' ? 'Saved to' : 'Plans saved to'}: {obsidian.vaultPath === CUSTOM_PATH_SENTINEL
                               ? (obsidian.customPath || '...')
                               : (obsidian.vaultPath || '...')}/{obsidian.folder || 'plannotator'}/
                           </div>
@@ -2396,13 +2437,14 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
 {`---
 created: ${new Date().toISOString().slice(0, 19)}Z
 source: plannotator
-tags: [plan, ...]
+tags: [${mode === 'annotate' ? 'plannotator' : 'plan'}, ...]
 ---`}
                             </pre>
                           </div>
 
                           <div className="border-t border-border/30" />
 
+                          {mode === 'plan' && (<>
                           <div className="flex items-center justify-between">
                             <div>
                               <div className="text-xs font-medium">Auto-save on Plan Arrival</div>
@@ -2423,6 +2465,7 @@ tags: [plan, ...]
                               }`} />
                             </button>
                           </div>
+                          </>)}
 
                           <div className="flex items-center justify-between">
                             <div>
@@ -2457,7 +2500,7 @@ tags: [plan, ...]
                       <div>
                         <div className="text-sm font-medium">Bear Notes</div>
                         <div className="text-xs text-muted-foreground">
-                          Auto-save approved plans to Bear
+                          {mode === 'annotate' ? 'Save documents to Bear from the Options menu. When on, plan review also saves each approved plan here.' : 'Auto-save approved plans to Bear'}
                         </div>
                       </div>
                       <button
@@ -2503,6 +2546,7 @@ tags: [plan, ...]
                           </select>
                         </div>
 
+                        {mode === 'plan' && (<>
                         <div className="border-t border-border/30" />
 
                         <div className="flex items-center justify-between">
@@ -2525,6 +2569,7 @@ tags: [plan, ...]
                             }`} />
                           </button>
                         </div>
+                        </>)}
                       </div>
                     )}
                   </>
@@ -2537,7 +2582,7 @@ tags: [plan, ...]
                       <div>
                         <div className="text-sm font-medium">Octarine</div>
                         <div className="text-xs text-muted-foreground">
-                          Auto-save approved plans to Octarine
+                          {mode === 'annotate' ? 'Save documents to Octarine from the Options menu. When on, plan review also saves each approved plan here.' : 'Auto-save approved plans to Octarine'}
                         </div>
                       </div>
                       <button
@@ -2585,9 +2630,10 @@ tags: [plan, ...]
                         </div>
 
                         <div className="text-[10px] text-muted-foreground/70">
-                          Plans saved to: {octarine.workspace || '...'} / {octarine.folder || 'plannotator'}/
+                          {mode === 'annotate' ? 'Saved to' : 'Plans saved to'}: {octarine.workspace || '...'} / {octarine.folder || 'plannotator'}/
                         </div>
 
+                        {mode === 'plan' && (<>
                         <div className="border-t border-border/30" />
 
                         <div className="flex items-center justify-between">
@@ -2610,6 +2656,7 @@ tags: [plan, ...]
                             }`} />
                           </button>
                         </div>
+                        </>)}
                       </div>
                     )}
                   </>

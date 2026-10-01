@@ -1,11 +1,10 @@
 /**
  * Duck-typed adapters over the OpenCode 2 plugin context.
  *
- * The V2 plugin API is still pre-release: the published `next` and `latest`
- * dist-tags of `@opencode-ai/plugin` carry an older context shape than the
- * `beta` / `dev` nightlies. Nothing here may import the plugin package at
- * runtime or assume a domain exists: every capability is probed before use so
- * the adapter degrades to today's behavior on an older host.
+ * The build uses the stable @opencode/plugin types, but installed V2 hosts may
+ * predate native commands, agent switching or transcript notices. Nothing here
+ * imports the plugin package at runtime: optional capabilities are probed so
+ * older hosts retain their fallback behavior.
  */
 
 import type { OpenCodeBridgeAgent } from "./cli-bridge";
@@ -224,6 +223,9 @@ export function toBridgeMessages(context: unknown): unknown[] {
       id: typeof message.id === "string" ? message.id : undefined,
       role: typeof message.type === "string" ? message.type : undefined,
       time: isRecord(message.time) ? { created: message.time.created } : undefined,
+      // V2 assistant messages record their writer (`Session.Message.Assistant`
+      // carries `agent: Agent.ID`); /plannotator-last routes feedback to it.
+      ...(typeof message.agent === "string" && message.agent ? { agent: message.agent } : {}),
     },
     parts: Array.isArray(message.content) ? message.content : [],
   }));
@@ -235,6 +237,16 @@ function joinTextParts(parts: unknown[]): string {
       isRecord(part) && part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");
+}
+
+/** The session's current agent, or undefined when the host cannot say. */
+async function readSessionAgent(ctx: V2ContextLike, sessionID: string): Promise<string | undefined> {
+  try {
+    const session: unknown = await ctx.session?.get?.({ sessionID });
+    return isRecord(session) && typeof session.agent === "string" ? session.agent : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Read the session id out of the V1-shaped `{ path: { id } }` request. */
@@ -293,7 +305,7 @@ const CO_PROMOTED_DELIVERY = "steer";
  *
  * Two vocabularies are live at once, and this adapter has to speak both:
  *
- *  - `0.0.0-next-*` (the version this package pins, and what CI installs)
+ *  - `0.0.0-next-*` (older V2 hosts, before the inbox-event rename)
  *    publishes `session.input.promoted` with `data.inputID`
  *    (`SessionInputPromoted` in `@opencode-ai/client`'s generated types).
  *  - v2.0.x and `dev` renamed the inbox events: `session.inbox.delivered` and
@@ -669,7 +681,13 @@ export function createV2BridgeClient(input: {
           // A failed switch must never cost the reviewer their feedback: the
           // same guarantee `switchV2SessionAgent` gives the approval path.
           try {
-            await input.ctx.session.switchAgent({ sessionID, agent });
+            // `Session.switchAgent` publishes an `agent-switched` transcript
+            // row unconditionally, so skip it when the session is already on
+            // that agent — upstream's own command plugin guards the same way
+            // (`packages/core/src/config/plugin/command.ts`).
+            if (await readSessionAgent(input.ctx, sessionID) !== agent) {
+              await input.ctx.session.switchAgent({ sessionID, agent });
+            }
           } catch (error) {
             warn(`[Plannotator] Could not switch the OpenCode session to "${agent}": ${error instanceof Error ? error.message : String(error)}`);
           }

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { likelyAppHtmlEncoding, prewarmAppHtml } from "../generated/app-html.ts";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import os from "node:os";
@@ -7,7 +8,7 @@ import { basename, resolve as resolvePath } from "node:path";
 import { SingleFlight } from "../generated/single-flight.ts";
 import { contentHash } from "../generated/draft.ts";
 import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "../generated/review-draft.ts";
-import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl, resolveGitRemoteCheck } from "../generated/config.ts";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveClaudeSandbox, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl, resolveGitRemoteCheck, resolveReviewProgress } from "../generated/config.ts";
 import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "../generated/feedback-archive.ts";
 import { isFaviconStyle, type FaviconStyle } from "../generated/favicon.ts";
 
@@ -21,6 +22,7 @@ import {
 	getDisplayRepo,
 	getMRLabel,
 	getMRNumberLabel,
+	getPRNumber,
 	isSameProject,
 	type PRMetadata,
 	type PRListItem,
@@ -48,23 +50,39 @@ import {
 	nextRemoteBaseCheckInterval,
 	REMOTE_BASE_CHECK_INTERVAL_MS,
 	getFileContentsForDiff as getFileContentsForDiffCore,
+	getFileBytesForDiff as getFileBytesForDiffCore,
+	type DiffSide,
+	type FileBytesRead,
 	getSinceBaseSections,
 	isBinaryPatchFile,
+	commitFamilyId,
 	isSameCwdCommitSwitch,
 	listPatchFiles,
 	STATIC_PATCH_DIFF_TYPE,
 	parseCommitDiffType,
+	parseJjCommitDiffType,
 	parseWorktreeDiffType,
 	resolveBaseBranch,
 	validateFilePath,
 } from "../generated/review-core.ts";
 import {
+	REVIEW_IMAGE_ENDPOINT,
+	REVIEW_IMAGE_READ_CONCURRENCY,
+	createConcurrencyLimiter,
+	handleReviewImageRequest,
+	readPRImageSide,
+} from "../generated/review-image.ts";
+import {
 	getGitButlerContextRevision,
 	getGitButlerPatchFingerprint,
 } from "../generated/gitbutler-core.ts";
+import { canonicalizeJjCommitDiffType } from "../generated/jj-core.ts";
 import {
 	getCommitDiffInfo,
+	getJjCommitDiffInfo,
 	listCommitHistory,
+	listJjCommitHistory,
+	resolveJjCommitRailBase,
 	type CommitDiffInfo,
 } from "../generated/commit-history.ts";
 import {
@@ -96,6 +114,7 @@ import {
 	handleUploadRequest,
 } from "./handlers.ts";
 import { handleApiNotFound, html, json, parseBody, parseJsonBody, readBody, requestUrl, send } from "./helpers.ts";
+import { captureReviewProgress, handleReviewProgress } from "../generated/review-progress.ts";
 import { createPiAIRuntime, handlePiAIRequest } from "./ai-runtime.ts";
 
 import { buildAdvertisedUrl, isRemoteSession, listenOnPort } from "./network.ts";
@@ -105,11 +124,14 @@ import {
 	fetchPR,
 	fetchPRContext,
 	fetchPRFileContent,
+	fetchPRFileBytes,
 	fetchPRList,
 	fetchPRStack,
 	fetchPRViewedFiles,
 	getPRUser,
 	markPRFilesViewed,
+	parseFileLevelComments,
+	parsePRReviewAction,
 	parsePRUrl,
 	prCommandRuntime,
 	submitPRReview,
@@ -194,6 +216,8 @@ import {
 	getVcsContext,
 	getVcsDiffFingerprint,
 	getVcsFileContentsForDiff,
+	getVcsFileBytesForDiff,
+	jjRuntime,
 	resolveVcsCwd,
 	resolveAvailableDiffType,
 	reviewRuntime,
@@ -278,6 +302,7 @@ export interface ReviewServerResult {
 	waitForDecision: () => Promise<{
 		approved: boolean;
 		feedback: string;
+		reviewDirectory?: string;
 		annotations: unknown[];
 		agentSwitch?: string;
 		exit?: boolean;
@@ -286,6 +311,8 @@ export interface ReviewServerResult {
 }
 
 export async function startReviewServer(options: {
+	/** Return the active local directory with the decision for cross-directory feedback. */
+	includeReviewDirectory?: boolean;
 	rawPatch: string;
 	gitRef: string;
 	htmlContent: string;
@@ -316,6 +343,7 @@ export async function startReviewServer(options: {
 	openStatePinned?: boolean;
 	/** Freshness token captured atomically with the initial provider patch. */
 	initialFingerprint?: string;
+	initialFileIdentities?: Record<string, string>;
 	error?: string;
 	sharingEnabled?: boolean;
 	/**
@@ -366,7 +394,7 @@ export async function startReviewServer(options: {
 	/** Called when server starts with the URL, remote status, and port */
 	onReady?: (url: string, isRemote: boolean, port: number) => void;
 }): Promise<ReviewServerResult> {
-	const gitUser = detectGitUser();
+	const gitUser = detectGitUser(options.workspace?.root ?? options.gitContext?.cwd);
 	const aiEnabled = resolveAIEnabled();
 	const submitPlatformReview = options.prReviewSubmitter ?? submitPRReview;
 	let draftKey = contentHash(options.rawPatch);
@@ -454,11 +482,12 @@ export async function startReviewServer(options: {
 			}
 		: workspace
 			? { display: basename(workspace.root), branch: "Workspace" }
-		: getRepoInfo();
+		: getRepoInfo(options.gitContext?.cwd);
 	const editorAnnotations = createEditorAnnotationHandler();
 	const externalAnnotations = createExternalAnnotationHandler("review");
 
 	let currentPatch = options.rawPatch;
+	let currentFileIdentities = options.initialFileIdentities;
 	let currentGitRef = options.gitRef;
 	let currentDiffType: DiffType | WorkspaceDiffType = options.diffType || workspace?.diffType || "uncommitted";
 	let currentError = options.error;
@@ -595,7 +624,25 @@ export async function startReviewServer(options: {
 			if (ok) callFlowService.invalidateRuntimeState();
 		},
 	});
+	// PLANNOTATOR_REVIEW_PROGRESS / config.reviewProgress: when off, no snapshot
+	// exists, so the endpoint answers `available: false` without touching disk and
+	// the client keeps viewed marks in the draft, as for unsupported modes.
+	const captureProgress = () => !resolveReviewProgress(loadConfig()) ? Promise.resolve(null) : captureReviewProgress({
+		patch: currentPatch,
+		fileIdentities: currentFileIdentities,
+		diffType: currentDiffType,
+		base: currentBase,
+		cwd: options.gitContext ? options.gitContext.cwd ?? process.cwd() : undefined,
+		vcsType: sessionVcsType,
+		prUrl: prMeta?.url,
+		prScope: currentPRDiffScope,
+		workspaceRoot: workspace?.root,
+	}, reviewRuntime.runGit);
+	// Captured once at startup: either by the initial fingerprint capture below
+	// or, when the caller already supplied a fingerprint, right after it.
+	let progressSnapshot: ReturnType<typeof captureProgress> = Promise.resolve(null);
 	const captureDiffFingerprint = (knownFingerprint?: string): void => {
+		progressSnapshot = captureProgress();
 		// A fingerprint capture marks a committed review-view change. Stop work
 		// for the prior snapshot even when the new view cannot run CallDiff.
 		callFlowService.cancelAll();
@@ -619,6 +666,7 @@ export async function startReviewServer(options: {
 		});
 	};
 	if (currentFingerprint === null) captureDiffFingerprint();
+	else progressSnapshot = captureProgress();
 
 	// --- Base staleness vs the remote (mirrors Bun review.ts) -----------------
 	// `origin/<default>` is GitHub's state as of the last fetch. The startup
@@ -738,9 +786,12 @@ export async function startReviewServer(options: {
 		if (isPRMode || workspace || !options.gitContext) return undefined;
 		const effective = parseWorktreeDiffType(diffType)?.subType ?? diffType;
 		const sha = parseCommitDiffType(effective as string)?.sha;
-		if (!sha) return undefined;
+		const jjCommitId = parseJjCommitDiffType(effective as string)?.commitId;
+		if (!sha && !jjCommitId) return undefined;
 		const cwd = resolveVcsCwd(diffType as DiffType, options.gitContext.cwd);
-		const info = await getCommitDiffInfo(reviewRuntime, sha, cwd);
+		const info = jjCommitId
+			? await getJjCommitDiffInfo(jjRuntime, jjCommitId, cwd)
+			: await getCommitDiffInfo(reviewRuntime, sha!, cwd);
 		if (!info) return undefined;
 		const avatars = await commitAvatars.resolve(cwd, [info.authorEmail]);
 		const avatarUrl = avatars.get(info.authorEmail);
@@ -822,11 +873,12 @@ export async function startReviewServer(options: {
 								currentDiffType as DiffType,
 								remote,
 								gitCwd,
-								{ hideWhitespace: currentHideWhitespace },
+								{ hideWhitespace: currentHideWhitespace, captureFileIdentities: true },
 							);
 							if (!baseEverSwitched) {
 								currentBase = remote;
 								currentPatch = rebuilt.patch;
+								currentFileIdentities = rebuilt.fileIdentities;
 								currentGitRef = rebuilt.label;
 								currentError = rebuilt.error;
 								// draftKey doubles as the snapshot id the freshness probe
@@ -926,7 +978,7 @@ export async function startReviewServer(options: {
 	// itself stays a pure content hash — drafts survive content-identical
 	// mode round-trips.
 	function currentSnapshotId(): string {
-		return `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}`;
+		return `${draftKey}:${currentDiffType}${isPRMode ? `:${currentPRDiffScope}` : ""}${currentContextRevision ? `:${currentContextRevision}` : ""}${currentFileIdentities ? `:${contentHash(JSON.stringify(currentFileIdentities))}` : ""}`;
 	}
 
 	// --- Durable feedback archive (Node mirror of packages/server/review.ts) ---
@@ -965,11 +1017,8 @@ export async function startReviewServer(options: {
 		if (prMeta) {
 			target.pr = {
 				provider: prMeta.platform,
-				repo:
-					prMeta.platform === "github"
-						? `${prMeta.owner}/${prMeta.repo}`
-						: prMeta.projectPath,
-				number: prMeta.platform === "github" ? prMeta.number : prMeta.iid,
+				repo: getDisplayRepo(prMeta),
+				number: getPRNumber(prMeta),
 			};
 		}
 		return target;
@@ -1473,7 +1522,7 @@ export async function startReviewServer(options: {
 					?? await guideStore.captureLaunchContext();
 				// The review this guide describes, for portable export (decision
 				// record D6). Mirrors packages/server/review.ts.
-				const commitSha = parseCommitDiffType(String(worktreeParts?.subType ?? launchDiffType))?.sha;
+				const commitSha = commitFamilyId(String(launchDiffType)) ?? undefined;
 				const launchSource: GuideSnapshotSource = workspacePrompt
 					? { kind: "workspace", ...(repoInfo?.display && { repo: repoInfo.display }) }
 					: launchPrMeta
@@ -1484,9 +1533,13 @@ export async function startReviewServer(options: {
 								headSha: launchPrMeta.headSha,
 								pr: {
 									url: launchPrMeta.url,
-									number: launchPrMeta.platform === "github" ? launchPrMeta.number : launchPrMeta.iid,
+									number: getPRNumber(launchPrMeta),
 									title: launchPrMeta.title,
-									platform: launchPrMeta.platform,
+									// The portable guide format names only github/gitlab; other
+									// platforms omit the optional field rather than widen it.
+									...(launchPrMeta.platform === "github" || launchPrMeta.platform === "gitlab"
+										? { platform: launchPrMeta.platform }
+										: {}),
 								},
 							}
 						: {
@@ -1544,7 +1597,7 @@ export async function startReviewServer(options: {
 				const model = typeof config?.model === "string" && config.model ? config.model : undefined;
 				const effort = typeof config?.effort === "string" && config.effort ? config.effort : undefined;
 				const prompt = composeClaudeReviewPrompt(userMessage, reviewProfile);
-				const { command, stdinPrompt } = buildClaudeCommand(prompt, model, effort);
+				const { command, stdinPrompt } = buildClaudeCommand(prompt, model, effort, { sandbox: resolveClaudeSandbox(loadConfig()) });
 				return { command, stdinPrompt, prompt, cwd, label: jobLabel, captureStdout: true, model, effort, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label };
 			}
 
@@ -1553,8 +1606,8 @@ export async function startReviewServer(options: {
 			// appends the marker-block output contract (even for a custom profile —
 			// it's the only thing that makes their prose output parseable). The
 			// engine's buildArgv passes the prompt as the trailing positional arg and
-			// threads the spawn cwd (--workspace for Cursor, --dir for OpenCode; Pi has
-			// no cwd flag — it always uses the process's actual cwd, which spawnJob
+			// threads the spawn cwd (--workspace for Cursor; OpenCode (#1609) and Pi have
+			// no cwd flag — they use the process's actual cwd, which spawnJob
 			// already sets from this same cwd).
 			// captureStdout is required: the marker block comes back on stdout NDJSON.
 			const markerEngine = MARKER_ENGINES[provider as MarkerEngineId];
@@ -1579,7 +1632,7 @@ export async function startReviewServer(options: {
 			const jobPrMeta = jobPrUrl ? prSwitchCache.get(jobPrUrl)?.metadata : undefined;
 			const jobPrContext = jobPrMeta ? {
 				prUrl: jobPrUrl,
-				prNumber: jobPrMeta.platform === "github" ? jobPrMeta.number : jobPrMeta.iid,
+				prNumber: getPRNumber(jobPrMeta),
 				prTitle: jobPrMeta.title,
 				prRepo: getDisplayRepo(jobPrMeta),
 			} : jobPrUrl ? { prUrl: jobPrUrl } : {};
@@ -1779,6 +1832,11 @@ export async function startReviewServer(options: {
 	// otherwise resolve the patch's paths against an unrelated cwd. Mirrors
 	// packages/server/review.ts.
 	const isStaticPatchMode = options.diffType === STATIC_PATCH_DIFF_TYPE;
+	// Image preview capability advert (#1598), beside approvalNotesSupported on
+	// every diff payload. Off where nothing can be read: a static patch has
+	// no repository, and P4 drops binary files from its patch entirely.
+	const imagePreviewSupported = !isStaticPatchMode;
+	const runImageRead = createConcurrencyLimiter(REVIEW_IMAGE_READ_CONCURRENCY);
 	const sourceKindAdvert = isStaticPatchMode
 		? ({ sourceKind: "patch" } as const)
 		: ({} as Record<string, never>);
@@ -1789,6 +1847,7 @@ export async function startReviewServer(options: {
 	let resolveDecision!: (result: {
 		approved: boolean;
 		feedback: string;
+		reviewDirectory?: string;
 		annotations: unknown[];
 		agentSwitch?: string;
 		exit?: boolean;
@@ -1796,6 +1855,7 @@ export async function startReviewServer(options: {
 	const decisionPromise = new Promise<{
 		approved: boolean;
 		feedback: string;
+		reviewDirectory?: string;
 		annotations: unknown[];
 		agentSwitch?: string;
 		exit?: boolean;
@@ -2153,6 +2213,7 @@ export async function startReviewServer(options: {
 				gitContext: hasLocalAccess ? servedGitContext : undefined,
 				sharingEnabled,
 				approvalNotesSupported,
+				imagePreviewSupported,
 				...sourceKindAdvert,
 				// Mount is the only place the pin matters, so it rides /api/diff
 				// alone (not the switch endpoints).
@@ -2392,20 +2453,37 @@ export async function startReviewServer(options: {
 			}
 		} else if (url.pathname === "/api/commits" && req.method === "GET") {
 			// Linear commit history for the Commits panel (mirrors Bun review.ts).
-			// Git-local sessions only — PR/workspace/jj/p4 don't offer the view.
-			// Computed against the active diff's cwd (worktree-aware) and the
-			// active base so the divider matches the review baseline.
-			if (!options.gitContext || isPRMode || workspace || (sessionVcsType && sessionVcsType !== "git")) {
-				json(res, { error: "Commit history is only available for local git reviews" }, 400);
+			// Local git and jj sessions only — PR/workspace/GitButler/p4 don't
+			// offer the view. Computed against the active diff's cwd
+			// (worktree-aware) and the active base so the divider matches the
+			// review baseline (jj: the compare target, resolveJjCommitRailBase).
+			const commitsVcs = sessionVcsType ?? "git";
+			if (!options.gitContext || isPRMode || workspace || (commitsVcs !== "git" && commitsVcs !== "jj")) {
+				json(res, { error: "Commit history is only available for local git and jj reviews" }, 400);
 				return;
 			}
 			const limitParam = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
 			const before = url.searchParams.get("before") ?? undefined;
 			const commitsCwd = resolveVcsCwd(currentDiffType as DiffType, options.gitContext.cwd);
-			const page = await listCommitHistory(reviewRuntime, currentBase, commitsCwd, {
+			const pageOptions = {
 				...(Number.isFinite(limitParam) && { limit: limitParam }),
 				...(before !== undefined && { before }),
-			});
+			};
+			let page;
+			try {
+				if (commitsVcs === "jj") {
+					const railBase = resolveJjCommitRailBase(currentBase, clientGitContext ?? options.gitContext);
+					page = await listJjCommitHistory(jjRuntime, railBase.target, commitsCwd, {
+						...pageOptions,
+						baseLabel: railBase.label,
+					});
+				} else {
+					page = await listCommitHistory(reviewRuntime, currentBase, commitsCwd, pageOptions);
+				}
+			} catch (err) {
+				json(res, { error: err instanceof Error ? err.message : "Could not read commit history" }, 500);
+				return;
+			}
 			if (!page) {
 				json(res, { error: "Could not read commit history" }, 500);
 				return;
@@ -2459,6 +2537,7 @@ export async function startReviewServer(options: {
 					}
 					currentHideWhitespace = effectiveHideWhitespace;
 					currentPatch = snapshot.rawPatch;
+					currentFileIdentities = undefined;
 					currentGitRef = snapshot.gitRef;
 					currentDiffType = workspace.diffType;
 					currentError = snapshot.error;
@@ -2473,6 +2552,7 @@ export async function startReviewServer(options: {
 						gitRef: currentGitRef,
 						snapshotId: currentSnapshotId(),
 						approvalNotesSupported,
+						imagePreviewSupported,
 						...sourceKindAdvert,
 						diffType: currentDiffType,
 						diffOptions: workspace.diffOptions,
@@ -2499,6 +2579,11 @@ export async function startReviewServer(options: {
 					? resolveAvailableDiffType(clientGitContext, requestedDiffType, nextBaseExplicitlyChosen)
 					: { diffType: requestedDiffType };
 				newType = availability.diffType;
+				// Mirrors Bun review.ts: a rewritten jj revision resolves to its
+				// change's current version (Refresh after editing `@`).
+				if (sessionVcsType === "jj") {
+					newType = await canonicalizeJjCommitDiffType(jjRuntime, newType as string, options.gitContext?.cwd) as DiffType;
+				}
 				const base = resolveReviewBase(
 					typeof body.base === "string" ? body.base : undefined,
 					nextBaseExplicitlyChosen,
@@ -2506,6 +2591,7 @@ export async function startReviewServer(options: {
 				);
 				const defaultCwd = options.gitContext?.cwd;
 				const result = await runVcsDiff(newType as DiffType, base, defaultCwd, {
+					captureFileIdentities: sessionVcsType === "git",
 					hideWhitespace: effectiveHideWhitespace,
 				});
 				const resultContext = sessionVcsType === "gitbutler" && result.gitContext?.vcsType === "gitbutler"
@@ -2570,6 +2656,7 @@ export async function startReviewServer(options: {
 				}
 				currentHideWhitespace = effectiveHideWhitespace;
 				currentPatch = result.patch;
+				currentFileIdentities = result.fileIdentities;
 				currentGitRef = result.label;
 				currentDiffType = newType;
 				currentBase = nextBase;
@@ -2617,6 +2704,7 @@ export async function startReviewServer(options: {
 					gitRef: currentGitRef,
 					snapshotId: currentSnapshotId(),
 					approvalNotesSupported,
+					imagePreviewSupported,
 					...sourceKindAdvert,
 					diffType: currentDiffType,
 					// Echo the base the server actually used. resolveBaseBranch
@@ -2681,6 +2769,7 @@ export async function startReviewServer(options: {
 						snapshotId: currentSnapshotId(),
 						draftState: reviewDrafts.state(currentDraftKeys()),
 						approvalNotesSupported,
+						imagePreviewSupported,
 						...sourceKindAdvert,
 						prDiffScope: currentPRDiffScope,
 						...(layerPatchIncomplete ? { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable } : {}),
@@ -2731,6 +2820,7 @@ export async function startReviewServer(options: {
 					}
 					if (scopeEpoch !== prScopeEpoch) return respondSuperseded();
 					currentPatch = originalPRPatch;
+					currentFileIdentities = undefined;
 					currentGitRef = originalPRGitRef;
 					currentError = originalPRError;
 					currentPRDiffScope = "layer";
@@ -2749,6 +2839,7 @@ export async function startReviewServer(options: {
 						snapshotId: currentSnapshotId(),
 						draftState: reviewDrafts.state(currentDraftKeys()),
 						approvalNotesSupported,
+						imagePreviewSupported,
 						...sourceKindAdvert,
 						prDiffScope: currentPRDiffScope,
 						...(layerPatchIncomplete ? { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable } : {}),
@@ -2775,6 +2866,7 @@ export async function startReviewServer(options: {
 
 				if (scopeEpoch !== prScopeEpoch) return respondSuperseded();
 				currentPatch = result.patch;
+				currentFileIdentities = undefined;
 				currentGitRef = result.label;
 				currentError = undefined;
 				currentPRDiffScope = "full-stack";
@@ -2791,6 +2883,7 @@ export async function startReviewServer(options: {
 					snapshotId: currentSnapshotId(),
 					draftState: reviewDrafts.state(currentDraftKeys()),
 					approvalNotesSupported,
+					imagePreviewSupported,
 					...sourceKindAdvert,
 					prDiffScope: currentPRDiffScope,
 					semanticDiff: await getSemanticDiffAdvert(),
@@ -2821,6 +2914,7 @@ export async function startReviewServer(options: {
 				prRef = prRefFromMetadata(pr.metadata);
 				warmPRContext(pr.metadata.url, prRef);
 				currentPatch = pr.rawPatch;
+				currentFileIdentities = undefined;
 				currentGitRef = `${getMRLabel(pr.metadata)} ${getMRNumberLabel(pr.metadata)}`;
 				currentError = undefined;
 				originalPRPatch = pr.rawPatch;
@@ -2878,6 +2972,7 @@ export async function startReviewServer(options: {
 					snapshotId: currentSnapshotId(),
 					draftState: reviewDrafts.state(currentDraftKeys()),
 					approvalNotesSupported,
+					imagePreviewSupported,
 					...sourceKindAdvert,
 					prMetadata: pr.metadata,
 					// The new PR's checkout (null while warming) so Open-in re-roots
@@ -3003,7 +3098,13 @@ export async function startReviewServer(options: {
 			}
 			try {
 				const body = await parseBody(req);
+				const action = parsePRReviewAction(body.action);
+				if (!action) {
+					json(res, { error: "action must be one of approve, comment, request_changes" }, 400);
+					return;
+				}
 				const fileComments = (body.fileComments as PRReviewFileComment[]) || [];
+				const fileLevelComments = parseFileLevelComments(body.fileLevelComments);
 				const targetPrUrl = body.targetPrUrl as string | undefined;
 
 				let targetRef = prRef;
@@ -3024,13 +3125,14 @@ export async function startReviewServer(options: {
 					return;
 				}
 
-				console.error(`[pr-action] ${body.action} with ${fileComments.length} file comment(s), target=${targetUrl}, headSha=${targetHeadSha}`);
+				console.error(`[pr-action] ${action} with ${fileComments.length} line comment(s) and ${fileLevelComments.length} file-level comment(s), target=${targetUrl}, headSha=${targetHeadSha}`);
 				const submission = await submitPlatformReview(
 					targetRef,
 					targetHeadSha,
-					body.action as "approve" | "comment",
+					action,
 					body.body as string,
 					fileComments,
+					fileLevelComments,
 				);
 				console.error(`[pr-action] ${submission.status === "complete" ? "Success" : "Partial success"}`);
 				prContextLive.refreshAfterWrite(targetUrl, targetRef);
@@ -3068,6 +3170,71 @@ export async function startReviewServer(options: {
 				console.error("[plannotator] /api/pr-viewed error:", message);
 				json(res, { error: message }, 500);
 			}
+		} else if (url.pathname === REVIEW_IMAGE_ENDPOINT && req.method === "GET") {
+			// One side of a changed image, as bytes (#1598). Mirrors
+			// packages/server/review.ts: every decision is in the shared handler;
+			// this closure only says where the current mode reads a side from.
+			const readSide = async (
+				side: DiffSide,
+				filePath: string,
+				oldPath: string | undefined,
+				maxBytes: number,
+				signal?: AbortSignal,
+			): Promise<FileBytesRead> => {
+				if (workspace) return workspace.getFileBytes(filePath, oldPath, side, maxBytes);
+				const prCwd = (options.worktreePool && prMeta) ? options.worktreePool.resolve(prMeta.url) : options.agentCwd;
+				if (isPRMode && currentPRDiffScope === "full-stack" && prCwd && prMeta?.defaultBranch) {
+					const baseRef = await resolvePRFullStackBaseRef(reviewRuntime, prMeta.defaultBranch, prCwd);
+					if (!baseRef) return { kind: "missing" };
+					return getFileBytesForDiffCore(reviewRuntime, "merge-base", baseRef, filePath, oldPath, side, maxBytes, prCwd);
+				}
+				if (hasLocalAccess && !isPRMode) {
+					return getVcsFileBytesForDiff(
+						currentDiffType as DiffType,
+						currentBase,
+						filePath,
+						oldPath,
+						side,
+						maxBytes,
+						options.gitContext?.cwd,
+					);
+				}
+				if (isPRMode && prMeta && prRef) {
+					const ref = prRef;
+					return readPRImageSide({
+						gitRuntime: reviewRuntime,
+						poolCwd: prCwd,
+						oldSha: prMeta.mergeBaseSha ?? prMeta.baseSha,
+						headSha: prMeta.headSha,
+						side,
+						filePath,
+						oldPath,
+						maxBytes,
+						fetchBytes: (sha, path, max) => fetchPRFileBytes(ref, sha, path, max),
+						signal,
+					});
+				}
+				return { kind: "unavailable" };
+			};
+			// node:http has no request signal: abort when the client closes the
+			// socket before the response is written.
+			const requestAbort = new AbortController();
+			res.on("close", () => {
+				if (!res.writableEnded) requestAbort.abort();
+			});
+			const result = await handleReviewImageRequest({
+				params: url.searchParams,
+				ifNoneMatch: typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : null,
+				available: imagePreviewSupported,
+				patch: currentPatch,
+				isCurrentSnapshot: (snapshot) => snapshot === currentSnapshotId(),
+				signal: requestAbort.signal,
+				readSide: (side, filePath, oldPath, maxBytes, signal) =>
+					runImageRead(() => readSide(side, filePath, oldPath, maxBytes, signal), signal),
+			});
+			if (requestAbort.signal.aborted) return;
+			res.writeHead(result.status, result.headers);
+			res.end(result.body ?? undefined);
 		} else if (url.pathname === "/api/file-content" && req.method === "GET") {
 			// No working tree behind a static patch: the patch IS the whole content
 			// of the session, so there is nothing to expand into.
@@ -3301,12 +3468,13 @@ export async function startReviewServer(options: {
 			}
 		} else if (url.pathname === "/api/config" && req.method === "POST") {
 			try {
-				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; reviewAnalysis?: Record<string, unknown>; conventionalComments?: boolean };
+				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; autoUpdate?: unknown; reviewAnalysis?: Record<string, unknown>; conventionalComments?: boolean };
 				const toSave: Record<string, unknown> = {};
 				if (body.displayName !== undefined) toSave.displayName = body.displayName;
 				if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
 				if (body.theme !== undefined) toSave.theme = body.theme;
 				if (isFaviconStyle(body.favicon)) toSave.favicon = body.favicon;
+				if (typeof body.autoUpdate === "boolean") toSave.autoUpdate = body.autoUpdate;
 				if (body.reviewAnalysis !== undefined) {
 					const reviewAnalysis = parseReviewAnalysisConfig(body.reviewAnalysis);
 					if (!reviewAnalysis) return json(res, { error: "Invalid analysis settings" }, 400);
@@ -3514,6 +3682,21 @@ export async function startReviewServer(options: {
 					500,
 				);
 			}
+		} else if (url.pathname === "/api/review-progress") {
+			if (req.method === "POST" && !callFlowInstallOriginAllowed(req.headers.origin ?? null, req.headers.host ?? "")) {
+				json(res, { error: "Cross-origin progress updates are not allowed" }, 403);
+				return;
+			}
+			let body: unknown;
+			if (req.method === "POST") {
+				try { body = JSON.parse(await readBody(req)); } catch { json(res, { error: "Invalid JSON" }, 400); return; }
+			}
+			const result = await handleReviewProgress({
+				method: req.method ?? "GET", snapshotId: url.searchParams.get("snapshot"),
+				currentSnapshotId, progress: progressSnapshot, currentProgress: () => progressSnapshot,
+				body, platformViewed: isPRMode ? initialViewedFiles : [],
+			});
+			json(res, result.body, result.status);
 		} else if (url.pathname === "/api/draft") {
 			await handleReviewDraftRequest(req, res, currentDraftKeys(), reviewDrafts);
 		} else if (url.pathname === "/favicon.png") {
@@ -3614,6 +3797,8 @@ export async function startReviewServer(options: {
 				resolveDecision({
 					approved,
 					feedback: feedbackText,
+					...(options.includeReviewDirectory && !prMeta && options.diffType !== STATIC_PATCH_DIFF_TYPE
+						? { reviewDirectory: resolveAgentCwd() } : {}),
 					annotations: annotationList,
 					agentSwitch: body.agentSwitch as string | undefined,
 				});
@@ -3625,11 +3810,14 @@ export async function startReviewServer(options: {
 		} else if (url.pathname.startsWith("/api/")) {
 			handleApiNotFound(res, url.pathname);
 		} else {
-			html(res, options.htmlContent);
+			await html(req, res, options.htmlContent, isRemoteSession());
 		}
 	});
 
 	const { port, portSource } = await listenOnPort(server);
+	// Remote sessions serve the app page compressed (#1617); start gzip (what
+	// browsers ask for over plain http) now so the first load does not wait.
+	if (isRemoteSession()) prewarmAppHtml(options.htmlContent, likelyAppHtmlEncoding(false));
 	serverUrl = buildAdvertisedUrl(port);
 	agentApiUrl = `http://127.0.0.1:${port}`;
 	const exitHandler = () => agentJobs.killAll();

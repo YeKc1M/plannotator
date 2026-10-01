@@ -25,6 +25,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
+import { bundledSkillPaths } from "./bundled-skill.ts";
 import { buildPromptVariables, formatTodoList, loadPlannotatorConfig, renderTemplate, resolveExecutionMode, resolvePhaseProfile } from "./config.ts";
 import {
 	type ChecklistItem,
@@ -349,6 +350,14 @@ export default function plannotator(pi: ExtensionAPI): void {
 		currentPiSession.update(ctx);
 	});
 
+	// The plannotator knowledge skill is offered here rather than through a
+	// static `pi.skills` manifest entry, so it can yield to the copy the CLI
+	// installer puts in ~/.agents/skills instead of colliding with it (#1642).
+	pi.on("resources_discover", () => {
+		const skillPaths = bundledSkillPaths(pi.getCommands());
+		return skillPaths.length > 0 ? { skillPaths } : undefined;
+	});
+
 	pi.on("session_shutdown", () => {
 		sessionAlive = false;
 		currentPiSession.clear();
@@ -668,7 +677,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("plannotator-review", {
-		description: "Open interactive code review for current changes or a PR URL; pass --git or --gitbutler to force that provider, --base <ref> / --diff-type <type> to pin the session's opening diff",
+		description: "Open interactive code review for current changes, a directory, or a PR URL; pass --git or --gitbutler to force that provider, --base <ref> / --diff-type <type> to pin the session's opening diff",
 		handler: async (args, ctx) => {
 			if (!hasReviewBrowserHtml()) {
 				ctx.ui.notify(
@@ -682,7 +691,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 			const origin = getPiSessionIdentity(ctx);
 
 			try {
-				const { parseReviewArgs } = await import("./generated/review-args.ts");
+				const { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory } = await import("./generated/review-args.ts");
 				const reviewArgs = parseReviewArgs(args ?? "");
 				// Argument-shape failures refuse to start a session (same contract
 				// as the CLI's exit 1), surfaced through Pi's notifier.
@@ -690,7 +699,12 @@ export default function plannotator(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Plannotator: ${reviewArgs.errors.join("; ")}`, "error");
 					return;
 				}
+				const reviewTarget = resolveReviewTarget(reviewArgs, ctx.cwd);
+				const ignoredNotice = formatIgnoredReviewWords(reviewTarget);
+				if (ignoredNotice) ctx.ui.notify(`Plannotator: ${ignoredNotice}`, "info");
 				const session = await startCodeReviewBrowserSession(ctx, {
+					cwd: reviewTarget.directory,
+					includeReviewDirectory: !!reviewTarget.directory,
 					prUrl: reviewArgs.prUrl,
 					patchFile: reviewArgs.patchFile,
 					vcsType: reviewArgs.vcsType,
@@ -712,6 +726,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 					.waitForDecision()
 					.then(async (result) => {
 						try {
+							if (result.feedback) result.feedback = withReviewDirectory(result.feedback, result.reviewDirectory);
 							if (result.exit) {
 								safeNotify(ctx, "Code review session closed.", "info", origin);
 								return;
@@ -1215,6 +1230,14 @@ export default function plannotator(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: PLAN_SUBMIT_TOOL,
 		label: "Submit Plan",
+		// Pi runs one assistant message's tool calls in parallel by default, and
+		// its write/edit tools apply changes through an async per-file mutation
+		// queue, while this tool reads the plan file synchronously as soon as it
+		// starts. An "edit plan + submit plan" batch could therefore review (and
+		// save to history) the pre-edit plan. A sequential tool makes pi run the
+		// WHOLE batch one call at a time, in order, so the edit lands first
+		// (#1622). Supported by every pi in our peer range (>= 0.79.1).
+		executionMode: "sequential",
 		description:
 			"Submit your Plannotator plan for user review. " +
 			"Call this only while Plannotator planning mode is active, after writing your plan as a markdown file anywhere inside the working directory. " +
@@ -1444,16 +1467,16 @@ export default function plannotator(pi: ExtensionAPI): void {
 			// Denied
 			persistState();
 			const feedbackText = result.feedback || "Plan rejected. Please revise.";
-			const { buildPlanFileRule, getPlanDeniedPrompt, getPlanToolName } = await loadPlannotatorPrompts();
+			const { buildPlanFileRule, composePlanDeniedMessage, getPlanToolName } = await loadPlannotatorPrompts();
 			return {
 				content: [
 					{
 						type: "text",
-						text: getPlanDeniedPrompt("pi", loadConfig(), {
+						text: composePlanDeniedMessage("pi", loadConfig(), {
 							toolName: getPlanToolName("pi"),
 							planFileRule: buildPlanFileRule(getPlanToolName("pi"), inputPath),
 							feedback: feedbackText,
-						}),
+						}, { answersOnly: result.answersOnly }),
 					},
 				],
 				details: { approved: false, feedback: feedbackText },

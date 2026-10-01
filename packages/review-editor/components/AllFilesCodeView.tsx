@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { getSingularPatch, processFile } from '@pierre/diffs';
+import { DEFAULT_CODE_VIEW_FILE_METRICS, getSingularPatch, processFile } from '@pierre/diffs';
 import type {
   CodeViewItem,
   CodeViewLineSelection,
@@ -10,6 +10,7 @@ import type {
   LineAnnotation,
   PostRenderPhase,
   SelectedLineRange,
+  VirtualFileMetrics,
 } from '@pierre/diffs';
 import { CodeView, EditProvider, type CodeViewHandle, useStableCallback } from '@pierre/diffs/react';
 import type { DiffTokenEventBaseProps } from '@pierre/diffs';
@@ -34,7 +35,7 @@ import {
   resolveLineSelectionBehavior,
   type LineSelectionSource,
 } from '../utils/lineSelectionBehavior';
-import { isContentlessBinaryPatch, isOversizedReviewStubPatch } from '@plannotator/shared/diff-paths';
+import { isContentlessBinaryPatch, isImagePreviewCandidate, isOversizedReviewStubPatch } from '@plannotator/shared/diff-paths';
 import { OversizedFileNotice } from './OversizedFileNotice';
 import { ToolbarHost, type ToolbarHostHandle } from './ToolbarHost';
 import { FileHeader } from './FileHeader';
@@ -190,6 +191,20 @@ export interface AllFilesCodeViewProps {
    *  patch review): the augmentation stage completes as a no-op instead of
    *  firing a /api/file-content request the server answers 400. */
   contextExpansionAvailable?: boolean;
+  /**
+   * Before/After image preview for a hunkless image chunk (#1598), rendered in
+   * place of the binary notice. A render prop rather than a flag so the
+   * preview (and its fetches) never enter hosts that leave it unset: the
+   * guide chain and the read-only guides.show viewer keep the plain notice.
+   */
+  renderImagePreview?: (args: {
+    file: DiffFile;
+    /** The notice to show when the server cannot display the file. */
+    fallback: React.ReactNode;
+    /** The notice to show when every side is over the byte cap. */
+    tooLargeFallback?: React.ReactNode;
+    onHeightChange: () => void;
+  }) => React.ReactNode;
   /** Compact coarse-pointer shell. Adjusts custom-header chrome and Pierre's
    * matching virtualization metric without changing desktop geometry. */
   compactTouchLayout?: boolean;
@@ -528,6 +543,11 @@ function buildItemIdentity(
  */
 const SCROLLED_PAST_EPSILON_PX = 8;
 
+/** The one VirtualizedFileDiff method the image-header sizing needs. */
+type HeaderMetricsTarget = { setMetrics(metrics?: Partial<VirtualFileMetrics>, force?: boolean): void };
+const isHeaderMetricsTarget = (value: unknown): value is HeaderMetricsTarget =>
+  typeof value === 'object' && value !== null && typeof (value as HeaderMetricsTarget).setMetrics === 'function';
+
 // Resolved pixel height of the custom header. Must equal FileHeader's fixed
 // container height (`style={{ height: 'var(--panel-header-h)' }}`) so CodeView's
 // virtualization reserves exactly the right space for the header. FileHeader is
@@ -567,6 +587,7 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
   reviewBase,
   reviewSnapshotId,
   contextExpansionAvailable = true,
+  renderImagePreview,
   compactTouchLayout,
   onLineSelection,
   onAddAnnotationForFile,
@@ -792,6 +813,20 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
     [files, visualOrder, prUrl, prDiffScope, patchHashes, seedCollapsed, generatedKey],
   );
   const { filePathToItemId, filePathToItemIds, itemIdToFilePath, itemIdToFile } = identity;
+
+  // Items whose header slot carries an image preview (#1598). Only these get a
+  // measured header height; without `renderImagePreview` (the guide chain,
+  // guides.show) the set is empty and nothing below runs.
+  const imagePreviewItemIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!renderImagePreview) return ids;
+    for (const [id, file] of itemIdToFile) {
+      if (isImagePreviewCandidate(file.patch, file.path, file.oldPath)) ids.add(id);
+    }
+    return ids;
+  }, [itemIdToFile, renderImagePreview]);
+  const imagePreviewItemIdsRef = useRef(imagePreviewItemIds);
+  imagePreviewItemIdsRef.current = imagePreviewItemIds;
 
   // Stable identity of the current diff. Changes whenever the file set or any
   // file's patch CONTENT changes (diff type / base / whitespace / PR switch),
@@ -1214,6 +1249,95 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
     handle.updateItem(item);
   }, []);
 
+  // --- Measured header height for image-preview items (#1598) ---------------
+  //
+  // Pierre sizes every item from `itemMetrics` and line estimates; it never
+  // measures the custom header slot. That is fine for the fixed-height
+  // FileHeader, but an image preview lives in the same slot and is a few
+  // hundred pixels tall. Left alone, Pierre models the card as a bare 33px
+  // header: once the scroll passes that 33px the card leaves the virtual
+  // window, unmounts, and the code below jumps up into its place.
+  //
+  // So for image-preview items we measure the whole header slot and hand the
+  // height to that item's own VirtualizedFileDiff through the public
+  // `setMetrics` (per instance; every other item keeps the shared metrics).
+  // Pierre then lays the card out at its real height, keeps it mounted while
+  // any of it is on screen, and puts the next file below it. Instances persist
+  // per CodeView record, so an override survives the card scrolling out of the
+  // window and back. Code files never take this path.
+  const itemMetricsRef = useRef<Partial<VirtualFileMetrics>>({});
+  /** Measured header-slot height per image-preview item id. */
+  const measuredHeaderHeightsRef = useRef(new Map<string, number>());
+  /** The item's VirtualizedFileDiff, captured from onPostRender. */
+  const headerMetricsInstancesRef = useRef(new Map<string, HeaderMetricsTarget>());
+  /** What was last applied to each instance (header height + shared metrics). */
+  const appliedHeaderMetricsRef = useRef(
+    new WeakMap<HeaderMetricsTarget, { height: number; base: Partial<VirtualFileMetrics> }>(),
+  );
+
+  const syncHeaderMetrics = useCallback(
+    (itemId: string) => {
+      const instance = headerMetricsInstancesRef.current.get(itemId);
+      if (instance == null) return;
+      const base = itemMetricsRef.current;
+      const baseHeight = base.diffHeaderHeight ?? DEFAULT_CODE_VIEW_FILE_METRICS?.diffHeaderHeight ?? 0;
+      const height = measuredHeaderHeightsRef.current.get(itemId) ?? baseHeight;
+      const applied = appliedHeaderMetricsRef.current.get(instance);
+      // Nothing to do when this exact height is already applied over the
+      // current shared metrics, or when the item never had an override and
+      // still matches the shared header height.
+      if (applied ? applied.height === height && applied.base === base : height === baseHeight) return;
+      // Same shape as CodeView's own per-item metrics (its defaults first),
+      // with only the header height replaced.
+      instance.setMetrics({ ...DEFAULT_CODE_VIEW_FILE_METRICS, ...base, diffHeaderHeight: height });
+      appliedHeaderMetricsRef.current.set(instance, { height, base });
+      // setMetrics only marks the instance dirty; the version bump makes
+      // CodeView re-lay out from this item down.
+      refreshItem(itemId);
+    },
+    [refreshItem],
+  );
+
+  // A ref callback per item id, so a header re-render does not re-observe.
+  const headerMeasureRefs = useRef(new Map<string, (el: HTMLElement | null) => void>());
+  const headerObserversRef = useRef(new Map<string, ResizeObserver>());
+  const getHeaderMeasureRef = useCallback(
+    (itemId: string) => {
+      let callback = headerMeasureRefs.current.get(itemId);
+      if (callback) return callback;
+      callback = (el: HTMLElement | null) => {
+        headerObserversRef.current.get(itemId)?.disconnect();
+        headerObserversRef.current.delete(itemId);
+        if (el == null || typeof ResizeObserver === 'undefined') return;
+        const report = () => {
+          const height = Math.ceil(el.getBoundingClientRect().height);
+          // 0 means hidden (an inactive dock panel), not a real size: keep
+          // the last measurement instead of collapsing the card.
+          if (height <= 0) return;
+          const baseHeight = itemMetricsRef.current.diffHeaderHeight ?? 0;
+          if (height === baseHeight) measuredHeaderHeightsRef.current.delete(itemId);
+          else measuredHeaderHeightsRef.current.set(itemId, height);
+          syncHeaderMetrics(itemId);
+        };
+        const observer = new ResizeObserver(report);
+        observer.observe(el);
+        headerObserversRef.current.set(itemId, observer);
+        report();
+      };
+      headerMeasureRefs.current.set(itemId, callback);
+      return callback;
+    },
+    [syncHeaderMetrics],
+  );
+
+  useEffect(() => {
+    const observers = headerObserversRef.current;
+    return () => {
+      for (const observer of observers.values()) observer.disconnect();
+      observers.clear();
+    };
+  }, []);
+
   // --- Lazy full-content hunk expansion via CodeView item updates (P5) --------
 
   // Per-item augmentation bookkeeping. `status` guards against double-fetch /
@@ -1524,6 +1648,14 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
         clearItemSearchHighlights(node);
         nodeToItemIdRef.current.delete(node);
         return;
+      }
+      // Image-preview items take a per-item header height (see
+      // syncHeaderMetrics). Capture the instance and (re)apply: a change to
+      // the shared itemMetrics resets every instance, and this is the first
+      // point after that reset where the item renders again.
+      if (imagePreviewItemIdsRef.current.has(context.id) && isHeaderMetricsTarget(_instance)) {
+        headerMetricsInstancesRef.current.set(context.id, _instance);
+        syncHeaderMetrics(context.id);
       }
       // Track which item currently owns this <diffs-container> element so the
       // text-drag selection handler can resolve file identity from the
@@ -2370,6 +2502,19 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
 
     const collapsed = item.collapsed === true;
     const fileComments = fileCommentsByPath.get(filePath) ?? [];
+    const isOversizedStub = isOversizedReviewStubPatch(file.patch);
+    const isBinaryNotice = !isOversizedStub && isContentlessBinaryPatch(file.patch);
+    const remeasure = () => refreshItem(item.id);
+    const imagePreview = !collapsed && renderImagePreview && isImagePreviewCandidate(file.patch, file.path, file.oldPath)
+      ? renderImagePreview({
+          file,
+          fallback: isOversizedStub
+            ? <OversizedFileNotice onHeightChange={remeasure} />
+            : isBinaryNotice ? <BinaryFileNotice onHeightChange={remeasure} /> : null,
+          tooLargeFallback: isOversizedStub ? <OversizedFileNotice onHeightChange={remeasure} /> : undefined,
+          onHeightChange: remeasure,
+        })
+      : null;
     // Edit-to-suggestion affordance (flag-gated). Slot portals republish on
     // updateItem BEFORE React commits state, so read the session's refs.
     const isEditingThis = editEnabled && editSession.editingItemIdRef.current === item.id;
@@ -2378,7 +2523,12 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
       : null;
 
     return (
-      <div className="relative flex flex-col">
+      <div
+        className="relative flex flex-col"
+        // Image-preview items report their real header height to the
+        // virtualizer (see syncHeaderMetrics); other headers are fixed height.
+        ref={imagePreviewItemIdsRef.current.has(item.id) ? getHeaderMeasureRef(item.id) : undefined}
+      >
         <FileHeader
         compactTouchLayout={compactTouchLayout}
         readOnly={readOnly}
@@ -2447,18 +2597,19 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
             onHeightChange={() => refreshItem(item.id)}
           />
         )}
+        {/* A hunkless image chunk previews its Before/After images (#1598)
+            when the host opts in; the notices below are its fallback. */}
+        {imagePreview}
         {/* Files over the review size cap arrive as a contents-free stub, so
             Pierre renders nothing below the header. Explain why rather than
             leaving a bare header that reads as a broken diff. */}
-        {!collapsed && isOversizedReviewStubPatch(file.patch) && (
+        {!collapsed && !imagePreview && isOversizedStub && (
           <OversizedFileNotice onHeightChange={() => refreshItem(item.id)} />
         )}
         {/* The general fallback under that specific case: any OTHER hunkless
             binary chunk draws nothing either. Gated on the marker so a
             marker-carrying stub is explained exactly once, by the line above. */}
-        {!collapsed
-          && !isOversizedReviewStubPatch(file.patch)
-          && isContentlessBinaryPatch(file.patch) && (
+        {!collapsed && !imagePreview && isBinaryNotice && (
           <BinaryFileNotice onHeightChange={() => refreshItem(item.id)} />
         )}
         {/* EXPERIMENTAL edit-session HUD: session controls + state in a slim
@@ -2518,6 +2669,16 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
     return Number.isFinite(px) && px > 0 ? Math.round(px * 1.5) : undefined;
   }, [fontSize]);
 
+  const itemMetrics = useMemo<Partial<VirtualFileMetrics>>(
+    () => ({
+      diffHeaderHeight: compactTouchLayout ? COMPACT_PANEL_HEADER_HEIGHT : PANEL_HEADER_HEIGHT,
+      hunkSeparatorHeight: HUNK_SEPARATOR_HEIGHT,
+      ...(customLineHeight != null && { lineHeight: customLineHeight }),
+    }),
+    [compactTouchLayout, customLineHeight],
+  );
+  itemMetricsRef.current = itemMetrics;
+
   const options = useMemo<CodeViewOptions<DiffAnnotationMetadata>>(
     () => ({
       themeType: pierreTheme.type,
@@ -2539,11 +2700,7 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
       // leadingHeight reserves space for the leading-content portal (commit
       // description card) so items start below it and it scrolls with them.
       layout: { gap: 0, paddingTop: 8 + leadingHeight, paddingBottom: 8 },
-      itemMetrics: {
-        diffHeaderHeight: compactTouchLayout ? COMPACT_PANEL_HEADER_HEIGHT : PANEL_HEADER_HEIGHT,
-        hunkSeparatorHeight: HUNK_SEPARATOR_HEIGHT,
-        ...(customLineHeight != null && { lineHeight: customLineHeight }),
-      },
+      itemMetrics,
       // Opt-in safety net for the hand-maintained itemMetrics above: Pierre
       // compares its virtualization estimates against measured DOM heights and
       // warns on drift. Explicit env opt-in (VITE_PIERRE_VALIDATE_HEIGHTS=1)
@@ -2600,8 +2757,7 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
       disableBackground,
       expandUnchanged,
       readOnly,
-      customLineHeight,
-      compactTouchLayout,
+      itemMetrics,
       leadingHeight,
       handleLineSelectionEnd,
       handleGutterUtilityClick,
@@ -2613,6 +2769,23 @@ export const AllFilesCodeView: React.FC<AllFilesCodeViewProps> = ({
       handlePostRender,
     ],
   );
+
+  // A change to the shared itemMetrics (font size, compact layout) makes
+  // CodeView reset every instance to them, dropping the image-header
+  // overrides. Mounted items re-apply from onPostRender; this re-applies to
+  // items outside the window too, once CodeView has run its reset.
+  const lastItemMetricsRef = useRef(itemMetrics);
+  useEffect(() => {
+    if (lastItemMetricsRef.current === itemMetrics) return;
+    lastItemMetricsRef.current = itemMetrics;
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        appliedHeaderMetricsRef.current = new WeakMap();
+        for (const itemId of headerMetricsInstancesRef.current.keys()) syncHeaderMetrics(itemId);
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [itemMetrics, syncHeaderMetrics]);
 
   // After all hooks: hold the surface until the worker pool can take the
   // first tokenization wave (≈100-300ms once per session; instant after).

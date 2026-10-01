@@ -4,9 +4,9 @@
  * OpenCode's V2 plugin API gained command EXECUTION in anomalyco/opencode
  * PR #44765 (issue #2185): the command draft grew an `add({ name, description,
  * execute })` method whose callback fully owns the invocation, so nothing
- * reaches the model unless it says so. That shape currently ships only on the
- * `beta` and `dev` dist-tags of `@opencode-ai/plugin`; `next` and `latest`
- * still carry a draft of `{ list, get, update, remove }` with no `add`.
+ * reaches the model unless it says so. Stable @opencode/plugin carries that
+ * shape; older V2 hosts have a draft of `{ list, get, update, remove }` with
+ * no `add`.
  *
  * `ctx.command.transform` therefore proves NOTHING: it exists on both. The only
  * honest probe is the draft handed to the callback, which is what this module
@@ -36,7 +36,7 @@ export const NATIVE_COMMANDS: ReadonlyArray<{ name: string; description: string 
   {
     name: "plannotator-review",
     description:
-      "Open the Plannotator code review UI for current changes or a PR URL; pass --git or --gitbutler to force that provider",
+      "Open the Plannotator code review UI for current changes, a directory, or a PR URL; pass --git or --gitbutler to force that provider",
   },
   {
     name: "plannotator-annotate",

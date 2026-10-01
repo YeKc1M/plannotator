@@ -8,7 +8,8 @@
  * Server-agnostic: takes a mode, server URL getter, and cwd getter.
  */
 
-import { formatClaudeLogEvent } from "./claude-review";
+import { resolve as resolvePath } from "node:path";
+import { allowedToolsOf, CLAUDE_SHELL_BLOCKED_WARNING, detectClaudeShellBlocked, disallowedToolsOf, formatClaudeLogEvent } from "./claude-review";
 import {
   MARKER_ENGINES,
   formatMarkerLogEvent,
@@ -301,6 +302,12 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
         stderr: "pipe",
         env: {
           ...process.env,
+          // PWD must name the spawn cwd, not the server's own directory (#1609):
+          // OpenCode 1.x resolves its session directory as `process.env.PWD ??
+          // process.cwd()`, so an inherited PWD would silently run the agent in
+          // the server's directory instead of the review's (PR pool checkouts,
+          // worktrees, workspace roots). A shell sets PWD to its cwd; so do we.
+          PWD: resolvePath(spawnCwd),
           PLANNOTATOR_AGENT_SOURCE: source,
           PLANNOTATOR_API_URL: getServerUrl(),
         },
@@ -428,6 +435,12 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
 
         if (exitCode !== 0 && stderrBuf) {
           entry.info.error = stderrBuf;
+        }
+
+        // #1627: a Claude job whose every shell command was refused (sandbox that
+        // cannot start, under dontAsk) otherwise finishes looking normal.
+        if (captureStdout && (provider === "claude" || spawnOptions?.engine === "claude") && detectClaudeShellBlocked(stdoutBuf, allowedToolsOf(entry.info.command), disallowedToolsOf(entry.info.command))) {
+          entry.info.warning = CLAUDE_SHELL_BLOCKED_WARNING;
         }
 
         // Ingest results before broadcasting completion so annotations arrive first

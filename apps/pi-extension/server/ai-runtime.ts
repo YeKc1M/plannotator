@@ -110,14 +110,7 @@ export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}):
 				// NOT run eagerly at startup. The initializer runs on first explicit
 				// activation (?activate= from the model picker) or first kimi
 				// session.
-				if (provider && "fetchModels" in provider) {
-					providerInitializers.set(
-						providerId,
-						ai.createBestEffortOnce(
-							() => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
-						),
-					);
-				}
+				deferModelDiscovery(providerId, provider);
 			}
 		} catch {
 			// Kimi CLI not available.

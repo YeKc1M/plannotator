@@ -35,13 +35,19 @@ import {
   probeAnnotateToken,
   selectAnnotateTokenTarget,
 } from "@plannotator/shared/annotate-target";
-import { parseReviewArgs } from "@plannotator/shared/review-args";
+import { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory } from "@plannotator/shared/review-args";
 import { urlToMarkdown, isConvertedSource } from "@plannotator/shared/url-to-markdown";
 import { buildLocalWorkspaceReview, type WorkspaceDiffType } from "@plannotator/server/review-workspace";
 import { statSync } from "fs";
 import path from "path";
 import { resolveValidatedTargetAgent } from "./agent-switch";
 import { deliverOpenCodePrompt } from "./prompt-delivery-error";
+import {
+  readLastUserAgent,
+  readMessageAgent,
+  resolveAddressableAgent,
+  resolveAnnotatedMessageAgent,
+} from "./message-agent";
 
 /** Shared dependencies injected by the plugin */
 export interface CommandDeps {
@@ -79,6 +85,25 @@ export async function handleReviewCommand(
     return;
   }
   const urlArg = reviewArgs.prUrl;
+  let reviewDirectory: string | undefined;
+  try {
+    const target = resolveReviewTarget(reviewArgs, directory ?? process.cwd());
+    reviewDirectory = target.directory;
+    const notice = formatIgnoredReviewWords(target);
+    if (notice) client.app.log({ level: "info", message: `[Plannotator] ${notice}` });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    client.app.log({ level: "error", message });
+    // app.log never reaches the TUI; toast so a refused target is visible.
+    try {
+      const result = client.tui?.showToast?.({ body: { title: "Plannotator", message, variant: "error" } });
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch {
+      // Toast delivery is best-effort.
+    }
+    return;
+  }
+  let reviewCwd = reviewDirectory ?? directory ?? process.cwd();
   const isPRMode = urlArg !== undefined;
   // Caller-pinned open state (--base/--diff-type): session-only seed, same
   // contract as the CLI. Fatal validation failures surface through the
@@ -90,6 +115,7 @@ export async function handleReviewCommand(
   let gitRef: string;
   let diffError: string | undefined;
   let initialFingerprint: string | undefined;
+  let initialFileIdentities: Record<string, string> | undefined;
   let userDiffType: DiffType | WorkspaceDiffType | undefined;
   let gitContext: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
   let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
@@ -138,8 +164,9 @@ export async function handleReviewCommand(
     client.app.log({ level: "info", message: "Opening code review UI..." });
 
     const config = loadConfig();
-    const cwd = directory ?? process.cwd();
-    const managedVcs = await detectManagedVcs(cwd, reviewArgs.vcsType);
+    const managedVcs = await detectManagedVcs(reviewCwd, reviewArgs.vcsType);
+    if (reviewDirectory) reviewCwd = await managedVcs?.getRoot?.(reviewCwd) ?? reviewCwd;
+    const cwd = reviewCwd;
     const forcedVcs = !!reviewArgs.vcsType && reviewArgs.vcsType !== "auto";
     if (managedVcs || forcedVcs) {
       const providerId = (managedVcs?.id ?? reviewArgs.vcsType) as
@@ -192,6 +219,7 @@ export async function handleReviewCommand(
         // server serves this patch under the detected default: a mixed-base
         // review.
         if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
+        initialFileIdentities = diffResult.fileIdentities;
       } catch (err) {
         client.app.log({ level: "error", message: err instanceof Error ? err.message : "Failed to prepare local review diff" });
         return;
@@ -234,7 +262,8 @@ export async function handleReviewCommand(
     gitRef,
     error: diffError,
     origin: "opencode",
-    project: (await detectProjectName()) ?? undefined,
+    project: (await detectProjectName(reviewDirectory ? reviewCwd : undefined)) ?? undefined,
+    includeReviewDirectory: !!reviewDirectory,
     diffType: isPRMode ? undefined : userDiffType,
     gitContext,
     initialBase: initialBaseFromFlags,
@@ -244,6 +273,7 @@ export async function handleReviewCommand(
     // undefined leaves PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck deciding.
     gitRemoteCheck: reviewArgs.gitRemoteCheck,
     initialFingerprint,
+    initialFileIdentities,
     prMetadata,
     workspace,
     agentCwd,
@@ -261,6 +291,7 @@ export async function handleReviewCommand(
   });
 
   const result = await server.waitForDecision();
+  result.feedback = withReviewDirectory(result.feedback, result.reviewDirectory);
   await Bun.sleep(1500);
   server.stop();
 
@@ -495,6 +526,16 @@ export async function handleAnnotateCommand(
 
   if (result.feedback) {
     if (sessionId) {
+      // The agent the user is talking to reads the feedback, not OpenCode's
+      // default agent (#1612). Unknown leaves the prompt unnamed as before.
+      let sessionAgent: string | undefined;
+      try {
+        const response = await client.session?.messages?.({ path: { id: sessionId } });
+        sessionAgent = readLastUserAgent(response?.data);
+      } catch {
+        sessionAgent = undefined;
+      }
+      const agent = await resolveAddressableAgent({ client, agent: sessionAgent, directory });
       const text = result.approved
         ? getAnnotateApprovedWithNotesPrompt("opencode", undefined, {
             context: `${isFolder ? "Folder" : "File"}: ${absolutePath}`,
@@ -510,6 +551,7 @@ export async function handleAnnotateCommand(
         prompt: {
           path: { id: sessionId },
           body: {
+            ...(agent && { agent }),
             parts: [{
               type: "text",
               text,
@@ -532,8 +574,8 @@ export async function handleAnnotateCommand(
 export async function handleAnnotateLastCommand(
   event: any,
   deps: CommandDeps
-): Promise<{ approved: boolean; feedback: string } | null> {
-  const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl } = deps;
+): Promise<{ approved: boolean; feedback: string; agent?: string } | null> {
+  const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl, directory } = deps;
   const startServer = deps.startAnnotateServer ?? startAnnotateServer;
 
   // @ts-ignore - Event properties contain arguments
@@ -556,6 +598,9 @@ export async function handleAnnotateLastCommand(
 
   const RECENT_LIMIT = 25;
   const recentMessages: { messageId: string; text: string; timestamp?: string }[] = [];
+  // Who wrote each candidate message (#1612), kept beside the payload rather
+  // than in it: the annotate server has no use for it.
+  const messageAgents: { messageId: string; agent?: string }[] = [];
   if (messages) {
     for (let i = messages.length - 1; i >= 0 && recentMessages.length < RECENT_LIMIT; i--) {
       const msg = messages[i];
@@ -564,11 +609,13 @@ export async function handleAnnotateLastCommand(
         .filter((p: any) => p.type === "text" && p.text?.trim())
         .map((p: any) => p.text);
       if (textParts.length === 0) continue;
+      const messageId = msg.info.id ?? `opencode-${i}`;
       recentMessages.push({
-        messageId: msg.info.id ?? `opencode-${i}`,
+        messageId,
         text: textParts.join("\n"),
         timestamp: msg.info.time?.created ? new Date(msg.info.time.created).toISOString() : undefined,
       });
+      messageAgents.push({ messageId, agent: readMessageAgent(msg.info) });
     }
   }
 
@@ -610,7 +657,18 @@ export async function handleAnnotateLastCommand(
     return null;
   }
 
-  return result.feedback
-    ? { approved: Boolean(result.approved), feedback: result.feedback }
-    : null;
+  if (!result.feedback) return null;
+
+  // The agent that wrote the annotated message answers the feedback (#1612);
+  // unknown or no longer addressable leaves the prompt unnamed as before.
+  const agent = await resolveAddressableAgent({
+    client,
+    agent: resolveAnnotatedMessageAgent(messageAgents, result),
+    directory,
+  });
+  return {
+    approved: Boolean(result.approved),
+    feedback: result.feedback,
+    ...(agent && { agent }),
+  };
 }

@@ -4,6 +4,7 @@ import {
   CODEX_FALLBACK_MODELS,
   claudeCatalogFromSdk,
   claudeModelVersion,
+  cliVersionFrom,
   modelSelectOptions,
   resolveEffortChoice,
   resolveModelChoice,
@@ -105,6 +106,23 @@ describe("claudeCatalogFromSdk", () => {
     expect(catalog.map((m) => m.id).sort()).toEqual(["claude-fable-5-1[1m]", "fable", "haiku", "opus", "opus[1m]", "sonnet"]);
   });
 
+  test("names pinned models from displayName when the description is only a tagline (Claude Code 2.1.282)", () => {
+    // 2.1.282 moved the model name from `description` ("Fable 5.1 · …") into
+    // `displayName` and left `description` as a tagline; the tagline must not
+    // become the label, or several rows read identically.
+    const rows = claudeCatalogFromSdk([
+      { value: "claude-fable-5-1", displayName: "Fable 5.1", description: "For your toughest challenges" },
+      { value: "claude-opus-4-8", displayName: "Opus 4.8", description: "Best for everyday, complex tasks" },
+      { value: "claude-opus-4-7", displayName: "Opus 4.7", description: "Best for everyday, complex tasks" },
+      { value: "claude-opus-4-6[1m]", displayName: "Opus 4.6", description: "Best for everyday, complex tasks" },
+    ]);
+    const label = (id: string) => rows.find((m) => m.id === id)?.label;
+    expect(label("claude-fable-5-1")).toBe("Fable 5.1");
+    expect(label("claude-opus-4-8")).toBe("Opus 4.8");
+    expect(label("claude-opus-4-7")).toBe("Opus 4.7");
+    expect(label("claude-opus-4-6[1m]")).toBe("Opus 4.6 (1M)");
+  });
+
   test("tolerates an empty or malformed reply", () => {
     expect(claudeCatalogFromSdk([])).toEqual([]);
     expect(claudeCatalogFromSdk([{ value: "" }, null as unknown as ClaudeSdkModelInfo])).toEqual([]);
@@ -194,4 +212,29 @@ test("claudeModelVersion reads major.minor and ignores date and [1m] suffixes", 
   expect(claudeModelVersion("claude-sonnet-4-20250514")).toBe("4");
   expect(claudeModelVersion("gpt-6-sol")).toBeUndefined();
   expect(claudeModelVersion(undefined)).toBeUndefined();
+});
+
+test("the Codex fallback defaults to GPT-6-Sol, which codex >= 0.155 lists", () => {
+  expect(CODEX_FALLBACK_MODELS.filter((m) => m.default).map((m) => m.id)).toEqual(["gpt-6-sol"]);
+});
+
+test("cliVersionFrom reads the version from claude --version and the codex userAgent", () => {
+  expect(cliVersionFrom("2.1.282 (Claude Code)\n")).toBe("2.1.282");
+  expect(cliVersionFrom("plannotator/0.155.1 (Mac OS 26.3.0; arm64) ghostty/1.3.1 (plannotator; 0)")).toBe("0.155.1");
+  expect(cliVersionFrom("codex_cli_rs/0.156.0-alpha.2 (Linux)")).toBe("0.156.0-alpha.2");
+  expect(cliVersionFrom("")).toBeUndefined();
+  expect(cliVersionFrom(undefined)).toBeUndefined();
+});
+
+test("cliVersionFrom prefers the line naming the tool, else the first line", () => {
+  const noisy = "node 18.2.0 warning: something\n2.1.282 (Claude Code)\n";
+  expect(cliVersionFrom(noisy, /claude code/i)).toBe("2.1.282");
+  // No line names the tool: the first line's version, never a later line's.
+  expect(cliVersionFrom("2.1.282\nnode 18.2.0", /claude code/i)).toBe("2.1.282");
+  expect(cliVersionFrom("no version here\n1.2.3")).toBeUndefined();
+});
+
+test("cliVersionFrom refuses an unbounded prerelease suffix", () => {
+  expect(cliVersionFrom(`0.156.0-${"a".repeat(200)}`)).toBeUndefined();
+  expect(cliVersionFrom("0.156.0-alpha.2")).toBe("0.156.0-alpha.2");
 });

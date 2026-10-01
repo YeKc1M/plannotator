@@ -23,6 +23,7 @@ import { useAgentSettings } from '../hooks/useAgentSettings';
 import type { AgentEngine, AgentMode, ReviewEngine } from '../hooks/useAgentSettings';
 import type { AgentLaunchParams } from '../hooks/useAgentJobs';
 import { ConfigRow, SegmentedPicker, Toggle, SelectMenu } from './AgentControls';
+import { ModelSourceHint } from './ModelSourceHint';
 import {
   CLAUDE_FALLBACK_MODELS,
   CODEX_FALLBACK_MODELS,
@@ -427,6 +428,12 @@ function JobCard({
         >
           <X size={12} />
         </button>
+      )}
+
+      {job.warning && (
+        <p role="status" data-agent-job-warning className="mt-1.5 ml-4 text-[10px] leading-snug text-warning">
+          {job.warning}
+        </p>
       )}
 
       {/* Error details — fallback for when the dockview detail panel is not available */}
@@ -1015,7 +1022,10 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
   ) => (
     <ConfigRow label="Model" stacked>
       {catalogs[engine].settled ? (
-        <SelectMenu value={value} options={modelSelectOptions(catalogs[engine].models, value)} onChange={onChange} />
+        <>
+          <SelectMenu value={value} options={modelSelectOptions(catalogs[engine].models, value)} onChange={onChange} />
+          <ModelSourceHint tool={engine} info={catalogs[engine]} className="text-[10px] text-muted-foreground/50" />
+        </>
       ) : (
         renderStaticChoice('Loading models…', <Loader2 className="animate-spin text-muted-foreground" size={11} />)
       )}

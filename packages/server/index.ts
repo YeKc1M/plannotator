@@ -8,10 +8,11 @@
  *   PLANNOTATOR_PORT   - Fixed port or inclusive range (default: random locally, 19432 for remote)
  *   PLANNOTATOR_ORIGIN - Explicit origin override; validated against AGENT_CONFIG
  *                        in packages/shared/agents.ts. Supported values:
- *                        "claude-code", "amp", "droid", "kiro-cli", "opencode",
- *                        "codex", "copilot-cli", "gemini-cli", "pi", "oh-my-pi".
+ *                        "claude-code", "amp", "droid", "kiro-cli", "mistral-vibe",
+ *                        "opencode", "codex", "copilot-cli", "gemini-cli", "pi", "oh-my-pi".
  */
 
+import { appHtmlResponse, likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
 import type { Origin } from "@plannotator/shared/agents";
 import { resolve } from "path";
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
@@ -42,6 +43,7 @@ import {
 import { getRepoInfo } from "./repo";
 import { detectProjectName } from "./project";
 import { loadConfig, saveConfig, detectGitUser, getServerConfig, resolveAIEnabled, resolveFeedbackHistory } from "./config";
+import { getAutoUpdateAdvert } from "./auto-update";
 import { appendFeedbackRecord, type FeedbackDecision } from "@plannotator/shared/feedback-archive";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
 import { readImprovementHook, getImprovementHookExpectedPath } from "@plannotator/shared/improvement-hooks";
@@ -57,6 +59,7 @@ import { isWSL } from "./browser";
 import { AI_QUERY_ENDPOINT, createAIRuntime } from "./ai-runtime";
 import { isAIEndpointPath, type AIEndpoints } from "@plannotator/ai";
 import { isArchiveDocumentMutation } from "@plannotator/shared/archive-mode";
+import { readPlanFile } from "@plannotator/shared/doc-resolve";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -91,6 +94,8 @@ export interface ServerOptions {
   mode?: "archive";
   /** Custom plan save path — used by archive mode to find saved plans */
   customPlanPath?: string | null;
+  /** The plan's file on disk as the harness reported it, trusted only when it holds `plan` */
+  planFilePath?: string;
 }
 
 export interface ServerResult {
@@ -107,6 +112,10 @@ export interface ServerResult {
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    /** The reviewer's only feedback was answers to the plan's questions
+     *  (`answersOnly: true` on /api/deny). Consumers pick the
+     *  `plan.answered` prompt through `composePlanDeniedMessage`. */
+    answersOnly?: boolean;
   }>;
   /** Wait for user to close (archive mode only) */
   waitForDone?: () => Promise<void>;
@@ -128,7 +137,8 @@ export interface ServerResult {
 export async function startPlannotatorServer(
   options: ServerOptions
 ): Promise<ServerResult> {
-  const { plan, origin, htmlContent, permissionMode, sharingEnabled = true, shareBaseUrl, pasteApiUrl, onReady, mode, customPlanPath } = options;
+  const { plan, origin, htmlContent, permissionMode, sharingEnabled = true, shareBaseUrl, pasteApiUrl, onReady, mode, customPlanPath, planFilePath } = options;
+  const planFile = mode === "archive" ? null : readPlanFile(planFilePath, plan);
 
   const isRemote = isRemoteSession();
   const wslFlag = await isWSL();
@@ -171,6 +181,7 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    answersOnly?: boolean;
   }) => void;
   let decisionPromise: Promise<{
     approved: boolean;
@@ -178,6 +189,7 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    answersOnly?: boolean;
   }>;
 
   if (mode !== "archive") {
@@ -329,14 +341,15 @@ export async function startPlannotatorServer(
                 shareBaseUrl,
                 isWSL: wslFlag,
                 serverConfig: getServerConfig(gitUser),
+                ...getAutoUpdateAdvert(),
               });
             }
-            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo, projectRoot: process.cwd(), isWSL: wslFlag, serverConfig: getServerConfig(gitUser) });
+            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo, projectRoot: process.cwd(), planDir: planFile?.dir, isWSL: wslFlag, serverConfig: getServerConfig(gitUser), ...getAutoUpdateAdvert() });
           }
 
           // API: Serve a linked markdown document
           if (url.pathname === "/api/doc" && req.method === "GET") {
-            return handleDoc(req);
+            return handleDoc(req, { planFile });
           }
 
           // API: Batch existence check for code-file paths the renderer detected
@@ -368,12 +381,13 @@ export async function startPlannotatorServer(
           // API: Update user config (write-back to ~/.plannotator/config.json)
           if (url.pathname === "/api/config" && req.method === "POST") {
             try {
-              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
+              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; autoUpdate?: unknown; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
               const toSave: Record<string, unknown> = {};
               if (body.displayName !== undefined) toSave.displayName = body.displayName;
               if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
               if (body.theme !== undefined) toSave.theme = body.theme;
               if (isFaviconStyle(body.favicon)) toSave.favicon = body.favicon;
+              if (typeof body.autoUpdate === "boolean") toSave.autoUpdate = body.autoUpdate;
               if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
               if (body.conventionalLabels !== undefined) toSave.conventionalLabels = body.conventionalLabels;
               if (body.pfmReminder !== undefined) toSave.pfmReminder = body.pfmReminder;
@@ -602,14 +616,17 @@ export async function startPlannotatorServer(
             let planSaveEnabled = true; // default to enabled for backwards compat
             let planSaveCustomPath: string | undefined;
             let draftGeneration: number | undefined;
+            let answersOnly = false;
             try {
               const body = (await req.json()) as {
                 feedback?: string;
                 planSave?: { enabled: boolean; customPath?: string };
                 draftGeneration?: number;
+                answersOnly?: unknown;
               };
               draftGeneration = readDraftGenerationFromBody(body);
               feedback = body.feedback || feedback;
+              answersOnly = body.answersOnly === true;
 
               // Capture plan save settings
               if (body.planSave !== undefined) {
@@ -630,7 +647,7 @@ export async function startPlannotatorServer(
             archivePlanDecision("denied", feedback);
 
             deleteDraft(draftKey, draftGeneration);
-            resolveDecision({ approved: false, feedback, savedPath });
+            resolveDecision({ approved: false, feedback, savedPath, ...(answersOnly ? { answersOnly: true } : {}) });
             return Response.json({ ok: true, savedPath });
           }
 
@@ -643,9 +660,7 @@ export async function startPlannotatorServer(
           }
 
           // Serve embedded HTML for all other routes (SPA)
-          return new Response(htmlContent, {
-            headers: { "Content-Type": "text/html" },
-          });
+          return appHtmlResponse(req, htmlContent, isRemote);
         },
 
         error(err) {
@@ -672,6 +687,10 @@ export async function startPlannotatorServer(
     })();
     return stopPromise;
   };
+
+  // Remote sessions serve the app page compressed (#1617); start the likely
+  // encoding (gzip over plain http) now so the first load does not wait.
+  if (isRemote) prewarmAppHtml(htmlContent, likelyAppHtmlEncoding(false));
 
   // The cache warm must never gate the listening socket. Its async filesystem
   // walk yields between directories while requests remain serviceable.

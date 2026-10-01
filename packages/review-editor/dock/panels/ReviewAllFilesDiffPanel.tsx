@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
 import type { IDockviewPanelProps } from 'dockview-react';
 import { AllFilesCodeView } from '../../components/AllFilesCodeView';
 import { CommitDescriptionHeader } from '../../components/CommitDescriptionHeader';
+import { ImageDiffPreview } from '../../components/ImageDiffPreview';
 import { useReviewState } from '../ReviewStateContext';
 
 export const ReviewAllFilesDiffPanel: React.FC<IDockviewPanelProps> = () => {
@@ -12,6 +13,30 @@ export const ReviewAllFilesDiffPanel: React.FC<IDockviewPanelProps> = () => {
   // file list the shape, and each file expands on demand. The card rides
   // INSIDE the scroller (leadingContent), so it scrolls away with the diff.
   const commitInfo = state.commitInfo;
+  // Before/After previews for changed images (#1598), only when the server
+  // advertised it. Stable per snapshot so header slots do not churn.
+  const snapshotId = state.snapshotId;
+  const compact = state.isCompactTouchLayout;
+  const renderImagePreview = useMemo(
+    () =>
+      state.imagePreviewAvailable
+        ? ({ file, fallback, tooLargeFallback, onHeightChange }: Parameters<NonNullable<React.ComponentProps<typeof AllFilesCodeView>['renderImagePreview']>>[0]) => (
+            <ImageDiffPreview
+              key={`${snapshotId ?? ''}:${file.path}`}
+              filePath={file.path}
+              status={file.status}
+              snapshotId={snapshotId}
+              variant="all-files"
+              compact={compact}
+              fallback={fallback}
+              tooLargeFallback={tooLargeFallback}
+              onHeightChange={onHeightChange}
+            />
+          )
+        : undefined,
+    [state.imagePreviewAvailable, snapshotId, compact],
+  );
+
   // Stable element identity per commit — an inline JSX literal would be a new
   // object every context re-render and churn the measuring ResizeObserver in
   // AllFilesCodeView (leadingContent is in its effect deps).
@@ -39,6 +64,7 @@ export const ReviewAllFilesDiffPanel: React.FC<IDockviewPanelProps> = () => {
       reviewBase={state.reviewBase}
       reviewSnapshotId={state.feedbackDiffContext?.snapshotId}
       contextExpansionAvailable={state.contextExpansionAvailable}
+      renderImagePreview={renderImagePreview}
       compactTouchLayout={state.isCompactTouchLayout}
       onLineSelection={state.onLineSelection}
       onAddAnnotationForFile={state.onAddAnnotationForFile}

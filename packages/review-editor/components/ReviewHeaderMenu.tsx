@@ -11,21 +11,20 @@ import { MenuVersionSection } from '@plannotator/ui/components/MenuVersionSectio
 import { ReviewAgentsIcon } from '@plannotator/ui/components/ReviewAgentsIcon';
 import { TextShimmer } from '@plannotator/ui/components/TextShimmer';
 import { SparklesIcon } from '@plannotator/ui/components/SparklesIcon';
-import { GitHubIcon } from '@plannotator/ui/components/GitHubIcon';
-import { GitLabIcon } from '@plannotator/ui/components/GitLabIcon';
+import { PRPlatformIcon } from '@plannotator/ui/components/PRPlatformIcon';
 import { modKey } from '@plannotator/ui/utils/platform';
 import type { UpdateInfo } from '@plannotator/ui/hooks/useUpdateCheck';
 import type { Origin } from '@plannotator/shared/agents';
 
 export interface CompactReviewDestination {
   value: 'agent' | 'platform';
-  platform: 'github' | 'gitlab';
+  platform: 'github' | 'gitlab' | 'bitbucket';
   platformLabel: string;
   onChange: (value: 'agent' | 'platform') => void;
 }
 
 export interface CompactReviewAction {
-  id: 'exit' | 'feedback' | 'approve' | 'copy' | 'note' | 'discard-finish';
+  id: 'exit' | 'feedback' | 'approve' | 'copy' | 'note' | 'comment' | 'discard-finish';
   label: string;
   subtitle?: string;
   onSelect: () => void;
@@ -142,9 +141,7 @@ export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
                           }`}
                         >
                           {destination === 'platform'
-                            ? compactDestination.platform === 'gitlab'
-                              ? <GitLabIcon className="w-3.5 h-3.5" />
-                              : <GitHubIcon className="w-3.5 h-3.5" />
+                            ? <PRPlatformIcon platform={compactDestination.platform} className="w-3.5 h-3.5" />
                             : <AgentDestinationIcon />
                           }
                           <span className="truncate">{label}</span>
@@ -380,7 +377,7 @@ const CompactReviewActionIcon: React.FC<{ kind: CompactReviewAction['id'] }> = (
       </svg>
     );
   }
-  if (kind === 'feedback' || kind === 'note') {
+  if (kind === 'feedback' || kind === 'note' || kind === 'comment') {
     return (
       <svg className="w-3.5 h-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-4l-4 4v-4z" />

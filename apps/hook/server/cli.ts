@@ -124,6 +124,11 @@ export function isVersionInvocation(args: string[]): boolean {
 
 declare const __CLI_VERSION__: string;
 
+/** The release version baked in at compile time; undefined for dev/source runs. */
+export function getCliVersion(): string | undefined {
+  return typeof __CLI_VERSION__ !== "undefined" ? __CLI_VERSION__ : undefined;
+}
+
 export function formatVersion(): string {
   return `plannotator ${typeof __CLI_VERSION__ !== "undefined" ? __CLI_VERSION__ : "dev"}`;
 }
@@ -141,7 +146,7 @@ export function formatTopLevelHelp(): string {
     "  plannotator --help",
     "  plannotator --version, -v",
     "  plannotator [--browser <name>]",
-    "  plannotator review [--git | --gitbutler] [--base <ref>] [--diff-type <type>] [--patch-file <path | ->] [--tailscale] [PR_URL]",
+    "  plannotator review [--git | --gitbutler] [--base <ref>] [--diff-type <type>] [--patch-file <path | ->] [--tailscale] [DIRECTORY | PR_URL]",
     "  plannotator annotate <file.md | file.txt | file.html | https://... | folder/>  [--markdown] [--no-jina] [--tailscale] [--gate] [--json] [--hook] [--require-approval] [--result-file <path>]",
     "  plannotator annotate-last [--stdin] [--tailscale] [--gate] [--json] [--hook]",
     "  plannotator copilot-last [--gate] [--json] [--hook]",
@@ -175,9 +180,9 @@ export function formatTopLevelHelp(): string {
 export const SUBCOMMAND_HELP: Record<string, string> = {
   review: [
     "Usage:",
-    "  plannotator review [--git | --gitbutler] [--base <ref>] [--diff-type <type>] [--local | --no-local] [--patch-file <path | ->] [--no-git-remote-check] [--tailscale] [--json] [PR_URL]",
+    "  plannotator review [--git | --gitbutler] [--base <ref>] [--diff-type <type>] [--local | --no-local] [--patch-file <path | ->] [--no-git-remote-check] [--tailscale] [--json] [DIRECTORY | PR_URL]",
     "",
-    "Review local VCS changes or a GitHub/GitLab pull request in the browser.",
+    "Review local VCS changes or a GitHub, GitLab or Bitbucket Cloud pull request in the browser.",
     "",
     "Options:",
     "  --git         Force git as the VCS (skip auto-detection)",
@@ -199,9 +204,13 @@ export const SUBCOMMAND_HELP: Record<string, string> = {
     "                or { \"gitRemoteCheck\": false } in ~/.plannotator/config.json.",
     "  --tailscale   Publish the loopback session over your tailnet via tailscale serve (HTTPS)",
     "  --json        Emit one decision/message JSON record instead of plaintext",
-    "  PR_URL        GitHub PR or GitLab MR URL to review",
+    "  PR_URL        GitHub PR, GitLab MR or Bitbucket Cloud PR URL to review",
+    "  DIRECTORY     Review a repo, worktree, or multi-repo workspace at this path",
+    "                Relative to the invoking directory; quote paths containing spaces.",
     "",
-    "  --patch-file cannot be combined with PR_URL.",
+    "  Accepts one DIRECTORY or PR_URL. Neither can be combined with --patch-file.",
+    "  A sole word or a path-like word (./x, ../x, a/b, ~/x) is a directory target;",
+    "  other words are ignored with a notice.",
     "",
     "JSON output:",
     '  { "decision": "approved" | "annotated" | "dismissed", "message": string }',
@@ -213,6 +222,8 @@ export const SUBCOMMAND_HELP: Record<string, string> = {
     "Examples:",
     "  plannotator review",
     "  plannotator review --git",
+    "  plannotator review ../feature-worktree",
+    "  plannotator review ./backend --diff-type last-commit",
     "  plannotator review --gitbutler",
     "  plannotator review --base feature/part-1   # review one layer of a stacked branch",
     "  plannotator review --patch-file reading.diff",

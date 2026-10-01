@@ -101,7 +101,7 @@ import {
 } from "@plannotator/server/goal-setup";
 import { type DiffType, detectManagedVcs, prepareLocalReviewDiff, gitRuntime } from "@plannotator/server/vcs";
 import { loadConfig, resolveDefaultDiffType, resolveSharingEnabled } from "@plannotator/shared/config";
-import { parseReviewArgs, type ParsedReviewArgs } from "@plannotator/shared/review-args";
+import { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory, type ParsedReviewArgs } from "@plannotator/shared/review-args";
 import { resolveReviewOpenState, type ReviewOpenState } from "@plannotator/shared/review-open-state";
 import { listBranches, type AvailableBranches } from "@plannotator/shared/review-core";
 import {
@@ -115,7 +115,7 @@ import {
   selectAnnotateTokenTarget,
 } from "@plannotator/shared/annotate-target";
 import { createWorktreePool, type WorktreePool, type PoolEntry } from "@plannotator/shared/worktree-pool";
-import { parsePRUrl, checkPRAuth, fetchPR, getCliName, getCliInstallUrl, getMRLabel, getMRNumberLabel, getDisplayRepo } from "@plannotator/server/pr";
+import { parsePRUrl, checkPRAuth, fetchPR, getCliName, getCliInstallUrl, getMRLabel, getMRNumberLabel, getDisplayRepo, getPlatformLabel, getPRNumber, getPRHeadFetchSpec, getPRCloneCommand } from "@plannotator/server/pr";
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
 import { enableTailscaleServe } from "@plannotator/server/tailscale-serve";
 import { writeUrlQr } from "@plannotator/server/qr";
@@ -133,12 +133,13 @@ import {
 import { rmSync, realpathSync, existsSync } from "fs";
 import { parseRemoteUrl } from "@plannotator/shared/repo";
 import {
-  getPlanDeniedPrompt,
+  composePlanDeniedMessage,
   getPlanToolName,
   buildPlanFileRule,
 } from "@plannotator/shared/prompts";
 import { buildReviewOutput, supportsReviewApprovalNotes } from "./review-output";
-import { registerSession, unregisterSession, listSessions } from "@plannotator/server/sessions";
+import { registerSession, unregisterSession, listSessions, type SessionInfo } from "@plannotator/server/sessions";
+import { enableAutoUpdateNotice, scheduleAutoUpdateCheck } from "@plannotator/server/auto-update";
 import { openBrowser } from "@plannotator/server/browser";
 import { inlineHtmlLocalAssets } from "@plannotator/server/html-assets";
 import { installAgentTerminalRuntime } from "@plannotator/server/agent-terminal-runtime";
@@ -164,9 +165,11 @@ import {
   findSessionLogsByAncestorWalk,
   findSessionLogsForCwd,
   getRecentRenderedMessages,
+  getRecentVibeMessages,
   resolveDroidSessionLogForCwd,
-  resolveSessionLogByAncestorPids,
-  resolveSessionLogByCwdScan,
+  describeClaudeSessionResolutionFailure,
+  resolveClaudeSessionLog,
+  resolveVibeSessionLogForCwd,
   type RenderedMessage,
 } from "./session-log";
 import {
@@ -177,11 +180,13 @@ import {
   resolveCodexStopPlan,
 } from "./codex-session";
 import { findCopilotPlanContent, findCopilotSessionByAncestorPids, findCopilotSessionForCwd, getRecentCopilotMessages } from "./copilot-session";
+import { resolveLatestVibePlan } from "./vibe-plan";
 import {
   formatInteractiveNoArgClarification,
   formatSubcommandHelp,
   formatTopLevelHelp,
   formatVersion,
+  getCliVersion,
   isInteractiveNoArgInvocation,
   isSubcommandHelpInvocation,
   isTopLevelHelpInvocation,
@@ -366,6 +371,19 @@ const emitAnnotateOutcome = createAnnotateOutcomeEmitter({
   hook: hookFlag,
   json: jsonFlag,
 });
+
+/** Directory target (absolute) or undefined; exits 1 on a typo'd/ambiguous target. */
+function resolveCliReviewDirectory(reviewArgs: ParsedReviewArgs, cwd: string): string | undefined {
+  try {
+    const target = resolveReviewTarget(reviewArgs, cwd);
+    const notice = formatIgnoredReviewWords(target);
+    if (notice) console.error(notice);
+    return target.directory;
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+}
 
 /**
  * Resolve the `--base` / `--diff-type` open-state seed for a review
@@ -572,6 +590,15 @@ if (isInteractiveNoArgInvocation(args, process.stdin.isTTY)) {
 // Ensure session cleanup on exit
 process.on("exit", () => unregisterSession());
 
+// Opt-in auto-update (#1634). Only this compiled-CLI entry point arms it; the
+// OpenCode and Pi servers never do. Both calls are no-ops for a dev/source run
+// (no __CLI_VERSION__), and the check itself is scheduled, never awaited.
+enableAutoUpdateNotice(getCliVersion());
+function registerCliSession(info: SessionInfo): void {
+  registerSession(info);
+  scheduleAutoUpdateCheck(getCliVersion());
+}
+
 // Route fatal signals through process.exit() so "exit" handlers run — by
 // default a SIGINT/SIGTERM death skips them, leaking background-warmup
 // children and stale `git worktree` registrations (the --local PR checkout
@@ -610,8 +637,13 @@ const pasteApiUrl = process.env.PLANNOTATOR_PASTE_URL || undefined;
 //     still be detected as themselves. OMPCODE still wins over the terminal
 //     fallback below.
 //
+//   > Mistral Vibe — detected from the pre_tool hook payload (hook_event_name
+//     "pre_tool" + tool_name "exit_plan_mode" is unambiguous vs Claude/Gemini),
+//     so the installer's hook command needs no env prefix. PLANNOTATOR_ORIGIN=
+//     mistral-vibe remains the manual override above.
+//
 // To add a new agent, also add an entry to AGENT_CONFIG in
-// packages/shared/agents.ts (see header comment there).
+// packages/core/agents.ts (see header comment there).
 const originOverride = process.env.PLANNOTATOR_ORIGIN as Origin | undefined;
 const detectedOrigin: Origin =
   (originOverride && originOverride in AGENT_CONFIG) ? originOverride :
@@ -702,6 +734,10 @@ function emitOpenCodeAnnotateOutcome(result: {
     console.log(JSON.stringify({
       decision: "approved",
       ...(result.feedback ? { feedback: result.feedback } : {}),
+      // Approve-with-notes is about a message too: the plugin reads which one
+      // to route the notes to the agent that wrote it (#1612).
+      ...(result.selectedMessageId && { selectedMessageId: result.selectedMessageId }),
+      ...(result.feedbackScope && { feedbackScope: result.feedbackScope }),
     }));
     return;
   }
@@ -798,7 +834,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -840,6 +876,8 @@ if (args[0] === "sessions") {
     process.exit(1);
   }
   const urlArg = reviewArgs.prUrl;
+  const reviewDirectory = resolveCliReviewDirectory(reviewArgs, process.env.PLANNOTATOR_CWD || process.cwd());
+  let reviewCwd = reviewDirectory ?? process.cwd();
   const isPRMode = urlArg !== undefined;
   const useLocal = isPRMode && reviewArgs.useLocal;
   // Caller-pinned open state: `--base` / `--diff-type` seed this session only
@@ -852,6 +890,7 @@ if (args[0] === "sessions") {
   let gitRef: string;
   let diffError: string | undefined;
   let initialFingerprint: string | undefined;
+  let initialFileIdentities: Record<string, string> | undefined;
   let gitContext: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
   let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
   let prPatchIncomplete = false;
@@ -881,6 +920,7 @@ if (args[0] === "sessions") {
       console.error("Supported formats:");
       console.error("  GitHub: https://github.com/owner/repo/pull/123");
       console.error("  GitLab: https://gitlab.com/group/project/-/merge_requests/42");
+      console.error("  Bitbucket Cloud: https://bitbucket.org/workspace/repo/pull-requests/7");
       process.exit(1);
     }
 
@@ -891,8 +931,10 @@ if (args[0] === "sessions") {
       await checkPRAuth(prRef);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("not found") || msg.includes("ENOENT")) {
-        console.error(`${cliName === "gh" ? "GitHub" : "GitLab"} CLI (${cliName}) is not installed.`);
+      // REST-only platforms (Bitbucket) have no CLI to be missing; their auth
+      // error already names the env vars and token scopes to set.
+      if (cliName && (msg.includes("not found") || msg.includes("ENOENT"))) {
+        console.error(`${getPlatformLabel(prRef)} CLI (${cliName}) is not installed.`);
         console.error(`Install it from ${cliUrl}`);
       } else {
         console.error(msg);
@@ -924,18 +966,18 @@ if (args[0] === "sessions") {
       let sessionDir: string | undefined;
       try {
         const repoDir = process.cwd();
-        const identifier = prMetadata.platform === "github"
-          ? `${prMetadata.owner}-${prMetadata.repo}-${prMetadata.number}`
-          : `${prMetadata.projectPath.replace(/\//g, "-")}-${prMetadata.iid}`;
+        const identifier = `${getDisplayRepo(prMetadata).replace(/\//g, "-")}-${getPRNumber(prMetadata)}`;
         const suffix = Math.random().toString(36).slice(2, 8);
         // Resolve tmpdir to its real path — on macOS, tmpdir() returns /var/folders/...
         // but processes report /private/var/folders/... which breaks path stripping.
         sessionDir = path.join(realpathSync(tmpdir()), `plannotator-pr-${identifier}-${suffix}`);
-        const prNumber = prMetadata.platform === "github" ? prMetadata.number : prMetadata.iid;
+        const prNumber = getPRNumber(prMetadata);
         localPath = path.join(sessionDir, "pool", `pr-${prNumber}`);
-        const fetchRefStr = prMetadata.platform === "github"
-          ? `refs/pull/${prMetadata.number}/head`
-          : `refs/merge-requests/${prMetadata.iid}/head`;
+        // GitHub/GitLab: the PR head ref on origin. Bitbucket: the source
+        // branch, from the fork's URL when the PR comes from one.
+        const headFetch = getPRHeadFetchSpec(prMetadata);
+        const fetchRefStr = headFetch.ref;
+        const headRemote = headFetch.remote ?? "origin";
 
         // Validate inputs from platform API to prevent git flag/path injection
         if (prMetadata.baseBranch.includes('..') || prMetadata.baseBranch.startsWith('-')) throw new Error(`Invalid base branch: ${prMetadata.baseBranch}`);
@@ -948,9 +990,7 @@ if (args[0] === "sessions") {
           if (remoteResult.exitCode === 0) {
             const remoteUrl = remoteResult.stdout.trim();
             const currentRepo = parseRemoteUrl(remoteUrl);
-            const prRepo = prMetadata.platform === "github"
-              ? `${prMetadata.owner}/${prMetadata.repo}`
-              : prMetadata.projectPath;
+            const prRepo = getDisplayRepo(prMetadata);
             const repoMatches = !!currentRepo && currentRepo.toLowerCase() === prRepo.toLowerCase();
             // Extract host from remote URL to avoid cross-instance false positives (GHE)
             const sshHost = remoteUrl.match(/^[^@]+@([^:]+):/)?.[1];
@@ -965,11 +1005,8 @@ if (args[0] === "sessions") {
         const warmupPath = localPath;
         const warmupSessionDir = sessionDir;
         const { baseBranch, baseSha, url: prUrl } = prMetadata;
-        const platform = prMetadata.platform;
-        const host = prMetadata.host;
-        const prRepo = platform === "github"
-          ? `${prMetadata.owner}/${prMetadata.repo}`
-          : prMetadata.projectPath;
+        const prRepo = getDisplayRepo(prMetadata);
+        const cloneCommand = getPRCloneCommand(prMetadata, localPath);
         // Validate repo identifier to prevent flag injection via crafted URLs
         if (/^-/.test(prRepo)) throw new Error(`Invalid repository identifier: ${prRepo}`);
 
@@ -1013,8 +1050,12 @@ if (args[0] === "sessions") {
               // Best-effort baseSha availability — mirrors ensureObjectAvailable
               const catRes = await runStep(["git", "cat-file", "-t", baseSha], { cwd: repoDir });
               if (catRes.exitCode !== 0) await runStep(["git", "fetch", "origin", "--", baseSha], { cwd: repoDir });
-              const headFetchRes = await runStep(["git", "fetch", "origin", "--", fetchRefStr], { cwd: repoDir });
-              if (headFetchRes.exitCode !== 0) throw new Error(`git fetch origin ${fetchRefStr} failed: ${headFetchRes.stderr.trim()}`);
+              const headFetchRes = await runStep(["git", "fetch", headRemote, "--", fetchRefStr], {
+                cwd: repoDir,
+                // A fork URL fetch runs in the background: never prompt for credentials.
+                ...(headFetch.remote ? { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } as Record<string, string> } : {}),
+              });
+              if (headFetchRes.exitCode !== 0) throw new Error(`git fetch ${headRemote} ${fetchRefStr} failed: ${headFetchRes.stderr.trim()}`);
 
               const addRes = await runStep(["git", "worktree", "add", "--detach", warmupPath, "FETCH_HEAD"], { cwd: repoDir });
               if (addRes.exitCode !== 0) throw new Error(`git worktree add failed: ${addRes.stderr.trim()}`);
@@ -1022,27 +1063,22 @@ if (args[0] === "sessions") {
             })()
           : (async () => {
               // ── Cross-repo: shallow clone + fetch PR head ──
-              const cli = platform === "github" ? "gh" : "glab";
-              // gh/glab repo clone doesn't accept --hostname; set GH_HOST/GITLAB_HOST env instead
-              const isDefaultHost = host === "github.com" || host === "gitlab.com";
-              const cloneEnv = isDefaultHost ? undefined : {
-                ...process.env,
-                ...(platform === "github" ? { GH_HOST: host } : { GITLAB_HOST: host }),
-              } as Record<string, string>;
+              // gh/glab repo clone doesn't accept --hostname, so the clone
+              // command carries GH_HOST/GITLAB_HOST env overrides instead.
+              const cloneEnv = cloneCommand.env
+                ? { ...process.env, ...cloneCommand.env } as Record<string, string>
+                : undefined;
 
               // Step 1: Fast skeleton clone (no checkout, depth 1 — minimal data transfer)
-              const cloneResult = await runStep(
-                [cli, "repo", "clone", prRepo, warmupPath, "--", "--depth=1", "--no-checkout"],
-                { env: cloneEnv },
-              );
+              const cloneResult = await runStep(cloneCommand.argv, { env: cloneEnv });
               if (cloneResult.exitCode !== 0) {
-                throw new Error(`${cli} repo clone failed: ${cloneResult.stderr.trim()}`);
+                throw new Error(`${cloneCommand.argv[0] === "git" ? "git clone" : `${cloneCommand.argv[0]} repo clone`} failed: ${cloneResult.stderr.trim()}`);
               }
 
               // Step 2: Fetch only the PR head ref (targeted, much faster than full fetch)
               const fetchResult = await runStep(
-                ["git", "fetch", "--depth=200", "origin", fetchRefStr],
-                { cwd: warmupPath },
+                ["git", "fetch", "--depth=200", headRemote, fetchRefStr],
+                { cwd: warmupPath, ...(cloneCommand.env ? { env: cloneEnv } : {}) },
               );
               if (fetchResult.exitCode !== 0) throw new Error(`Failed to fetch PR head ref: ${fetchResult.stderr.trim()}`);
 
@@ -1118,7 +1154,8 @@ if (args[0] === "sessions") {
   } else {
     // --- Local Review Mode ---
     const config = loadConfig();
-    const managedVcs = await detectManagedVcs(process.cwd(), reviewArgs.vcsType);
+    const managedVcs = await detectManagedVcs(reviewCwd, reviewArgs.vcsType);
+    if (reviewDirectory) reviewCwd = await managedVcs?.getRoot?.(reviewCwd) ?? reviewCwd;
     const forcedVcs = !!reviewArgs.vcsType && reviewArgs.vcsType !== "auto";
 
     if (managedVcs || forcedVcs) {
@@ -1133,8 +1170,10 @@ if (args[0] === "sessions") {
         isWorkspace: false,
         providerId,
         resolvedDefaultDiffType: resolveDefaultDiffType(config),
+        cwd: reviewCwd,
       });
       const diffResult = await prepareLocalReviewDiff({
+        cwd: reviewCwd,
         vcsType: reviewArgs.vcsType,
         requestedDiffType: openState.requestedDiffType,
         requestedBase: openState.requestedBase,
@@ -1151,6 +1190,7 @@ if (args[0] === "sessions") {
       // the server would serve this patch under the detected default: a
       // mixed-base review (wrong file-content fetches, wrong agent prompts).
       if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
+      initialFileIdentities = diffResult.fileIdentities;
     } else {
       // Multi-repo workspace review has no base parameter — the open-state
       // flags always error here.
@@ -1159,7 +1199,7 @@ if (args[0] === "sessions") {
         isWorkspace: true,
         resolvedDefaultDiffType: resolveDefaultDiffType(config),
       });
-      workspace = await buildLocalWorkspaceReview(process.cwd(), {
+      workspace = await buildLocalWorkspaceReview(reviewCwd, {
         configuredDiffType: resolveDefaultDiffType(config),
         hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
       });
@@ -1175,7 +1215,7 @@ if (args[0] === "sessions") {
     }
   }
 
-  const reviewProject = (await detectProjectName()) ?? "_unknown";
+  const reviewProject = (await detectProjectName(reviewCwd)) ?? "_unknown";
 
   // Start review server (even if empty - user can switch diff types in local mode)
   const server = await startReviewServer({
@@ -1184,6 +1224,7 @@ if (args[0] === "sessions") {
     error: diffError,
     origin: detectedOrigin,
     project: reviewProject,
+    includeReviewDirectory: !!reviewDirectory,
     diffType: workspace ? (initialDiffType ?? workspace.diffType) : gitContext ? (initialDiffType ?? "unstaged") : initialDiffType,
     gitContext,
     initialBase: initialBaseFromFlags,
@@ -1193,6 +1234,7 @@ if (args[0] === "sessions") {
     // undefined leaves PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck deciding.
     gitRemoteCheck: reviewArgs.gitRemoteCheck,
     initialFingerprint,
+    initialFileIdentities,
     prMetadata,
     prPatchIncomplete,
     workspace,
@@ -1204,6 +1246,7 @@ if (args[0] === "sessions") {
     // this CLI's origins may see approve-carrying menu items (spec §6.4).
     approvalNotesSupported: supportsReviewApprovalNotes(detectedOrigin),
     htmlContent: reviewHtmlContent,
+    tailnetPublished: tailscaleFlag,
     onCleanup: worktreeCleanup,
     onReady: async (url, isRemote, port) => {
       if (tailscaleFlag) {
@@ -1218,7 +1261,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1238,6 +1281,7 @@ if (args[0] === "sessions") {
   server.stop();
 
   // Output feedback (captured by slash command)
+  result.feedback = withReviewDirectory(result.feedback, result.reviewDirectory);
   const output = buildReviewOutput(result, detectedOrigin);
   console.log(jsonFlag ? JSON.stringify(output) : output.message);
   process.exit(0);
@@ -1469,7 +1513,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1503,6 +1547,7 @@ if (args[0] === "sessions") {
   const isCodex = !!codexThreadId;
   const isDroid = detectedOrigin === "droid";
   const isCopilot = detectedOrigin === "copilot-cli";
+  const isVibe = detectedOrigin === "mistral-vibe";
 
   // Collect up to N recent assistant messages so the user can pick the right
   // one — defaults to the same selection as the legacy "last message"
@@ -1519,7 +1564,7 @@ if (args[0] === "sessions") {
   // earlier branch claims the invocation.
   let copilotLockSessionDir: string | null = null;
   let copilotSessionDir: string | null = null;
-  if (!stdinFlag && !isCodex && !isDroid) {
+  if (!stdinFlag && !isCodex && !isDroid && !isVibe) {
     copilotLockSessionDir = findCopilotSessionByAncestorPids();
     copilotSessionDir = copilotLockSessionDir ??
       (isCopilot ? findCopilotSessionForCwd(projectRoot) : null);
@@ -1595,22 +1640,27 @@ if (args[0] === "sessions") {
         .map((m) => ({ messageId: m.messageId, text: m.text, lineNumbers: [], timestamp: m.timestamp }));
       lastMessage = recentMessages[0] ?? null;
     }
+  } else if (isVibe) {
+    // Mistral Vibe path: resolve the session log for the current cwd from
+    // $VIBE_HOME/logs/session/ (indexed by .session_index.json), then read
+    // the most recent rendered assistant messages from messages.jsonl.
+    if (process.env.PLANNOTATOR_DEBUG) {
+      console.error(`[DEBUG] Vibe detected, project root: ${projectRoot}`);
+    }
+    const vibeLog = resolveVibeSessionLogForCwd(projectRoot);
+    if (process.env.PLANNOTATOR_DEBUG) {
+      console.error(`[DEBUG] Vibe selected log: ${vibeLog ?? "(none)"}`);
+    }
+    if (vibeLog) {
+      recentMessages = getRecentVibeMessages(vibeLog, RECENT_MESSAGES_LIMIT)
+        .map((m) => ({ messageId: m.messageId, text: m.text, lineNumbers: [], timestamp: m.timestamp }));
+      lastMessage = recentMessages[0] ?? null;
+    }
   } else {
     // Claude Code path: resolve session log
     //
-    // Strategy (most precise → least precise):
-    // 1. Ancestor-PID session metadata: walk up the process tree checking
-    //    ~/.claude/sessions/<pid>.json at each hop. When invoked from a slash
-    //    command's `!` bang, the direct parent is a bash subshell — Claude's
-    //    session file is a few hops up. Deterministic when it matches.
-    // 2. Cwd-scan of session metadata: read every ~/.claude/sessions/*.json,
-    //    filter by cwd, pick the most recent startedAt. Better than mtime
-    //    guessing because it uses session-level metadata.
-    // 3. CWD slug match (mtime-based): legacy behavior — picks the most
-    //    recently modified jsonl in the project dir. Fragile when multiple
-    //    sessions exist for the same project.
-    // 4. Ancestor directory walk: handles the case where the user `cd`'d
-    //    deeper into a subdirectory after session start.
+    // Prefer precise session metadata. Heuristic cwd/ancestor fallbacks are
+    // only safe when no metadata identifies the invoking session.
 
     if (process.env.PLANNOTATOR_DEBUG) {
       console.error(`[DEBUG] Project root: ${projectRoot}`);
@@ -1639,19 +1689,20 @@ if (args[0] === "sessions") {
       }
     }
 
-    // 1. Walk ancestor PIDs for a matching session metadata file
-    const ancestorLog = resolveSessionLogByAncestorPids();
-    tryLogCandidates("Ancestor PID session metadata", () => ancestorLog ? [ancestorLog] : []);
-
-    // 2. Scan all session metadata files for one whose cwd matches
-    const cwdScanLog = resolveSessionLogByCwdScan({ cwd: projectRoot });
-    tryLogCandidates("Cwd-scan session metadata", () => cwdScanLog ? [cwdScanLog] : []);
-
-    // 3. Fall back to CWD slug match (mtime-based)
-    tryLogCandidates("CWD slug match (mtime)", () => findSessionLogsForCwd(projectRoot));
-
-    // 4. Fall back to ancestor directory walk
-    tryLogCandidates("Directory ancestor walk", () => findSessionLogsByAncestorWalk(projectRoot));
+    const resolution = resolveClaudeSessionLog({ cwd: projectRoot });
+    if (resolution.status === "identified") {
+      tryLogCandidates(
+        `Claude session metadata (${resolution.source})`,
+        () => resolution.logPath ? [resolution.logPath] : [],
+      );
+    } else if (resolution.status === "unavailable") {
+      tryLogCandidates("CWD slug match (mtime)", () => findSessionLogsForCwd(projectRoot));
+      tryLogCandidates("Directory ancestor walk", () => findSessionLogsByAncestorWalk(projectRoot));
+    }
+    if (!lastMessage) {
+      const reason = describeClaudeSessionResolutionFailure(resolution);
+      if (reason) console.error(reason);
+    }
   }
 
   if (!lastMessage) {
@@ -1710,7 +1761,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1760,7 +1811,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1823,7 +1874,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -1853,10 +1904,11 @@ if (args[0] === "sessions") {
     ...(result.feedback && { feedback: result.feedback }),
     ...(result.savedPath && { savedPath: result.savedPath }),
     ...(result.agentSwitch && { agentSwitch: result.agentSwitch }),
+    ...(result.answersOnly && { answersOnly: true }),
   }));
   process.exit(0);
 
-} else if (args[0] === "opencode-review") {
+} else if (args[0] === "opencode-review" || args[0] === "opencode-review-directory") {
   // ============================================
   // OPENCODE PLUGIN CODE REVIEW MODE
   // ============================================
@@ -1878,6 +1930,8 @@ if (args[0] === "sessions") {
     process.exit(1);
   }
   const urlArg = reviewArgs.prUrl;
+  const reviewDirectory = resolveCliReviewDirectory(reviewArgs, process.env.PLANNOTATOR_CWD || process.cwd());
+  let reviewCwd = reviewDirectory ?? (process.env.PLANNOTATOR_CWD || process.cwd());
   const isPRMode = urlArg !== undefined;
   // Caller-pinned open state (--base/--diff-type through the plugin's
   // verbatim rawArgs forward) — session-only seed, mirrors the direct
@@ -1889,6 +1943,7 @@ if (args[0] === "sessions") {
   let gitRef: string;
   let diffError: string | undefined;
   let initialFingerprint: string | undefined;
+  let initialFileIdentities: Record<string, string> | undefined;
   let userDiffType: DiffType | WorkspaceDiffType | undefined;
   let gitContext: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
   let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
@@ -1943,8 +1998,9 @@ if (args[0] === "sessions") {
     console.error("Opening code review UI...");
 
     const config = loadConfig();
-    const cwd = process.env.PLANNOTATOR_CWD || process.cwd();
-    const managedVcs = await detectManagedVcs(cwd, reviewArgs.vcsType);
+    const managedVcs = await detectManagedVcs(reviewCwd, reviewArgs.vcsType);
+    if (reviewDirectory) reviewCwd = await managedVcs?.getRoot?.(reviewCwd) ?? reviewCwd;
+    const cwd = reviewCwd;
     const forcedVcs = !!reviewArgs.vcsType && reviewArgs.vcsType !== "auto";
 
     if (managedVcs || forcedVcs) {
@@ -1976,6 +2032,7 @@ if (args[0] === "sessions") {
       diffError = diffResult.error;
       initialFingerprint = diffResult.fingerprint;
       if (openState.requestedBase !== undefined) initialBaseFromFlags = diffResult.base;
+      initialFileIdentities = diffResult.fileIdentities;
     } else {
       await resolveCliReviewOpenState(reviewArgs, {
         isPRMode: false,
@@ -2001,7 +2058,7 @@ if (args[0] === "sessions") {
 
   const bridgeSharingEnabled = getBridgeSharingEnabled(input);
   const bridgeShareBaseUrl = getBridgeShareBaseUrl(input);
-  const reviewProject = (await detectProjectName()) ?? "_unknown";
+  const reviewProject = (await detectProjectName(reviewDirectory ? reviewCwd : undefined)) ?? "_unknown";
 
   const server = await startReviewServer({
     rawPatch,
@@ -2009,6 +2066,7 @@ if (args[0] === "sessions") {
     error: diffError,
     origin: "opencode",
     project: reviewProject,
+    includeReviewDirectory: !!reviewDirectory,
     diffType: isPRMode ? undefined : userDiffType,
     gitContext,
     initialBase: initialBaseFromFlags,
@@ -2018,6 +2076,7 @@ if (args[0] === "sessions") {
     // undefined leaves PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck deciding.
     gitRemoteCheck: reviewArgs.gitRemoteCheck,
     initialFingerprint,
+    initialFileIdentities,
     prMetadata,
     prPatchIncomplete,
     workspace,
@@ -2040,7 +2099,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2064,7 +2123,7 @@ if (args[0] === "sessions") {
         : "annotated",
     approved: result.approved,
     isPRMode,
-    ...(result.feedback && { feedback: result.feedback }),
+    ...(result.feedback && { feedback: withReviewDirectory(result.feedback, result.reviewDirectory) }),
     ...(result.agentSwitch && { agentSwitch: result.agentSwitch }),
   }));
   process.exit(0);
@@ -2143,7 +2202,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2210,7 +2269,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2230,11 +2289,11 @@ if (args[0] === "sessions") {
       permissionDecision: "allow",
     }));
   } else {
-    const feedback = getPlanDeniedPrompt("copilot-cli", undefined, {
+    const feedback = composePlanDeniedMessage("copilot-cli", undefined, {
       toolName: getPlanToolName("copilot-cli"),
       planFileRule: "",
       feedback: result.feedback || "Plan changes requested",
-    });
+    }, { answersOnly: result.answersOnly });
     console.log(JSON.stringify({
       permissionDecision: "deny",
       permissionDecisionReason: feedback,
@@ -2316,7 +2375,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2501,7 +2560,7 @@ if (args[0] === "sessions") {
       },
     });
 
-    registerSession({
+    registerCliSession({
       pid: process.pid,
       port: server.port,
       url: server.url,
@@ -2521,11 +2580,80 @@ if (args[0] === "sessions") {
       console.log(
         JSON.stringify({
           decision: "block",
-          reason: getPlanDeniedPrompt("codex", undefined, {
+          reason: composePlanDeniedMessage("codex", undefined, {
             toolName: getPlanToolName("codex"),
             planFileRule: "",
             feedback: result.feedback || "Plan changes requested",
-          }),
+          }, { answersOnly: result.answersOnly }),
+        })
+      );
+    }
+
+    process.exit(0);
+  }
+
+  // Mistral Vibe: pre_tool hook matching exit_plan_mode. Vibe's tool takes
+  // no args, so the plan is not in the payload — the pre_tool payload carries
+  // transcript_path, and the resolver pins the plan this session wrote by
+  // scanning that transcript (newest-by-mtime within a freshness window as
+  // the fallback, else fail open). Detection is payload-based (pre_tool +
+  // exit_plan_mode is unambiguous vs Claude/Gemini); PLANNOTATOR_ORIGIN=
+  // mistral-vibe remains the manual override above.
+  const isVibeExitPlanMode =
+    event.hook_event_name === "pre_tool" && event.tool_name === "exit_plan_mode";
+  if (isVibeExitPlanMode) {
+    const vibeTranscript =
+      typeof event.transcript_path === "string" ? event.transcript_path : undefined;
+    const vibePlanContent = resolveLatestVibePlan({ transcriptPath: vibeTranscript });
+    if (!vibePlanContent) {
+      console.error(
+        "No plan file found in $VIBE_HOME/plans. Vibe may not have written the plan yet, or VIBE_HOME is set to a non-default location."
+      );
+      // Fail open: empty stdout + exit 0 lets Vibe pass the tool through.
+      process.exit(0);
+    }
+
+    const vibePlanProject = (await detectProjectName()) ?? "_unknown";
+    const vibeServer = await startPlannotatorServer({
+      plan: vibePlanContent,
+      origin: "mistral-vibe",
+      sharingEnabled,
+      shareBaseUrl,
+      pasteApiUrl,
+      htmlContent: planHtmlContent,
+      onReady: async (url, isRemote, port) => {
+        handleServerReady(url, isRemote, port);
+        if (isRemote && sharingEnabled) {
+          await writeRemoteShareLink(vibePlanContent, shareBaseUrl, "review the plan", "plan only").catch(() => {});
+        }
+      },
+    });
+
+    registerCliSession({
+      pid: process.pid,
+      port: vibeServer.port,
+      url: vibeServer.url,
+      mode: "plan",
+      project: vibePlanProject,
+      startedAt: new Date().toISOString(),
+      label: `plan-${vibePlanProject}`,
+    });
+
+    const vibeResult = await vibeServer.waitForDecision();
+    await Bun.sleep(1500);
+    vibeServer.stop();
+
+    if (vibeResult.approved) {
+      console.log(JSON.stringify({ decision: "allow" }));
+    } else {
+      console.log(
+        JSON.stringify({
+          decision: "deny",
+          reason: composePlanDeniedMessage("mistral-vibe", undefined, {
+            toolName: getPlanToolName("mistral-vibe"),
+            planFileRule: "",
+            feedback: vibeResult.feedback || "Plan changes requested",
+          }, { answersOnly: vibeResult.answersOnly }),
         })
       );
     }
@@ -2566,6 +2694,8 @@ if (args[0] === "sessions") {
   const server = await startPlannotatorServer({
     plan: planContent,
     origin: isGemini ? "gemini-cli" : detectedOrigin,
+    // Claude Code writes the plan to disk before the hook fires.
+    planFilePath: isGemini ? undefined : event.tool_input?.planFilePath,
     permissionMode,
     sharingEnabled,
     shareBaseUrl,
@@ -2580,7 +2710,7 @@ if (args[0] === "sessions") {
     },
   });
 
-  registerSession({
+  registerCliSession({
     pid: process.pid,
     port: server.port,
     url: server.url,
@@ -2607,11 +2737,11 @@ if (args[0] === "sessions") {
       console.log(
         JSON.stringify({
           decision: "deny",
-          reason: getPlanDeniedPrompt("gemini-cli", undefined, {
+          reason: composePlanDeniedMessage("gemini-cli", undefined, {
             toolName: getPlanToolName("gemini-cli"),
             planFileRule: buildPlanFileRule(getPlanToolName("gemini-cli"), planFilename),
             feedback: result.feedback || "Plan changes requested",
-          }),
+          }, { answersOnly: result.answersOnly }),
         })
       );
     }
@@ -2650,11 +2780,11 @@ if (args[0] === "sessions") {
             hookEventName: "PermissionRequest",
             decision: {
               behavior: "deny",
-              message: getPlanDeniedPrompt(detectedOrigin, undefined, {
+              message: composePlanDeniedMessage(detectedOrigin, undefined, {
                 toolName: getPlanToolName(detectedOrigin),
                 planFileRule: "",
                 feedback: result.feedback || "Plan changes requested",
-              }),
+              }, { answersOnly: result.answersOnly }),
             },
           },
         })

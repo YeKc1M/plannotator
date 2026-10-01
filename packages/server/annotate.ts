@@ -11,6 +11,7 @@
  *   PLANNOTATOR_PORT   - Fixed port or inclusive range (default: random locally, 19432 for remote)
  */
 
+import { appHtmlResponse, likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
 import { getRepoInfo } from "./repo";
 import type { Origin } from "@plannotator/shared/agents";
@@ -44,6 +45,7 @@ import {
 } from "@plannotator/shared/annotate-client-lease";
 import { createAnnotateDecisionSettler } from "@plannotator/shared/annotate-decision";
 import { saveConfig, detectGitUser, getServerConfig, isAgentTerminalSide, loadConfig, resolveAIEnabled, resolveAnnotateHistory, resolveFeedbackHistory } from "./config";
+import { getAutoUpdateAdvert } from "./auto-update";
 import { appendFeedbackRecord, type FeedbackDecision, type FeedbackSurface } from "@plannotator/shared/feedback-archive";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
 import { existsSync } from "fs";
@@ -278,6 +280,9 @@ export async function startAnnotateServer(
   }
 
   const isRemote = isRemoteSession();
+  // The app page is served compressed only to sessions reachable from another
+  // device: remote mode or --tailscale (#1617). Local sessions are unchanged.
+  const compressAppHtml = isRemote || options.tailnetPublished === true;
   const wslFlag = await isWSL();
   const gitUser = detectGitUser();
 
@@ -737,6 +742,7 @@ export async function startAnnotateServer(
               projectRoot: process.cwd(),
               isWSL: wslFlag,
               serverConfig: getServerConfig(gitUser),
+              ...getAutoUpdateAdvert(),
               agentTerminal: agentTerminal.capability,
               feedbackTemplates: {
                 fileFeedback: getAnnotateFileFeedbackTemplate(origin),
@@ -805,6 +811,7 @@ export async function startAnnotateServer(
               // sibling docs the same way it linkifies .md ones.
               markdownExtensions: getExtraMarkdownExtensions(),
               serverConfig: getServerConfig(gitUser),
+              ...getAutoUpdateAdvert(),
               agentTerminal: agentTerminal.capability,
               ...(recentMessages ? { recentMessages } : {}),
               // Resolved copy-wrapper templates (config-aware, placeholders
@@ -919,12 +926,13 @@ export async function startAnnotateServer(
           // API: Update user config (write-back to ~/.plannotator/config.json)
           if (url.pathname === "/api/config" && req.method === "POST") {
             try {
-              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; agentTerminalSide?: unknown; agentTerminalDefaultAgent?: unknown };
+              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; autoUpdate?: unknown; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; agentTerminalSide?: unknown; agentTerminalDefaultAgent?: unknown };
               const toSave: Record<string, unknown> = {};
               if (body.displayName !== undefined) toSave.displayName = body.displayName;
               if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
               if (body.theme !== undefined) toSave.theme = body.theme;
               if (isFaviconStyle(body.favicon)) toSave.favicon = body.favicon;
+              if (typeof body.autoUpdate === "boolean") toSave.autoUpdate = body.autoUpdate;
               if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
               if (body.conventionalLabels !== undefined) toSave.conventionalLabels = body.conventionalLabels;
               if (isAgentTerminalSide(body.agentTerminalSide)) toSave.agentTerminalSide = body.agentTerminalSide;
@@ -1281,9 +1289,7 @@ export async function startAnnotateServer(
           if (framedMiss) return framedMiss;
 
           // Serve embedded HTML for all other routes (SPA)
-          return new Response(htmlContent, {
-            headers: { "Content-Type": "text/html" },
-          });
+          return appHtmlResponse(req, htmlContent, compressAppHtml);
         },
         websocket: agentTerminal.websocket,
 
@@ -1350,6 +1356,12 @@ export async function startAnnotateServer(
       () => server.stop(),
     );
   };
+
+  // Start the likely encoding now (gzip for plain-http remote mode, brotli
+  // behind tailscale serve) so the first load does not wait for it.
+  if (compressAppHtml) {
+    prewarmAppHtml(htmlContent, likelyAppHtmlEncoding(options.tailnetPublished === true));
+  }
 
   // Notify caller that server is ready. An async ready handler that rejects
   // (e.g. --tailscale publishing failed) must stop the server and propagate:

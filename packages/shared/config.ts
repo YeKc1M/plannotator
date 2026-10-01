@@ -46,8 +46,9 @@ export type PromptRuntime =
   | "pi"
   | "codex"
   | "gemini-cli"
-| "kimi"
-  | "oh-my-pi";
+  | "kimi"
+  | "oh-my-pi"
+  | "mistral-vibe";
 
 interface PromptSectionConfig {
   [key: string]: string | Partial<Record<PromptRuntime, PromptSectionOverrides>> | undefined;
@@ -65,6 +66,8 @@ export interface PromptConfig {
     approvedWithNotes?: string;
     autoApproved?: string;
     denied?: string;
+    /** A deny whose only feedback is answers to the plan's questions. */
+    answered?: string;
   };
   annotate?: PromptSectionConfig & {
     fileFeedback?: string;
@@ -156,15 +159,17 @@ export interface PlannotatorConfig {
    * honestly ("detected, skipped"), and never removes an integration a
    * previous install already wired. Overridden by the
    * PLANNOTATOR_SKIP_CODEX_INSTALL / PLANNOTATOR_SKIP_GEMINI_INSTALL /
-   * PLANNOTATOR_SKIP_KIRO_INSTALL / PLANNOTATOR_SKIP_OPENCODE_INSTALL env
-   * vars, which are in turn overridden by the --skip-codex / --skip-gemini /
-   * --skip-kiro / --skip-opencode flags. OpenCode has no detection leg, so
-   * its entry is a plain do-not-write switch. Default: all off.
+   * PLANNOTATOR_SKIP_KIRO_INSTALL / PLANNOTATOR_SKIP_VIBE_INSTALL /
+   * PLANNOTATOR_SKIP_OPENCODE_INSTALL env vars, which are in turn overridden
+   * by the --skip-codex / --skip-gemini / --skip-kiro / --skip-vibe /
+   * --skip-opencode flags. OpenCode has no detection leg, so its entry is a
+   * plain do-not-write switch. Default: all off.
    */
   skipInstall?: {
     codex?: boolean;
     gemini?: boolean;
     kiro?: boolean;
+    vibe?: boolean;
     opencode?: boolean;
   };
   /**
@@ -210,6 +215,23 @@ export interface PlannotatorConfig {
    */
   guideHistory?: boolean;
   /**
+   * Remember which files a code review marked viewed, across review sessions,
+   * under ~/.plannotator/review-progress/ (or PLANNOTATOR_DATA_DIR). Records
+   * carry repo file paths in plain text and nothing prunes them. Set to false
+   * to never read or write them; viewed marks then ride the annotation draft,
+   * as they do for review modes without a durable identity. Default: true.
+   */
+  reviewProgress?: boolean;
+  /**
+   * Opt-in background auto-update for the compiled `plannotator` binary.
+   * When true, a session started by the CLI checks GitHub for a newer stable
+   * release at most once per 24h and, when no other review session is open,
+   * runs the normal install script for that exact tag in a detached process
+   * (output in update.log in the data dir). PLANNOTATOR_AUTO_UPDATE wins over
+   * this key. Default: false.
+   */
+  autoUpdate?: boolean;
+  /**
    * Inject a Plannotator Flavored Markdown reminder into every EnterPlanMode
    * call so the agent is aware it can enrich plans with code-file links,
    * callouts, tables, diagrams, task lists, and the other PFM extensions.
@@ -240,6 +262,19 @@ export interface PlannotatorConfig {
    */
   guideShareUrl?: string;
   /**
+   * Atlassian account email for Bitbucket Cloud PR review (basic auth with
+   * `bitbucketToken`). Mirrors PLANNOTATOR_BITBUCKET_EMAIL, which takes
+   * precedence. Omit it to send the token as a Bearer token instead.
+   */
+  bitbucketEmail?: string;
+  /**
+   * Atlassian API token (with Bitbucket scopes) for Bitbucket Cloud PR review.
+   * Mirrors PLANNOTATOR_BITBUCKET_TOKEN, which takes precedence. Stored in
+   * plain text in config.json, so prefer the env var. Never sent to the
+   * browser: getServerConfig() allowlists its keys.
+   */
+  bitbucketToken?: string;
+  /**
    * Pass `--sandbox enabled` when launching Cursor's `agent` CLI for review
    * jobs. When true (default), review jobs run with Cursor's sandbox forced
    * on as part of their read-only posture. Set to false on systems where
@@ -249,6 +284,21 @@ export interface PlannotatorConfig {
    * PLANNOTATOR_CURSOR_SANDBOX env var, which takes precedence.
    */
   cursorSandbox?: boolean;
+  /**
+   * Let Claude Code agent jobs (code review, Code Tour, Guided Review) run
+   * under the user's own Claude Code sandbox setting. When true (default),
+   * Plannotator passes nothing sandbox-related and the user's settings decide.
+   * Set to false on systems where Claude Code's sandbox cannot start (Linux
+   * without bubblewrap/socat, AppArmor-restricted user namespaces): jobs run
+   * with `--permission-mode dontAsk`, so the unsandboxed fallback is refused
+   * and every Bash call dead-ends (#1627). False passes
+   * `--settings {"sandbox":{"enabled":false}}` for the job only, so its
+   * commands run WITHOUT OS containment, the same as for any user who never
+   * enabled Claude's sandbox (the default). The job's command allowlist still
+   * limits what the model can run, but it is not a containment boundary.
+   * Managed (enterprise) settings still win. Mirrors the PLANNOTATOR_CLAUDE_SANDBOX env var, which takes precedence.
+   */
+  claudeSandbox?: boolean;
   /**
    * Query the git remote during code review (issue #1553). When true
    * (default), a local git review runs `git ls-remote --symref origin HEAD`
@@ -545,9 +595,9 @@ export function saveConfig(partial: Partial<PlannotatorConfig>): void {
  * Detect the git user name from `git config user.name`.
  * Returns null if git is unavailable, not in a repo, or user.name is not set.
  */
-export function detectGitUser(): string | null {
+export function detectGitUser(cwd?: string): string | null {
   try {
-    const name = execSync("git config user.name", { encoding: "utf-8", timeout: 3000 }).trim();
+    const name = execSync("git config user.name", { cwd, encoding: "utf-8", timeout: 3000 }).trim();
     return name || null;
   } catch {
     return null;
@@ -569,8 +619,11 @@ export function getServerConfig(gitUser: string | null): {
   conventionalLabels?: CCLabelConfig[] | null;
   agentTerminalSide?: PlannotatorConfig["agentTerminalSide"];
   agentTerminalDefaultAgent?: string;
+  autoUpdate: boolean;
+  autoUpdateEnv?: boolean;
 } {
   const cfg = loadConfig();
+  const autoUpdateEnv = parseAutoUpdateEnv();
   return {
     displayName: cfg.displayName,
     diffOptions: cfg.diffOptions,
@@ -591,6 +644,11 @@ export function getServerConfig(gitUser: string | null): {
       cfg.agentTerminalDefaultAgent !== "" && {
         agentTerminalDefaultAgent: cfg.agentTerminalDefaultAgent,
       }),
+    // Always explicit (the config-file value, default false) so a stale
+    // cookie can never show the toggle on while the config says off.
+    // autoUpdateEnv carries PLANNOTATOR_AUTO_UPDATE when it overrides the file.
+    autoUpdate: coerceConfigBoolean(cfg.autoUpdate, false),
+    ...(autoUpdateEnv !== undefined && { autoUpdateEnv }),
   };
 }
 
@@ -705,6 +763,52 @@ export function resolveGuideHistory(config: PlannotatorConfig): boolean {
     return envVal === "1" || envVal.toLowerCase() === "true";
   }
   return coerceConfigBoolean(config.guideHistory, true);
+}
+
+/**
+ * Resolve whether code review persists viewed-file progress across sessions.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_REVIEW_PROGRESS env var  →  config.reviewProgress  →  default true
+ *
+ * Env `0` / `false` / `off` / `disabled` turn it off and `1` / `true` / `on`
+ * turn it on; an empty (or unrecognized) value counts as unset, so the config
+ * key still decides.
+ */
+export function resolveReviewProgress(
+  config: PlannotatorConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const v = env.PLANNOTATOR_REVIEW_PROGRESS?.trim().toLowerCase();
+  if (v === "0" || v === "false" || v === "off" || v === "disabled") return false;
+  if (v === "1" || v === "true" || v === "on") return true;
+  return coerceConfigBoolean(config.reviewProgress, true);
+}
+
+/**
+ * Resolve whether the compiled CLI keeps itself up to date in the background.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_AUTO_UPDATE env var  →  config.autoUpdate  →  default false
+ *
+ * Env `1` / `true` / `on` turn it on and `0` / `false` / `off` / `disabled`
+ * turn it off; an empty or unrecognized value counts as unset.
+ */
+export function resolveAutoUpdate(
+  config: PlannotatorConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const fromEnv = parseAutoUpdateEnv(env);
+  if (fromEnv !== undefined) return fromEnv;
+  return coerceConfigBoolean(config.autoUpdate, false);
+}
+
+/** The PLANNOTATOR_AUTO_UPDATE override, or undefined when it does not decide. */
+export function parseAutoUpdateEnv(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+  const v = env.PLANNOTATOR_AUTO_UPDATE?.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "on") return true;
+  if (v === "0" || v === "false" || v === "off" || v === "disabled") return false;
+  return undefined;
 }
 
 export function resolveUseJina(cliNoJina: boolean, config: PlannotatorConfig): boolean {
@@ -866,6 +970,25 @@ export function resolveCursorSandbox(config: PlannotatorConfig): boolean {
 }
 
 /**
+ * Resolve whether Claude Code review jobs defer to the user's own Claude Code
+ * sandbox setting (true) or run with the sandbox turned off for the job (false).
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_CLAUDE_SANDBOX env var  →  config.claudeSandbox  →  default true
+ *
+ * Env values `0` / `false` / `disabled` turn it off; anything else keeps the
+ * default. See `claudeSandbox` on PlannotatorConfig for why (#1627).
+ */
+export function resolveClaudeSandbox(config: PlannotatorConfig): boolean {
+  const envVal = process.env.PLANNOTATOR_CLAUDE_SANDBOX;
+  if (envVal !== undefined) {
+    const v = envVal.toLowerCase();
+    return v !== "0" && v !== "false" && v !== "disabled";
+  }
+  return coerceConfigBoolean(config.claudeSandbox, true);
+}
+
+/**
  * Resolve whether code review may query the git remote (issue #1553).
  *
  * Priority (highest wins):
@@ -915,3 +1038,69 @@ export function resolveTodoProviderEnabled(config: PlannotatorConfig): boolean {
   if (config.todoProvider !== undefined) return config.todoProvider !== "off";
   return true;
 }
+
+/** Default Bitbucket Cloud REST API base. */
+export const DEFAULT_BITBUCKET_API_URL = "https://api.bitbucket.org/2.0";
+
+/** Resolved Bitbucket Cloud credentials. Never log `token`. */
+export interface BitbucketCredentials {
+  /** Atlassian account email for basic auth; absent means Bearer auth. */
+  email?: string;
+  token: string;
+}
+
+/**
+ * Resolve Bitbucket Cloud API credentials.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_BITBUCKET_TOKEN / _EMAIL env vars  →  config.bitbucketToken / bitbucketEmail
+ *
+ * The token and email are resolved together from one source: an env token
+ * never pairs with a config-file email (a stale email would turn a valid
+ * Bearer token into failing basic auth). Empty values count as unset.
+ * Returns null when no token is configured.
+ */
+export function resolveBitbucketCredentials(
+  config: PlannotatorConfig,
+  env: Record<string, string | undefined> = process.env,
+): BitbucketCredentials | null {
+  const clean = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
+  const envToken = clean(env.PLANNOTATOR_BITBUCKET_TOKEN);
+  if (envToken) {
+    const email = clean(env.PLANNOTATOR_BITBUCKET_EMAIL);
+    return { token: envToken, ...(email ? { email } : {}) };
+  }
+  const cfgToken = clean(config.bitbucketToken);
+  if (cfgToken) {
+    const email = clean(config.bitbucketEmail);
+    return { token: cfgToken, ...(email ? { email } : {}) };
+  }
+  return null;
+}
+
+/**
+ * Resolve the Bitbucket Cloud REST API base URL. PLANNOTATOR_BITBUCKET_API_URL
+ * overrides the default for tests (a local fake API) and proxies. Credentials
+ * are sent to this URL, so anything that is not `https:` — or `http:` on a
+ * loopback host — is refused with a warning and the default is used.
+ */
+export function resolveBitbucketApiUrl(env: Record<string, string | undefined> = process.env): string {
+  const raw = env.PLANNOTATOR_BITBUCKET_API_URL?.trim();
+  if (!raw) return DEFAULT_BITBUCKET_API_URL;
+  try {
+    const u = new URL(raw);
+    const loopback = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
+    if ((u.protocol === "https:" || (u.protocol === "http:" && loopback)) && !u.username && !u.password) {
+      return `${u.origin}${u.pathname.replace(/\/+$/, "")}`;
+    }
+  } catch { /* fall through */ }
+  if (!warnedBitbucketApiUrls.has(raw)) {
+    warnedBitbucketApiUrls.add(raw);
+    console.error(
+      `[plannotator] Ignoring PLANNOTATOR_BITBUCKET_API_URL: must be an https URL (or http on localhost). Using ${DEFAULT_BITBUCKET_API_URL}.`,
+    );
+  }
+  return DEFAULT_BITBUCKET_API_URL;
+}
+const warnedBitbucketApiUrls = new Set<string>();
